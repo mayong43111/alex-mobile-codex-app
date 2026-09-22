@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto'
 import sharp from 'sharp'
 import { z } from 'zod'
 import type { AgentRun, Asset, Message } from '../src/domain.ts'
+import { assetContentType, assetExtension } from '../src/domain.ts'
 import { Store, HttpError } from './store.ts'
 import { LocalAssetStorage } from './assets.ts'
 import type { AssetStorage } from './assets.ts'
@@ -16,17 +17,28 @@ const configSchema = z.object({ gateway: z.literal('http://127.0.0.1:3199'), tok
 const remoteSchema = z.object({
   id: z.string().uuid(), threadId: z.string().uuid().nullable(),
   status: z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted']),
-  stage: z.enum(['codex', 'image']), reply: z.string().max(20000), error: z.string().optional(),
+  stage: z.enum(['codex', 'image', 'video']), reply: z.string().max(20000), error: z.string().optional(),
   imageOperation: z.enum(['generate', 'edit']).optional(),
+  sourceAssetId: z.string().uuid().optional(), needsSource: z.boolean().optional(),
   progress: z.array(z.object({ id: z.string().max(200), label: z.string().max(120), detail: z.string().max(6000).optional(), createdAt: z.string().datetime() })).max(200).optional(),
   image: z.object({ png: z.string().max(48 * 1024 * 1024), width: z.number(), height: z.number(), model: z.string(), checkpoint: z.string(),
-    operation: z.enum(['generate', 'edit']).optional(), sourceAssetId: z.string().uuid().optional(), sourceHash: z.string().regex(/^[0-9a-f]{64}$/).optional() }).optional(),
+    provider: z.enum(['azure', 'comfyui']).optional(), operation: z.enum(['generate', 'edit']).optional(), sourceAssetId: z.string().uuid().optional(), sourceHash: z.string().regex(/^[0-9a-f]{64}$/).optional() }).optional(),
+  video: z.object({ mp4: z.string().max(64 * 1024 * 1024), thumbnail: z.string().max(4 * 1024 * 1024), width: z.number().int().positive().max(1920), height: z.number().int().positive().max(1920), duration: z.number().positive().max(15), fps: z.literal(24), model: z.literal('minimax-h3'), provider: z.literal('comfyui'), checkpoint: z.string() }).optional(),
 })
 export type RemoteRun = z.infer<typeof remoteSchema>
 export type SourceImage = { assetId: string; png: string; hash: string; width: number; height: number }
+export type ImageCandidate = Omit<SourceImage, 'png'> & { name: string; kind: Asset['kind']; messageId: string; context: string }
+export type AttachmentNotice = { assetId: string; name: string; mediaType: 'image' | 'video' | 'file'; mimeType: string; bytes: number; location: string }
+export type ReadableAttachment = AttachmentNotice & { sha256: string }
+export type ConversationEntry = Pick<Message, 'role' | 'text'> & { attachments?: AttachmentNotice[] }
+function attachmentNotice(asset: Asset): AttachmentNotice {
+  return { assetId: asset.id, name: asset.name, mediaType: asset.mediaType ?? 'image', mimeType: assetContentType(asset), bytes: asset.bytes, location: `/api/assets/${asset.id}/content` }
+}
 export interface AgentTransport {
   health(): Promise<unknown>
-  submit(run: AgentRun, threadId: string | null, history?: Pick<Message, 'role' | 'text'>[], sourceImage?: SourceImage): Promise<void>
+  submit(run: AgentRun, threadId: string | null, history?: ConversationEntry[], imageCandidates?: ImageCandidate[], attachments?: AttachmentNotice[], readableAttachments?: ReadableAttachment[]): Promise<void>
+  provideSource?(runId: string, source: SourceImage): Promise<void>
+  uploadAttachment?(runId: string, asset: ReadableAttachment, bytes: Buffer): Promise<void>
   get(id: string): Promise<RemoteRun>
   stop(id: string): Promise<void>
 }
@@ -59,13 +71,18 @@ export async function loadAgentTransport(file: string): Promise<AgentTransport |
   }
   return {
     health: () => request('/health'),
-    async submit(run, threadId, history = [], sourceImage) {
+    async uploadAttachment(runId, asset, bytes) {
+      const response = await fetch(`${config.gateway}/attachment-runs/${runId}/${asset.assetId}`, { method: 'PUT', signal: AbortSignal.timeout(60000), headers: { Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/octet-stream', 'X-Content-SHA256': asset.sha256 }, body: new Uint8Array(bytes) })
+      if (!response.ok) throw new Error(`Attachment staging HTTP ${response.status}`)
+    },
+    async provideSource(runId, source) { await request(`/runs/${runId}/source`, 'PUT', source) },
+    async submit(run, threadId, history = [], imageCandidates = [], attachments = [], readableAttachments = []) {
       let imageToken: string | undefined
       let codexToken: string | undefined
       if (config.codex?.auth === 'entra') {
         codexToken = await managedModelToken()
         imageToken = codexToken
-      } else if (run.input.mode === 'image' || run.input.mode === 'auto') {
+      } else if ((run.input.mode === 'image' || run.input.mode === 'auto') && (run.input.imageModel ?? 'azure-image2') === 'azure-image2') {
         try {
           const { stdout } = await promisify(execFile)(`${homedir()}/.local/share/qwen-azure-cli/bin/az`,
             ['account', 'get-access-token', '--subscription', config.image.subscription, '--resource', 'https://cognitiveservices.azure.com/', '-o', 'json'], { timeout: 30000, maxBuffer: 256 * 1024 })
@@ -73,7 +90,7 @@ export async function loadAgentTransport(file: string): Promise<AgentTransport |
         } catch { if (run.input.mode === 'image') throw new Error('Azure 登录不可用，请在本机重新登录；未发送图片请求。') }
       }
       await request('/runs', 'POST', { id: run.id, projectId: run.projectId, threadId, text: run.input.text,
-        mode: run.input.mode, ratio: run.input.ratio, imageToken, codexToken, ...(history.length ? { history } : {}), ...(sourceImage ? { sourceImage } : {}) })
+        mode: run.input.mode, ratio: run.input.ratio, quality: run.input.quality ?? 'low', imageModel: run.input.imageModel ?? 'azure-image2', videoModel: run.input.videoModel ?? 'none', imageToken, codexToken, attachments, readableAttachments, imageCandidates, ...(history.length ? { history } : {}) })
     },
     async get(id) { return remoteSchema.parse(await request(`/runs/${id}`)) },
     async stop(id) { await request(`/runs/${id}`, 'DELETE') },
@@ -87,10 +104,12 @@ export class AgentWorker {
   private store: Store
   private assetStorage: AssetStorage
   private transport: AgentTransport
-  constructor(store: Store, dataDir: string, transport: AgentTransport, assetStorage: AssetStorage = new LocalAssetStorage(dataDir)) {
+  private canRun: () => boolean
+  constructor(store: Store, dataDir: string, transport: AgentTransport, assetStorage: AssetStorage = new LocalAssetStorage(dataDir), canRun: () => boolean = () => true) {
     this.store = store
     this.assetStorage = assetStorage
     this.transport = transport
+    this.canRun = canRun
   }
 
   start() {
@@ -104,8 +123,26 @@ export class AgentWorker {
     return this.operation
   }
 
+  private imageCandidates(run: AgentRun): ImageCandidate[] {
+    const snapshot = this.store.snapshot(run.projectId)
+    const position = snapshot.messages.findIndex(message => message.id === run.messageId)
+    if (position < 0) throw new Error('Run message missing')
+    const candidates = new Map<string, ImageCandidate>()
+    for (const message of snapshot.messages.slice(0, position + 1)) {
+      const completed = snapshot.runs.find(candidate => candidate.messageId === message.id && candidate.id !== run.id && candidate.status === 'completed')
+      for (const id of [...message.assetIds, ...(completed?.assetId ? [completed.assetId] : [])]) {
+        const asset = this.store.asset(id)
+        if (asset.projectId !== run.projectId) throw new Error('Image project mismatch')
+        if ((asset.mediaType ?? 'image') !== 'image') continue
+        if (!candidates.has(id)) candidates.set(id, { assetId: id, name: asset.name, hash: asset.hash, width: asset.width, height: asset.height, kind: asset.kind, messageId: message.id, context: message.text.slice(0, 6000) })
+      }
+    }
+    return [...candidates.values()]
+  }
+
   private async advance() {
     if (!this.activeId) {
+      if (!this.canRun()) return
       const run = this.store.nextAgentRun()
       if (!run) return
       this.activeId = run.id
@@ -114,20 +151,23 @@ export class AgentWorker {
         const threadId = this.store.threadId(run.projectId)
         const snapshot = this.store.snapshot(run.projectId)
         const messages = snapshot.messages
-        const history = threadId ? [] : messages.slice(0, messages.findIndex(message => message.id === run.messageId)).map(message => ({ role: message.role ?? 'user', text: message.text }))
-        let sourceImage: SourceImage | undefined
-        if (run.input.mode !== 'chat') {
-          const previous = messages.slice(0, messages.findIndex(message => message.id === run.messageId)).reverse()
-          const sourceRun = previous.map(message => snapshot.runs.find(candidate => candidate.messageId === message.id && candidate.status === 'completed' && candidate.assetId)).find(Boolean)
-          const source = snapshot.assets.find(asset => asset.id === sourceRun?.assetId && asset.kind === 'generated')
-          if (source) {
-            const bytes = await this.assetStorage.read(`${source.id}.png`)
-            if (bytes.length > 32 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== source.hash) throw new Error('Invalid source image')
-            sourceImage = { assetId: source.id, png: bytes.toString('base64'), hash: source.hash, width: source.width, height: source.height }
-            this.store.updateAgent(run.id, { sourceAssetId: source.id })
-          }
+        const notices = (ids: string[]) => ids.map(id => {
+          const asset = this.store.asset(id)
+          if (asset.projectId !== run.projectId) throw new Error('Attachment project mismatch')
+          return attachmentNotice(asset)
+        })
+        const attachments = notices(run.input.assetIds ?? [])
+        const previousMessages = messages.slice(0, messages.findIndex(message => message.id === run.messageId))
+        const readableIds = attachments.length ? run.input.assetIds! : [...previousMessages].reverse().find(message => message.role !== 'assistant' && message.assetIds.length)?.assetIds ?? []
+        const readableAttachments: ReadableAttachment[] = this.transport.uploadAttachment ? notices(readableIds).map(notice => ({ ...notice, sha256: this.store.asset(notice.assetId).hash })) : []
+        for (const notice of readableAttachments) {
+          const asset = this.store.asset(notice.assetId)
+          const bytes = await this.assetStorage.read(`${asset.id}.${assetExtension(asset)}`)
+          if (bytes.length !== notice.bytes || bytes.length > 64 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== notice.sha256) throw new Error('Invalid attachment bytes')
+          await this.transport.uploadAttachment!(run.id, notice, bytes)
         }
-        await this.transport.submit(run, threadId, history, sourceImage)
+        const history = threadId ? [] : messages.slice(0, messages.findIndex(message => message.id === run.messageId)).map(message => ({ role: message.role ?? 'user', text: message.text, ...(message.assetIds.length ? { attachments: notices(message.assetIds) } : {}) }))
+        await this.transport.submit(run, threadId, history, this.imageCandidates(run), attachments, readableAttachments)
       }
       catch {
         this.store.updateAgent(run.id, { status: 'interrupted', error: '运行请求未确认，请检查容器及 Azure 登录；可能已计费，未自动重试。' })
@@ -148,7 +188,20 @@ export class AgentWorker {
         return
       }
       let assetId: string | undefined
+      if (remote.needsSource) {
+        if (remote.status !== 'running' || remote.imageOperation !== 'edit' || local.input.mode === 'chat' || !this.transport.provideSource) throw new Error('Unexpected source request')
+        const candidate = this.imageCandidates(local).find(candidate => candidate.assetId === remote.sourceAssetId)
+        if (!candidate || (local.sourceAssetId && local.sourceAssetId !== candidate.assetId)) throw new Error('Source outside run candidates')
+        const source = this.store.asset(candidate.assetId)
+        const bytes = await this.assetStorage.read(`${source.id}.${assetExtension(source)}`)
+        if (bytes.length !== source.bytes || bytes.length > 32 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== source.hash) throw new Error('Invalid source image')
+        this.store.updateAgent(id, { sourceAssetId: source.id, imageOperation: 'edit', reply: remote.reply, threadId: remote.threadId, progress })
+        await this.transport.provideSource(id, { assetId: source.id, png: bytes.toString('base64'), hash: source.hash, width: source.width, height: source.height })
+        return
+      }
+      if (remote.image && remote.video) throw new Error('Ambiguous media result')
       if (remote.status === 'completed' && remote.image) assetId = (await this.saveImage(local, remote.image)).id
+      if (remote.status === 'completed' && remote.video) assetId = (await this.saveVideo(local, remote.video)).id
       if (this.store.agentRun(id).status === 'cancelled') {
         if (remote.threadId) this.store.updateAgent(id, { threadId: remote.threadId })
         if (remote.status !== 'running') this.activeId = null
@@ -168,6 +221,9 @@ export class AgentWorker {
   }
 
   private async saveImage(run: AgentRun, image: NonNullable<RemoteRun['image']>): Promise<Asset> {
+    const provider = image.provider ?? 'azure'
+    const selected = run.input.imageModel ?? 'azure-image2'
+    if (provider !== (selected === 'azure-image2' ? 'azure' : 'comfyui') || (selected === 'qwen-image-2.1' && image.model !== selected)) throw new Error('Unexpected image provider or model')
     if (image.operation === 'edit') {
       if (!image.sourceAssetId || image.sourceAssetId !== run.sourceAssetId) throw new Error('Mismatched edit source')
       const source = this.store.asset(image.sourceAssetId)
@@ -183,17 +239,31 @@ export class AgentWorker {
     const thumbnail = await source.resize(480, 480, { fit: 'inside', withoutEnlargement: true }).webp().toBuffer()
     await this.assetStorage.put(`${run.id}.png`, bytes)
     await this.assetStorage.put(`${run.id}.webp`, thumbnail)
-    return this.store.addAsset({ id: run.id, projectId: run.projectId, name: `Azure-${run.id.slice(0, 8)}.png`,
+    return this.store.addAsset({ id: run.id, projectId: run.projectId, name: `${provider}-${run.id.slice(0, 8)}.png`,
       width: image.width, height: image.height, bytes: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'),
-      kind: 'generated', model: image.model, provider: 'azure', runId: run.id, createdAt: new Date().toISOString(),
+      kind: 'generated', model: image.model, provider, runId: run.id, createdAt: new Date().toISOString(),
       ...(image.operation === 'edit' ? { sourceAssetId: image.sourceAssetId, sourceHash: image.sourceHash } : {}) })
+  }
+
+  private async saveVideo(run: AgentRun, video: NonNullable<RemoteRun['video']>): Promise<Asset> {
+    if (run.input.videoModel !== 'minimax-h3' || video.model !== 'minimax-h3' || video.provider !== 'comfyui') throw new Error('Unexpected video provider')
+    const existing = this.store.snapshot(run.projectId).assets.find(asset => asset.id === run.id)
+    if (existing) return existing
+    const bytes = Buffer.from(video.mp4, 'base64')
+    if (bytes.length < 16 || bytes.length > 48 * 1024 * 1024 || bytes.toString('ascii', 4, 8) !== 'ftyp') throw new Error('Invalid MP4')
+    const thumbnail = await sharp(Buffer.from(video.thumbnail, 'base64'), { limitInputPixels: 1920 * 1920 }).resize(480, 480, { fit: 'inside', withoutEnlargement: true }).webp().toBuffer()
+    if (!Number.isFinite(video.duration) || video.duration <= 0 || video.duration > 15 || video.fps !== 24) throw new Error('Invalid video metadata')
+    await this.assetStorage.put(`${run.id}.mp4`, bytes)
+    await this.assetStorage.put(`${run.id}.webp`, thumbnail)
+    return this.store.addAsset({ id: run.id, projectId: run.projectId, name: `H3-${run.id.slice(0, 8)}.mp4`, mediaType: 'video', width: video.width, height: video.height,
+      duration: video.duration, fps: video.fps, bytes: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), kind: 'generated', model: video.model, provider: video.provider, runId: run.id, createdAt: new Date().toISOString() })
   }
 
   async stop(id: string) {
     const run = this.store.agentRun(id)
     if (run.status !== 'queued' && run.status !== 'running') return run
     if (run.status === 'running') await this.transport.stop(id)
-    return this.store.updateAgent(id, { status: 'cancelled', error: '已请求停止；已提交的 Azure 调用仍可能计费。' })
+    return this.store.updateAgent(id, { status: 'cancelled', error: '已请求停止等待；已提交的模型任务可能仍在执行或计费，请核实后再重试。' })
   }
 
   resend(projectId: string, messageId: string, request: { requestId: string; expectedTailId: string }) {
@@ -204,5 +274,9 @@ export class AgentWorker {
   async close() {
     clearInterval(this.timer)
     await this.operation
+  }
+
+  hasActiveProject(projectId?: string) {
+    return !!this.activeId && (!projectId || this.store.agentRun(this.activeId).projectId === projectId)
   }
 }

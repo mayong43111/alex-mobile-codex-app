@@ -29,6 +29,7 @@ class AzureImage(BaseTool):
         "properties": {
             "prompt": {"type": "string", "minLength": 1, "maxLength": 6000},
             "size": {"enum": ["1024x1024", "1536x1024", "1024x1536"]},
+            "quality": {"enum": ["low", "medium", "high"]},
             "operation": {"enum": ["generate", "edit"]},
             "sourceImage": {"type": "object", "required": ["assetId", "png", "hash", "width", "height"],
                 "properties": {"assetId": {"type": "string"}, "png": {"type": "string", "maxLength": 48 * 1024 * 1024},
@@ -50,7 +51,7 @@ class AzureImage(BaseTool):
             if (operation == "edit") != bool(source):
                 raise ValueError("Editing requires a source image")
             body = {"model": settings["deployment"], "prompt": inputs["prompt"],
-                    "size": inputs["size"], "quality": "low", "n": 1, "output_format": "png"}
+                    "size": inputs["size"], "quality": inputs.get("quality", "low"), "n": 1, "output_format": "png"}
             headers = {"Authorization": "Bearer " + self.access_token}
             endpoint = settings["endpoint"].rstrip("/") + "/openai/v1/images/"
             if source:
@@ -94,6 +95,7 @@ def main():
     run_id = str(UUID(request["runId"]))
     root = Path("/state/montage")
     result = AzureImage(request["accessToken"]).execute({"prompt": request["prompt"], "size": request["size"],
+        "quality": request.get("quality", "low"),
         "operation": request.get("operation", "generate"), **({"sourceImage": request["sourceImage"]} if request.get("sourceImage") else {})})
     if not result.success:
         write_checkpoint(root, run_id, "assets", "failed", {}, error=result.error)
@@ -106,7 +108,7 @@ def main():
     manifest = {"version": "1.0", "assets": [{"id": run_id, "type": "image", "path": "image.png",
         "source_tool": "azure_image2", "scene_id": "single", "model": result.model,
         "provider": "azure", "resolution": request["size"], "format": "png", "prompt": request["prompt"]}],
-        "metadata": {"cost_status": "unknown", "usage": result.data.get("usage"),
+        "metadata": {"cost_status": "unknown", "quality": request.get("quality", "low"), "usage": result.data.get("usage"),
             "operation": result.data["operation"], "source_asset_id": result.data.get("sourceAssetId"), "source_hash": result.data.get("sourceHash")}}
     write_checkpoint(root, run_id, "assets", "completed", {"asset_manifest": manifest})
     print(json.dumps({"success": True, **result.data, "model": result.model, "checkpoint": f"{run_id}/checkpoint_assets.json"}))

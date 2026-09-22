@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test'
 import type { Page } from '@playwright/test'
 import { resolve } from 'node:path'
+import sharp from 'sharp'
 
 async function openProjectPanel(page: Page, name: '素材库' | '任务记录') {
   if (await page.getByRole('dialog').count()) await page.getByRole('button', { name: '关闭', exact: true }).click()
@@ -8,6 +9,189 @@ async function openProjectPanel(page: Page, name: '素材库' | '任务记录') 
   await page.getByRole('button', { name: name === '任务记录' ? /^任务记录/ : name, exact: name !== '任务记录' }).click()
   await expect(page.getByRole('dialog', { name, exact: true })).toBeVisible()
 }
+
+test('project deletion requires confirmation and removes the selected project', async ({ page, request }, testInfo) => {
+  const title = `待删除-${testInfo.project.name}`
+  const project = await (await request.post('/api/projects', { data: { title } })).json()
+  await page.goto('/')
+  await page.evaluate(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.reload()
+  await page.getByRole('button', { name: '项目列表', exact: true }).click()
+  await expect(page.locator('.sidebar-bottom')).toHaveCount(0)
+  await expect(page.getByText('研究工作空间', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('本地单用户', { exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: `删除项目 ${title}`, exact: true }).click()
+  await expect(page.getByRole('dialog', { name: '删除项目？' })).toBeVisible()
+  await page.getByRole('button', { name: '取消', exact: true }).click()
+  expect((await request.get(`/api/projects/${project.id}`)).status()).toBe(200)
+  await page.getByRole('button', { name: '项目列表', exact: true }).click()
+  await page.getByRole('button', { name: `删除项目 ${title}`, exact: true }).click()
+  await page.screenshot({ path: testInfo.outputPath('delete-project.png') })
+  await page.getByRole('button', { name: '确认删除', exact: true }).click()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  expect((await request.get(`/api/projects/${project.id}`)).status()).toBe(404)
+  await page.reload()
+  await expect(page.getByRole('button', { name: `删除项目 ${title}`, exact: true })).toHaveCount(0)
+})
+
+test('VM controls require explicit confirmation and show operation state', async ({ page }, testInfo) => {
+  let actions = 0
+  let power = 'deallocated'
+  await page.route('**/api/vm', route => route.fulfill({ json: { configured: true, name: 'test-gpu', powerState: power, gpuReady: power === 'running' } }))
+  await page.route('**/api/vm/actions', route => {
+    const body = route.request().postDataJSON()
+    expect(body.confirmedName).toBe('test-gpu')
+    expect(body.requestId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(body.action).toBe(actions === 0 ? 'start' : 'deallocate')
+    actions++
+    power = body.action === 'start' ? 'running' : 'deallocated'
+    return route.fulfill({ status: 202, json: { configured: true, name: 'test-gpu', powerState: power, gpuReady: power === 'running', operation: { id: body.requestId, action: body.action, status: 'succeeded' } } })
+  })
+  await page.goto('/')
+  const vmEntry = page.locator('.topbar').getByRole('button', { name: 'VM 管理', exact: true })
+  await expect(vmEntry).toHaveText('')
+  await expect(vmEntry).toHaveAttribute('title', 'VM 管理')
+  await vmEntry.click()
+  const panel = page.getByRole('dialog', { name: 'VM 管理' })
+  await expect(panel.getByRole('status')).toContainText('计算计费已停止')
+  await expect(panel.getByRole('button', { name: '重启', exact: true })).toBeDisabled()
+  await page.screenshot({ path: testInfo.outputPath('vm-stopped.png') })
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  expect(actions).toBe(0)
+  await expect(panel.getByText(/启动后按实际运行时间计费/)).toBeVisible()
+  await panel.getByRole('button', { name: '取消', exact: true }).click()
+  expect(actions).toBe(0)
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  await panel.getByRole('button', { name: '确认启动', exact: true }).click()
+  await expect(panel.getByRole('status')).toContainText('运行中')
+  await panel.getByRole('button', { name: '关闭并解除分配', exact: true }).click()
+  await page.screenshot({ path: testInfo.outputPath('vm-confirmation.png') })
+  await panel.getByRole('button', { name: '确认关闭并解除分配', exact: true }).click()
+  await expect(panel.getByRole('status')).toContainText('已解除分配')
+  expect(actions).toBe(2)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
+
+test('VM panel blocks uncertain operations and retains action errors on refresh', async ({ page }, testInfo) => {
+  let operationStatus = 'pending'
+  let powerState = 'starting'
+  let reads = 0
+  let actions = 0
+  await page.route('**/api/vm', route => {
+    reads++
+    return route.fulfill({ json: { configured: true, name: 'test-gpu-with-a-long-instance-name', powerState, gpuReady: false, operation: { id: 'test-operation', action: 'start', status: operationStatus } } })
+  })
+  await page.route('**/api/vm/actions', route => {
+    actions++
+    return route.fulfill({ status: 409, json: { error: 'GPU 有运行或排队任务，不能关闭或重启。' } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'VM 管理', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'VM 管理' })
+  await expect(panel.getByText('启动 · 执行中', { exact: true })).toBeVisible()
+  await expect(panel.locator('.vm-controls button:enabled')).toHaveCount(0)
+  operationStatus = 'unknown'
+  powerState = 'running'
+  await panel.getByRole('button', { name: '刷新 VM 状态' }).click()
+  await expect(panel.getByText(/结果待核实，禁止重复操作/)).toBeVisible()
+  await expect(panel.locator('.vm-controls button:enabled')).toHaveCount(0)
+  await page.screenshot({ path: testInfo.outputPath('vm-unknown.png') })
+  operationStatus = 'failed'
+  await panel.getByRole('button', { name: '刷新 VM 状态' }).click()
+  await expect(panel.getByText('启动 · 失败', { exact: true })).toBeVisible()
+  await panel.getByRole('button', { name: '重启', exact: true }).click()
+  await panel.getByRole('button', { name: '确认重启', exact: true }).click()
+  await expect(panel.getByRole('alert')).toContainText('GPU 有运行或排队任务')
+  const previousReads = reads
+  await panel.getByRole('button', { name: '刷新 VM 状态' }).click()
+  await expect.poll(() => reads).toBeGreaterThan(previousReads)
+  await expect(panel.getByRole('button', { name: '刷新 VM 状态' })).toBeEnabled()
+  await expect(panel.getByRole('alert')).toContainText('GPU 有运行或排队任务')
+  expect(actions).toBe(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
+
+test('mixed uploads enter the library and chat submits only selected asset IDs', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '多文件上传' } })).json()
+  const submitted: { assetIds: string[]; text: string }[] = []
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', models: { images: ['azure-image2'], videos: [] } } }))
+  await page.route(`**/api/projects/${project.id}/chat`, async route => {
+    const body = route.request().postDataJSON()
+    expect(Object.keys(body).sort()).toEqual(['requestId', 'text', 'assetIds', 'ratio', 'quality', 'mode', 'imageModel', 'videoModel'].sort())
+    expect(JSON.stringify(body)).not.toContain('PRIVATE_FILE_CONTENT')
+    submitted.push(body)
+    const result = await request.post(`/api/projects/${project.id}/messages`, { data: { requestId: body.requestId, text: body.text, assetIds: body.assetIds, ratio: body.ratio } })
+    expect(result.status()).toBe(202)
+    await route.fulfill({ status: 202, json: await result.json() })
+  })
+  await page.goto('/')
+  await page.evaluate(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.reload()
+  const image = await sharp({ create: { width: 64, height: 32, channels: 3, background: '#16785d' } }).png().toBuffer()
+  const clip = Buffer.from(await page.evaluate(async () => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 64; canvas.height = 64
+    const context = canvas.getContext('2d')!
+    const stream = canvas.captureStream(24)
+    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' })
+    const chunks: Blob[] = []
+    const recording = new Promise<Blob>(resolve => {
+      recorder.ondataavailable = event => chunks.push(event.data)
+      recorder.onstop = () => resolve(new Blob(chunks))
+    })
+    recorder.start()
+    for (let frame = 0; frame < 20; frame++) {
+      context.fillStyle = frame % 2 ? '#16785d' : '#f4c943'
+      context.fillRect(0, 0, 64, 64)
+      await new Promise(requestAnimationFrame)
+    }
+    recorder.stop()
+    const bytes = await (await recording).arrayBuffer()
+    stream.getTracks().forEach(track => track.stop())
+    return Array.from(new Uint8Array(bytes))
+  }))
+  const text = Buffer.from('PRIVATE_FILE_CONTENT')
+  await page.locator('input[type=file]').setInputFiles([
+    { name: '照片.png', mimeType: 'image/png', buffer: image },
+    { name: '视频.webm', mimeType: 'video/webm', buffer: clip },
+    { name: '资料.txt', mimeType: 'text/plain', buffer: text },
+  ])
+  await expect(page.getByRole('button', { name: '移除附件 资料.txt', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: '上传文件', exact: true })).toBeEnabled()
+  const snapshot = await (await request.get(`/api/projects/${project.id}`)).json()
+  expect(snapshot.assets).toHaveLength(3)
+  expect(submitted).toHaveLength(0)
+  await page.getByRole('button', { name: '移除附件 资料.txt', exact: true }).click()
+  await page.screenshot({ path: testInfo.outputPath('mixed-attachments.png') })
+  await page.getByRole('button', { name: '提交需求', exact: true }).click()
+  await expect.poll(() => submitted.length).toBe(1)
+  expect(submitted[0].text).toBe('已上传附件。')
+  expect(submitted[0].assetIds).toEqual(snapshot.assets.filter((asset: { name: string }) => asset.name !== '资料.txt').map((asset: { id: string }) => asset.id))
+  await expect(page.locator('.attachments')).toHaveCount(0)
+  await expect(page.locator('.user-message')).toContainText('视频.webm')
+  await openProjectPanel(page, '素材库')
+  await expect(page.locator('.asset')).toHaveCount(3)
+  await page.screenshot({ path: testInfo.outputPath('mixed-library.png') })
+  await page.locator('.asset').filter({ hasText: '资料.txt' }).click()
+  const download = page.waitForEvent('download')
+  await page.getByRole('link', { name: '下载文件', exact: true }).click()
+  expect((await download).suggestedFilename()).toBe('资料.txt')
+  await page.getByRole('button', { name: '附加到对话', exact: true }).click()
+  await page.getByLabel('创作需求').fill('已上传一份资料')
+  await page.getByRole('button', { name: '提交需求', exact: true }).click()
+  await expect.poll(() => submitted.length).toBe(2)
+  expect(submitted[1].assetIds).toEqual([snapshot.assets.find((asset: { name: string }) => asset.name === '资料.txt').id])
+  await expect(page.locator('.attachments')).toHaveCount(0)
+  await page.reload()
+  await expect(page.locator('.message-file')).toHaveCount(2)
+  await page.locator('.message-file').filter({ hasText: '视频.webm' }).click()
+  const video = page.getByRole('dialog').locator('video')
+  await expect(video).toHaveAttribute('src', /\/api\/assets\/.+\/content$/)
+  await video.evaluate(element => { const media = element as HTMLVideoElement; media.muted = true; return media.play() })
+  await expect.poll(() => video.evaluate(element => (element as HTMLVideoElement).currentTime)).toBeGreaterThan(0)
+  expect(await video.evaluate(element => (element as HTMLVideoElement).videoWidth)).toBe(64)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
 
 test('PWA manifest, icons and network-only worker protect private content', async ({ page, context, request }) => {
   await page.goto('/')
@@ -49,10 +233,10 @@ test('create, upload, submit, persist, cancel, reuse and download', async ({ pag
   await expect(page.getByRole('status', { name: '已同步', exact: true })).toBeVisible()
   await page.screenshot({ path: testInfo.outputPath('workspace.png'), fullPage: true })
   await page.locator('input[type=file]').setInputFiles(resolve('public/reference-interior.jpg'))
-  await expect(page.getByRole('button', { name: '移除参考图 reference-interior.jpg' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '移除附件 reference-interior.jpg' })).toBeVisible()
   await page.getByLabel('创作需求').fill('保留室内结构，增加窗边自然光。')
   await page.getByRole('button', { name: '设置', exact: true }).click()
-  await page.getByLabel('图片比例').selectOption('4:3')
+  await page.getByLabel('默认比例').selectOption('4:3')
   await page.getByRole('button', { name: '关闭', exact: true }).click()
   await page.getByRole('button', { name: '提交需求' }).click()
   await expect(page.getByText('已保存 · 等待服务接入')).toBeVisible()
@@ -121,7 +305,7 @@ test('sample reference is real, uploaded explicitly, and not a generated result'
   await page.getByRole('button', { name: '保存项目' }).click()
   await page.getByRole('button', { name: '静物与光' }).click()
   await expect(page.getByLabel('创作需求')).toHaveValue(/参考这张图片/)
-  await expect(page.getByRole('button', { name: '移除参考图 静物与光.jpg' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '移除附件 静物与光.jpg' })).toBeVisible()
   await openProjectPanel(page, '素材库')
   await expect(page.locator('.asset')).toHaveCount(1)
   await expect.poll(() => page.locator('.asset img').evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0)
@@ -279,6 +463,38 @@ test('image loading stays visible after reply, resend sits inside bubble, and re
   await page.screenshot({ path: testInfo.outputPath('image-completed-actions.png'), fullPage: true })
 })
 
+test('video results use playback and download controls instead of image zoom', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '视频展示回归' } })).json()
+  const assetId = crypto.randomUUID()
+  const messageId = crypto.randomUUID()
+  const assistantId = crypto.randomUUID()
+  const now = new Date().toISOString()
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: {
+    project, threadId: null, jobs: [],
+    runs: [{ id: assetId, projectId: project.id, messageId, assistantId, status: 'completed', stage: 'video', createdAt: now, input: { text: '视频测试', mode: 'auto', ratio: '3:2', videoModel: 'minimax-h3' } }],
+    messages: [{ id: messageId, projectId: project.id, role: 'user', text: '视频测试', assetIds: [], createdAt: now }, { id: assistantId, projectId: project.id, role: 'assistant', text: '视频测试夹具', assetIds: [assetId], createdAt: now }],
+    assets: [{ id: assetId, projectId: project.id, name: 'fixture.mp4', kind: 'generated', mediaType: 'video', provider: 'comfyui', model: 'minimax-h3', width: 832, height: 480, duration: 124 / 24, fps: 24 }],
+  } }))
+  await page.route(`**/api/assets/${assetId}/content*`, route => route.request().url().includes('thumbnail=1')
+    ? route.fulfill({ path: resolve('public/reference-interior.jpg'), contentType: 'image/jpeg' })
+    : route.fulfill({ status: 204 }))
+  await page.goto('/')
+  await page.evaluate(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.reload()
+  await expect(page.locator('video')).toBeVisible()
+  await expect(page.locator('video')).toHaveAttribute('controls', '')
+  await expect(page.locator('video')).toHaveAttribute('playsinline', '')
+  await expect(page.getByRole('link', { name: '下载视频' })).toHaveAttribute('href', `/api/assets/${assetId}/content?download=1`)
+  await expect(page.getByText('MiniMax H3 · 5.17 秒')).toBeVisible()
+  await openProjectPanel(page, '素材库')
+  await page.locator('.asset').click()
+  await expect(page.getByRole('dialog').locator('video')).toBeVisible()
+  await expect(page.getByRole('button', { name: '放大', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '用作参考' })).toHaveCount(0)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('video-viewer.png') })
+})
+
 test('configured chat displays assistant, Azure assets and run history', async ({ page, request }, testInfo) => {
   const project = await (await request.post('/api/projects', { data: { title: '会话界面测试' } })).json()
   const now = new Date().toISOString()
@@ -289,10 +505,13 @@ test('configured chat displays assistant, Azure assets and run history', async (
   let submitted = false
   const expectedMode = 'auto'
   let expectedRatio = '1:1'
+  let expectedImageModel = 'azure-image2'
+  let expectedQuality = 'low'
+  let expectedVideoModel = 'none'
   let submitCount = 0
   let runStatus = 'completed'
   const progress = [{ id: 'reasoning:1', label: 'Codex 推理摘要', detail: '这是测试夹具的公开摘要。', createdAt: now }]
-  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', openmontage: 'installed' } }))
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', openmontage: 'installed', models: { images: ['azure-image2', 'qwen-image-2.1'], videos: ['minimax-h3'] } } }))
   await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: { project, threadId, jobs: [],
     messages: submitted ? [{ id: messageId, projectId: project.id, text: '手机对话测试', assetIds: [], createdAt: now, role: 'user' },
       { id: assistantId, projectId: project.id, text: '测试夹具中的助手回复', assetIds: [runId], createdAt: now, role: 'assistant' }] : [],
@@ -305,7 +524,10 @@ test('configured chat displays assistant, Azure assets and run history', async (
     const body = route.request().postDataJSON()
     expect(body.mode).toBe(expectedMode)
     expect(body.ratio).toBe(expectedRatio)
-    expect(body.assetIds).toBeUndefined()
+    expect(body.imageModel).toBe(expectedImageModel)
+    expect(body.quality).toBe(expectedQuality)
+    expect(body.videoModel).toBe(expectedVideoModel)
+    expect(body.assetIds).toEqual([])
     submitted = true
     submitCount += 1
     await route.fulfill({ status: 202, json: { id: runId } })
@@ -346,7 +568,7 @@ test('configured chat displays assistant, Azure assets and run history', async (
   await expect(page.getByRole('navigation', { name: '项目视图' })).toHaveCount(0)
   await page.getByLabel('创作需求').fill('查看素材时保留草稿')
   await openProjectPanel(page, '素材库')
-  await expect(page.getByText('Azure 生成', { exact: true })).toBeVisible()
+  await expect(page.getByText(/^azure 生成$/i)).toBeVisible()
   await page.locator('.asset').click()
   await expect(page.getByText(/azure \/ gpt-image-2/)).toBeVisible()
   await page.getByRole('button', { name: '关闭', exact: true }).click()
@@ -360,14 +582,32 @@ test('configured chat displays assistant, Azure assets and run history', async (
   await page.getByLabel('创作需求').fill('请生成一张透明玻璃杯的图片')
   await expect(page.getByRole('dialog')).toHaveCount(0)
   await page.getByRole('button', { name: '设置', exact: true }).click()
-  await page.getByLabel('图片比例').selectOption('2:3')
-  await expect(page.locator('.image-cost')).toContainText('1张 · 低质量 · 按量计费')
+  await page.getByLabel('默认比例').selectOption('2:3')
+  await expect(page.getByLabel('默认质量')).toHaveValue('low')
+  await expect(page.locator('.image-cost')).toHaveCount(0)
+  await expect(page.getByText('视频模型未启用', { exact: true })).toHaveCount(0)
+  await page.getByLabel('默认质量').selectOption('high')
+  expectedQuality = 'high'
+  await page.getByLabel('图片模型').selectOption('qwen-image-2.1')
+  await page.getByLabel('视频模型').selectOption('minimax-h3')
+  await expect(page.getByLabel('图片模型')).toHaveValue('qwen-image-2.1')
+  await page.screenshot({ path: testInfo.outputPath('model-options.png') })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  expectedImageModel = 'qwen-image-2.1'
+  expectedVideoModel = 'minimax-h3'
   await page.getByRole('button', { name: '关闭', exact: true }).click()
   await expect(page.getByLabel('创作需求')).toHaveValue('请生成一张透明玻璃杯的图片')
   expectedRatio = '2:3'
   await page.getByRole('button', { name: '提交需求' }).click()
   await expect.poll(() => submitCount).toBe(2)
   await expect(page.getByLabel('创作需求')).toHaveValue('')
+  await page.reload()
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await expect(page.getByLabel('图片模型')).toHaveValue('qwen-image-2.1')
+  await expect(page.getByLabel('默认比例')).toHaveValue('2:3')
+  await expect(page.getByLabel('默认质量')).toHaveValue('high')
+  await expect(page.getByLabel('视频模型')).toHaveValue('minimax-h3')
+  await page.getByRole('button', { name: '关闭', exact: true }).click()
   runStatus = 'running'
   await request.patch(`/api/projects/${project.id}`, { data: { title: '运行中输入区测试' } })
   await expect(page.getByRole('button', { name: '停止当前回复' })).toBeVisible()
@@ -377,7 +617,7 @@ test('configured chat displays assistant, Azure assets and run history', async (
     await expect.poll(() => page.evaluate(() => {
       const composer = document.querySelector('.composer')!.getBoundingClientRect()
       const body = document.querySelector('.conversation-scroll')!.getBoundingClientRect()
-      const attachment = document.querySelector('[aria-label="上传参考图"]')!.getBoundingClientRect()
+      const attachment = document.querySelector('[aria-label="上传文件"]')!.getBoundingClientRect()
       const stop = document.querySelector('[aria-label="停止当前回复"]')!.getBoundingClientRect()
       const send = document.querySelector('.send')!.getBoundingClientRect()
       return body.height >= window.innerHeight - 260 && body.bottom <= composer.top && composer.bottom <= window.innerHeight && attachment.right <= stop.left && stop.right <= send.left && send.right <= composer.right && stop.height >= 44 && document.documentElement.scrollWidth <= window.innerWidth

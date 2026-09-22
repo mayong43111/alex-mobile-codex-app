@@ -8,8 +8,89 @@ import sharp from 'sharp'
 import { buildApp } from './app.ts'
 import { Store } from './store.ts'
 import { AgentWorker, managedModelToken } from './agent.ts'
-import type { AgentTransport, RemoteRun, SourceImage } from './agent.ts'
+import type { AgentTransport, ImageCandidate, RemoteRun, SourceImage } from './agent.ts'
 import type { AssetStorage } from './assets.ts'
+import { VmController } from './vm.ts'
+
+test('VM controller pins the target, deduplicates operations and refuses busy GPU shutdown', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-vm-'))
+  let power = 'deallocated'
+  let posts = 0
+  let queued = false
+  const controller = new VmController({ subscription: randomUUID(), resourceGroup: 'test-rg', name: 'test-vm', comfyUrl: 'http://gpu.invalid', auth: 'cli' }, join(directory, 'vm.json'), async (url, method) => {
+    assert(url.startsWith('https://management.azure.com/'))
+    if (method === 'POST') { posts++; power = 'running'; return new Response(null, { status: 202, headers: { 'azure-asyncoperation': 'https://management.azure.com/test-operation' } }) }
+    return Response.json(url.endsWith('/test-operation') ? { status: 'Succeeded' } : { statuses: [{ code: `PowerState/${power}` }] })
+  }, async () => Response.json({ queue_running: queued ? ['task'] : [], queue_pending: [] }))
+  try {
+    await controller.initialize()
+    const id = randomUUID()
+    await assert.rejects(controller.act('start', id, 'wrong-vm', false), /名称/)
+    assert.equal((await controller.act('start', id, 'test-vm', false)).powerState, 'running')
+    await controller.act('start', id, 'test-vm', false)
+    assert.equal(posts, 1)
+    queued = true
+    await assert.rejects(controller.act('deallocate', randomUUID(), 'test-vm', true), /GPU/)
+    assert.equal(posts, 1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('VM API blocks actions while application work is pending', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-vm-api-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  const project = store.createProject('Busy')
+  store.queueAgent(project.id, { requestId: randomUUID(), text: 'test', ratio: '1:1', mode: 'auto' })
+  store.db.close()
+  let calls = 0
+  const app = await buildApp({ dataDir, vm: { busy: false, async status() { return { configured: true, name: 'test' } }, async act() { calls++; return { configured: true } } } })
+  try {
+    assert.equal((await app.inject('/api/vm')).json().name, 'test')
+    const result = await app.inject({ method: 'POST', url: '/api/vm/actions', payload: { action: 'deallocate', requestId: randomUUID(), confirmedName: 'test' } })
+    assert.equal(result.statusCode, 409)
+    assert.equal(calls, 0)
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('uncertain VM operation survives restart without resubmission', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-vm-uncertain-'))
+  const config = { subscription: randomUUID(), resourceGroup: 'test', name: 'test', comfyUrl: 'http://gpu.invalid', auth: 'cli' as const }
+  let posts = 0
+  const request = async (_url: string, method?: string) => {
+    if (method === 'POST') { posts++; throw new Error('Lost response') }
+    return Response.json({ statuses: [{ code: 'PowerState/deallocated' }] })
+  }
+  try {
+    const first = new VmController(config, join(directory, 'vm.json'), request)
+    await first.initialize()
+    const id = randomUUID()
+    await assert.rejects(first.act('start', id, 'test', false), /待核实/)
+    const second = new VmController(config, join(directory, 'vm.json'), request)
+    await second.initialize()
+    assert(second.busy)
+    assert.equal((await second.act('start', id, 'test', false)).operation?.status, 'unknown')
+    await assert.rejects(second.act('start', randomUUID(), 'test', false), /重复提交/)
+    assert.equal(posts, 1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('cloud VM control uses the application login authorization', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-vm-auth-'))
+  const tenantId = randomUUID(), userId = randomUUID()
+  let calls = 0
+  const app = await buildApp({ dataDir, entra: { tenantId, userIds: [userId] }, vm: { busy: false, async status() { return { configured: true } }, async act() { calls++; return { configured: true } } } })
+  const principal = Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [{ typ: 'tid', val: tenantId }, { typ: 'oid', val: userId }] })).toString('base64')
+  try {
+    const payload = { action: 'start', requestId: randomUUID(), confirmedName: 'test' }
+    assert.equal((await app.inject({ url: '/api/vm', headers: { 'x-ms-client-principal': principal } })).statusCode, 200)
+    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', headers: { 'x-ms-client-principal': principal }, payload })).statusCode, 202)
+    for (const headers of [{}, { 'x-ms-client-principal': Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [{ typ: 'tid', val: tenantId }, { typ: 'oid', val: randomUUID() }] })).toString('base64') }]) {
+      const expectedStatus = 'x-ms-client-principal' in headers ? 403 : 401
+      assert.equal((await app.inject({ url: '/api/vm', headers })).statusCode, expectedStatus)
+      assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', headers, payload })).statusCode, expectedStatus)
+    }
+    assert.equal(calls, 1)
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
 
 function memoryAssets() {
   const objects = new Map<string, Buffer>()
@@ -20,6 +101,185 @@ function memoryAssets() {
   }
   return { objects, storage }
 }
+
+test('chat attachments belong to the current project and survive resend', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-attachments-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  try {
+    const project = store.createProject('Files')
+    const other = store.createProject('Other')
+    const asset = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'reference.png', width: 32, height: 32, bytes: 10, hash: 'test', kind: 'reference', createdAt: new Date().toISOString() })
+    const input = { requestId: randomUUID(), text: '附件已上传', mode: 'auto' as const, ratio: '1:1' as const, assetIds: [asset.id] }
+    assert.throws(() => store.queueAgent(other.id, input), /another project/)
+    assert.throws(() => store.queueAgent(project.id, { ...input, assetIds: [asset.id, asset.id] }), /Invalid attachments/)
+    const run = store.queueAgent(project.id, input)
+    assert.deepEqual(store.snapshot(project.id).messages[0].assetIds, [asset.id])
+    assert.equal(store.queueAgent(project.id, input).id, run.id)
+    assert.throws(() => store.queueAgent(project.id, { ...input, assetIds: [] }), /already used/)
+    store.updateAgent(run.id, { status: 'completed' })
+    const resent = store.resend(project.id, run.messageId, { requestId: randomUUID(), expectedTailId: store.snapshot(project.id).messages.at(-1)!.id }, true)
+    assert('input' in resent)
+    assert.deepEqual(resent.input.assetIds, [asset.id])
+  } finally { store.db.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('chat API validates attachment IDs and rejects client supplied locations', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-chat-files-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  const project = store.createProject('Files')
+  const other = store.createProject('Other')
+  const asset = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'notes.txt', width: 0, height: 0, bytes: 20, hash: 'test', kind: 'reference', mediaType: 'file', createdAt: new Date().toISOString() })
+  store.db.close()
+  const app = await buildApp({ dataDir, agent: { async health() { return {} }, async submit() {}, async get() { throw new Error('Not polled') }, async stop() {} } })
+  try {
+    const input = { requestId: randomUUID(), text: '已上传附件', mode: 'auto', ratio: '1:1', assetIds: [asset.id] }
+    const url = `/api/projects/${project.id}/chat`
+    assert.equal((await app.inject({ method: 'POST', url: `/api/projects/${other.id}/chat`, payload: input })).statusCode, 400)
+    assert.equal((await app.inject({ method: 'POST', url, payload: { ...input, location: '/private/file' } })).statusCode, 400)
+    assert.equal((await app.inject({ method: 'POST', url, payload: { ...input, assetIds: [asset.id, asset.id] } })).statusCode, 400)
+    assert.equal((await app.inject({ method: 'POST', url, payload: { ...input, assetIds: [randomUUID()] } })).statusCode, 404)
+    const accepted = await app.inject({ method: 'POST', url, payload: input })
+    assert.equal(accepted.statusCode, 202)
+    assert.deepEqual(accepted.json().input.assetIds, [asset.id])
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('worker sends only current attachment metadata and protected locations without reading bytes', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-notices-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  const project = store.createProject('Files')
+  const asset = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'notes.txt', width: 0, height: 0, bytes: 500, hash: 'private-hash', kind: 'reference', mediaType: 'file', mimeType: 'text/plain', storageExtension: 'bin', hasThumbnail: false, createdAt: new Date().toISOString() })
+  const earlierAsset = store.addAsset({ ...asset, id: randomUUID(), name: 'earlier.txt' })
+  store.addAsset({ ...asset, id: randomUUID(), name: 'unselected.txt' })
+  const earlier = store.queueAgent(project.id, { requestId: randomUUID(), text: 'Earlier attachment', mode: 'chat', ratio: '1:1', assetIds: [earlierAsset.id] })
+  store.updateAgent(earlier.id, { status: 'completed' })
+  let submissions = 0
+  const worker = new AgentWorker(store, dataDir, {
+    async health() { return {} }, async stop() {}, async get() { throw new Error('Not polled') },
+    async submit(_run, _threadId, history, sourceImage, attachments) {
+      submissions++
+      assert.deepEqual(sourceImage, [])
+      assert.equal(history?.[0].attachments?.[0].assetId, earlierAsset.id)
+      assert(!JSON.stringify(history).includes('unselected.txt'))
+      assert.deepEqual(attachments, [{ assetId: asset.id, name: 'notes.txt', mediaType: 'file', mimeType: 'text/plain', bytes: 500, location: `/api/assets/${asset.id}/content` }])
+    },
+  }, { async read() { throw new Error('Attachment bytes must not be read') }, async put() {}, async remove() {} })
+  try {
+    store.queueAgent(project.id, { requestId: randomUUID(), text: '收到附件了吗', mode: 'auto', ratio: '1:1', assetIds: [asset.id] })
+    await worker.tick()
+    assert.equal(submissions, 1)
+    assert.equal(store.snapshot(project.id).runs.at(-1)!.status, 'running')
+  } finally { await worker.close(); store.db.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('worker stages only selected or latest retained attachments for on-demand reading', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-readable-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  const project = store.createProject('Readable')
+  const bytes = Buffer.from('Only a tool should reveal this text')
+  const hash = createHash('sha256').update(bytes).digest('hex')
+  const asset = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'notes.txt', width: 0, height: 0, bytes: bytes.length, hash, kind: 'reference', mediaType: 'file', storageExtension: 'bin', hasThumbnail: false, mimeType: 'text/plain', createdAt: new Date().toISOString() })
+  store.addAsset({ ...asset, id: randomUUID(), name: 'unselected.txt' })
+  let staged = 0, submitted = 0
+  const worker = new AgentWorker(store, dataDir, {
+    async health() { return {} }, async stop() {},
+    async get(id) { return { id, status: 'completed', stage: 'codex', reply: 'ok', threadId: null } },
+    async uploadAttachment(_runId, notice, content) { staged++; assert.equal(notice.assetId, asset.id); assert.deepEqual(content, bytes) },
+    async submit(_run, _thread, _history, _source, current, readable) {
+      submitted++
+      assert.equal(current?.length, submitted === 1 ? 1 : 0)
+      assert.equal(readable?.length, 1)
+      assert.equal(readable?.[0].assetId, asset.id)
+      assert(!JSON.stringify(readable).includes(bytes.toString()))
+    },
+  }, { async read(key) { assert.equal(key, `${asset.id}.bin`); return bytes }, async put() {}, async remove() {} })
+  try {
+    store.queueAgent(project.id, { requestId: randomUUID(), text: '看看附件', mode: 'chat', ratio: '1:1', assetIds: [asset.id] })
+    await worker.tick(); await worker.tick()
+    store.queueAgent(project.id, { requestId: randomUUID(), text: '继续读刚才的资料', mode: 'chat', ratio: '1:1' })
+    await worker.tick()
+    assert.equal(staged, 2)
+    assert.equal(submitted, 2)
+  } finally { await worker.close(); store.db.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('project deletion rejects active and stale changes, removes metadata and files', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-delete-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  const project = store.createProject('Delete me')
+  const assetId = randomUUID()
+  const { storage, objects } = memoryAssets()
+  store.addAsset({ id: assetId, projectId: project.id, name: 'video.mp4', mediaType: 'video', width: 32, height: 32, bytes: 4, hash: 'test', kind: 'generated', createdAt: new Date().toISOString() })
+  objects.set(`${assetId}.mp4`, Buffer.from('test'))
+  objects.set(`${assetId}.webp`, Buffer.from('test'))
+  const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'test', mode: 'auto', ratio: '1:1' })
+  assert.throws(() => store.deleteProject(project.id, store.project(project.id).updatedAt), /停止/)
+  store.updateAgent(run.id, { status: 'completed' })
+  const current = store.project(project.id)
+  store.db.close()
+  const app = await buildApp({ dataDir, assetStorage: storage })
+  try {
+    assert.equal((await app.inject({ method: 'DELETE', url: `/api/projects/${project.id}`, payload: { expectedUpdatedAt: '2000-01-01T00:00:00.000Z' } })).statusCode, 409)
+    const deleted = await app.inject({ method: 'DELETE', url: `/api/projects/${project.id}`, payload: { expectedUpdatedAt: current.updatedAt } })
+    assert.equal(deleted.statusCode, 200)
+    assert.equal(deleted.json().pendingCleanup, 0)
+    assert.equal(objects.size, 0)
+    assert.equal((await app.inject(`/api/projects/${project.id}`)).statusCode, 404)
+    assert.equal((await app.inject(`/api/assets/${assetId}/content`)).statusCode, 404)
+    assert.equal((await app.inject('/api/projects')).json().length, 0)
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('model choices persist through resend and videos support range downloads', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-video-'))
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  const { storage, objects } = memoryAssets()
+  const thumbnail = await sharp({ create: { width: 32, height: 32, channels: 3, background: '#047d6a' } }).webp().toBuffer()
+  const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(64)])
+  let selected: string | undefined
+  const transport: AgentTransport = {
+    async health() { return { models: { images: ['azure-image2', 'qwen-image-2.1'], videos: ['minimax-h3'] } } },
+    async submit(run) { selected = run.input.videoModel },
+    async get(id) { return { id, status: 'completed', stage: 'video', threadId: null, reply: '视频已完成', video: { mp4: mp4.toString('base64'), thumbnail: thumbnail.toString('base64'), width: 832, height: 480, duration: 124 / 24, fps: 24, model: 'minimax-h3', provider: 'comfyui', checkpoint: 'test' } } },
+    async stop() {},
+  }
+  const worker = new AgentWorker(store, dataDir, transport, storage)
+  const project = store.createProject('Video')
+  const run = store.queueAgent(project.id, { requestId: randomUUID(), text: '生成视频', mode: 'auto', ratio: '3:2', imageModel: 'qwen-image-2.1', videoModel: 'minimax-h3' })
+  await worker.tick(); await worker.tick()
+  assert.equal(selected, 'minimax-h3')
+  assert.equal(store.asset(run.id).mediaType, 'video')
+  assert.deepEqual(objects.get(`${run.id}.mp4`), mp4)
+  assert.equal(store.agentRun(run.id).assetId, run.id)
+  const resend = worker.resend(project.id, run.messageId, { requestId: randomUUID(), expectedTailId: store.snapshot(project.id).messages.at(-1)!.id })
+  assert('input' in resend)
+  assert.equal(resend.input.imageModel, 'qwen-image-2.1')
+  assert.equal(resend.input.videoModel, 'minimax-h3')
+  store.updateAgent(resend.id, { status: 'cancelled' })
+  await worker.close()
+  store.db.close()
+  const app = await buildApp({ dataDir, assetStorage: storage, agent: transport })
+  try {
+    assert.deepEqual((await app.inject('/api/health')).json().models.videos, ['minimax-h3'])
+    const url = `/api/assets/${run.id}/content`
+    const content = await app.inject(url)
+    assert.equal(content.headers['content-type'], 'video/mp4')
+    assert.deepEqual(content.rawPayload, mp4)
+    const range = await app.inject({ url, headers: { range: 'bytes=4-7' } })
+    assert.equal(range.statusCode, 206)
+    assert.equal(range.body, 'ftyp')
+    assert.equal(range.headers['content-range'], `bytes 4-7/${mp4.length}`)
+    assert.equal((await app.inject({ url, headers: { range: 'bytes=999999-' } })).statusCode, 416)
+    assert.equal((await app.inject({ url, headers: { range: 'bytes=0-1,3-4' } })).statusCode, 416)
+    assert.match((await app.inject(`${url}?download=1`)).headers['content-disposition']!, /\.mp4/)
+    assert.equal((await app.inject(`${url}?thumbnail=1`)).headers['content-type'], 'image/webp')
+    const input = { requestId: randomUUID(), text: '讨论模型', mode: 'auto', ratio: '1:1', imageModel: 'qwen-image-2.1', videoModel: 'minimax-h3' }
+    const queued = await app.inject({ method: 'POST', url: `/api/projects/${project.id}/chat`, payload: input })
+    assert.equal(queued.statusCode, 202)
+    assert.equal(queued.json().input.imageModel, 'qwen-image-2.1')
+    assert.equal((await app.inject({ method: 'POST', url: `/api/projects/${project.id}/chat`, payload: { ...input, imageModel: 'arbitrary-model' } })).statusCode, 400)
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
 
 test('managed model identity uses the model audience and rejects failed or stale tokens', async () => {
   const environment = { IDENTITY_ENDPOINT: 'http://127.0.0.1/identity', IDENTITY_HEADER: 'test-header' }
@@ -171,22 +431,26 @@ test('worker serializes turns, imports one image, stops queued work and does not
   }
 })
 
-test('editing reads the retained prior original from storage, preserves it and checks lineage', async () => {
+test('editing transfers only the Codex-selected retained image and checks lineage', async () => {
   const store = new Store(':memory:')
   const { storage, objects } = memoryAssets()
   const original = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#ffffff' } }).png().toBuffer()
   const edited = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#ff0000' } }).png().toBuffer()
   const sourceHash = createHash('sha256').update(original).digest('hex')
-  const submissions: (SourceImage | undefined)[] = []
+  const submissions: ImageCandidate[][] = []
+  const sources: SourceImage[] = []
   const remote = new Map<string, RemoteRun>()
   const threadId = randomUUID()
   const transport: AgentTransport = {
     async health() { return {} },
-    async submit(run, _thread, _history, source) {
-      submissions.push(source)
-      remote.set(run.id, { id: run.id, status: 'completed', stage: 'image', threadId, reply: 'Done', imageOperation: source ? 'edit' : 'generate',
-        image: { png: (source ? edited : original).toString('base64'), width: 64, height: 64, model: 'test', checkpoint: 'test', operation: source ? 'edit' : 'generate',
-          ...(source ? { sourceAssetId: source.assetId, sourceHash: source.hash } : {}) } })
+    async submit(run, _thread, _history, candidates = []) {
+      submissions.push(candidates)
+      if (run.input.text === 'Generate') remote.set(run.id, { id: run.id, status: 'completed', stage: 'image', threadId, reply: 'Done', imageOperation: 'generate', image: { png: original.toString('base64'), width: 64, height: 64, model: 'test', checkpoint: 'test', operation: 'generate' } })
+      else remote.set(run.id, { id: run.id, status: 'running', stage: 'codex', threadId, reply: 'Edit the first image', imageOperation: 'edit', needsSource: true, sourceAssetId: candidates[0].assetId })
+    },
+    async provideSource(id, source) {
+      sources.push(source)
+      remote.set(id, { id, status: 'completed', stage: 'image', threadId, reply: 'Done', imageOperation: 'edit', image: { png: edited.toString('base64'), width: 64, height: 64, model: 'test', checkpoint: 'test', operation: 'edit', sourceAssetId: source.assetId, sourceHash: source.hash } })
     },
     async get(id) { return remote.get(id)! },
     async stop() {},
@@ -197,15 +461,21 @@ test('editing reads the retained prior original from storage, preserves it and c
     const send = (text: string) => store.queueAgent(project.id, { requestId: randomUUID(), text, mode: 'auto', ratio: '1:1' })
     const first = send('Generate')
     await worker.tick(); await worker.tick()
-    assert.equal(submissions[0], undefined)
+    assert.deepEqual(submissions[0], [])
+    const second = send('Generate')
+    await worker.tick(); await worker.tick()
+    assert.equal(sources.length, 0)
     const edit = send('Make it red')
     const future = send('Later image')
     store.addAsset({ ...store.asset(first.id), id: future.id, runId: future.id })
     store.updateAgent(future.id, { status: 'completed', reply: 'Later', assetId: future.id })
+    await worker.tick()
+    assert.deepEqual(submissions[2].map(candidate => candidate.assetId), [first.id, second.id])
+    assert.equal(store.agentRun(edit.id).sourceAssetId, undefined)
     await worker.tick(); await worker.tick()
-    assert.equal(submissions[1]?.assetId, first.id)
-    assert.equal(submissions[1]?.hash, sourceHash)
-    assert.deepEqual(Buffer.from(submissions[1]!.png, 'base64'), original)
+    assert.equal(sources[0].assetId, first.id)
+    assert.equal(sources[0].hash, sourceHash)
+    assert.deepEqual(Buffer.from(sources[0].png, 'base64'), original)
     assert.equal(store.agentRun(edit.id).imageOperation, 'edit')
     assert.equal(store.asset(edit.id).sourceAssetId, first.id)
     assert.equal(store.asset(edit.id).sourceHash, sourceHash)
@@ -213,12 +483,63 @@ test('editing reads the retained prior original from storage, preserves it and c
     assert.deepEqual(objects.get(`${edit.id}.png`), edited)
     const retry = worker.resend(project.id, edit.messageId, { requestId: randomUUID(), expectedTailId: store.snapshot(project.id).messages.at(-1)!.id })
     await worker.tick()
-    assert.equal(submissions[2]?.assetId, first.id)
+    assert.deepEqual(submissions[3].map(candidate => candidate.assetId), [first.id, second.id])
+    await worker.tick()
     remote.get(retry.id)!.image!.sourceAssetId = future.id
     await worker.tick()
     assert.equal(store.agentRun(retry.id).status, 'interrupted')
     assert.equal(objects.has(`${retry.id}.png`), false)
-    assert.equal(store.snapshot(project.id).assets.length, 3)
+    assert.equal(store.snapshot(project.id).assets.length, 4)
+  } finally { await worker.close(); store.db.close() }
+})
+
+test('Codex can select either uploaded image while unselected, foreign and non-image sources are refused', async () => {
+  const store = new Store(':memory:')
+  const { storage, objects } = memoryAssets()
+  const project = store.createProject('Uploaded originals')
+  const other = store.createProject('Other project')
+  const bytes = await sharp({ create: { width: 64, height: 32, channels: 3, background: '#0088aa' } }).png().toBuffer()
+  const original = { projectId: project.id, name: 'upload.png', kind: 'reference' as const, mediaType: 'image' as const, width: 64, height: 32, bytes: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), createdAt: new Date().toISOString() }
+  const first = store.addAsset({ ...original, id: randomUUID() })
+  const second = store.addAsset({ ...original, id: randomUUID(), name: 'second.png' })
+  const unselected = store.addAsset({ ...original, id: randomUUID() })
+  const foreign = store.addAsset({ ...original, id: randomUUID(), projectId: other.id })
+  const document = store.addAsset({ ...original, id: randomUUID(), mediaType: 'file', storageExtension: 'bin', name: 'text.txt' })
+  objects.set(`${first.id}.png`, bytes)
+  objects.set(`${second.id}.png`, bytes)
+  let selected = first.id
+  let current: RemoteRun
+  let deliveries = 0
+  const worker = new AgentWorker(store, '', {
+    async health() { return {} }, async stop() {}, async get() { return current },
+    async submit(run, _thread, _history, candidates) {
+      assert.deepEqual(candidates?.map(candidate => candidate.assetId), [first.id, second.id])
+      assert(!JSON.stringify(candidates).includes('"png":'))
+      current = { id: run.id, status: 'running', stage: 'codex', threadId: null, reply: 'Selected', imageOperation: 'edit', sourceAssetId: selected, needsSource: true }
+    },
+    async provideSource(id, source) {
+      deliveries++
+      assert.equal(source.assetId, selected)
+      assert.deepEqual(Buffer.from(source.png, 'base64'), bytes)
+      current = { id, status: 'completed', stage: 'codex', threadId: null, reply: 'Source verified' }
+    },
+  }, storage)
+  try {
+    for (const sourceId of [first.id, second.id, unselected.id, foreign.id, document.id]) {
+      selected = sourceId
+      const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'Edit the specified upload', mode: 'auto', ratio: '1:1', assetIds: [first.id, second.id, document.id] })
+      await worker.tick()
+      assert.equal(store.agentRun(run.id).sourceAssetId, undefined)
+      await worker.tick()
+      if ([first.id, second.id].includes(sourceId)) {
+        await worker.tick()
+        assert.equal(store.agentRun(run.id).status, 'completed')
+        assert.equal(store.agentRun(run.id).sourceAssetId, sourceId)
+      } else assert.equal(store.agentRun(run.id).status, 'interrupted')
+    }
+    assert.equal(deliveries, 2)
+    assert.deepEqual(objects.get(`${first.id}.png`), bytes)
+    assert.deepEqual(objects.get(`${second.id}.png`), bytes)
   } finally { await worker.close(); store.db.close() }
 })
 
@@ -353,6 +674,48 @@ test('project, idempotent message, cancellation and restart persistence', async 
     await app.close()
     await rm(dataDir, { recursive: true, force: true })
   }
+})
+
+test('file uploads preserve bytes, force document downloads and support video ranges', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-files-'))
+  const { objects, storage } = memoryAssets()
+  const app = await buildApp({ dataDir, assetStorage: storage })
+  try {
+    const project = (await app.inject({ method: 'POST', url: '/api/projects', payload: { title: 'Files' } })).json()
+    const samples = [
+      { name: 'notes.txt', bytes: Buffer.from('private notes, not prompt content'), kind: 'file', mime: 'text/plain' },
+      { name: 'page.html', bytes: Buffer.from('<script>alert(1)</script>'), kind: 'file', mime: 'text/plain' },
+      { name: 'clip.mp4', bytes: Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(20)]), kind: 'video', mime: 'video/mp4' },
+    ]
+    for (const sample of samples) {
+      const response = await app.inject({ method: 'POST', url: `/api/projects/${project.id}/uploads`, headers: { 'content-type': 'multipart/form-data; boundary=studio' }, payload: Buffer.concat([Buffer.from(`--studio\r\nContent-Disposition: form-data; name="file"; filename="${sample.name}"\r\nContent-Type: application/octet-stream\r\n\r\n`), sample.bytes, Buffer.from('\r\n--studio--\r\n')]) })
+      assert.equal(response.statusCode, 201, response.body)
+      const asset = response.json()
+      assert.equal(asset.mediaType, sample.kind)
+      assert.equal(asset.mimeType, sample.mime)
+      assert.equal(asset.hasThumbnail, false)
+      const url = `/api/assets/${asset.id}/content`
+      const content = await app.inject(url)
+      assert.deepEqual(content.rawPayload, sample.bytes)
+      assert.equal((await app.inject(`${url}?thumbnail=1`)).statusCode, 404)
+      assert.equal(content.headers['x-content-type-options'], 'nosniff')
+      if (sample.kind === 'file') {
+        assert.match(content.headers['content-disposition']!, /attachment/)
+        assert.equal(content.headers['content-type'], 'application/octet-stream')
+        assert.match(content.headers['content-security-policy']!, /sandbox/)
+      } else {
+        const range = await app.inject({ url, headers: { range: 'bytes=4-7' } })
+        assert.equal(range.statusCode, 206)
+        assert.equal(range.body, 'ftyp')
+      }
+    }
+    assert.equal(objects.size, samples.length)
+    const snapshot = (await app.inject(`/api/projects/${project.id}`)).json()
+    assert.equal(snapshot.assets.length, samples.length)
+    const removed = await app.inject({ method: 'DELETE', url: `/api/projects/${project.id}`, payload: { expectedUpdatedAt: snapshot.project.updatedAt } })
+    assert.equal(removed.statusCode, 200)
+    assert.equal(objects.size, 0)
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
 })
 
 test('uploads validate actual image data, thumbnails and project ownership', async () => {

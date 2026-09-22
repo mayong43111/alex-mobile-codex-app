@@ -32,6 +32,21 @@
 - 首次生成已出图，但新增来源字段违反 OpenMontage 严格素材 schema，检查点保存失败；现将字段移到 manifest 元数据，完整检查点离线测试通过。仅本地人工恢复该测试原图后继续编辑，没有重复生成或自动恢复云端数据。总计一次真实生成和一次真实编辑，费用未知；不能将本次验收描述为未经恢复的完整首次成功流程。
 - 10 项后端、16 项手机端、3 项决策、1 项并发保存、5 项图片工具测试以及构建、lint 通过。真实编辑使用本地 CLI 图片认证；云端托管身份下编辑、真实手机键盘和 PWA 安装尚未验收。
 
+## VM 控制授权
+
+2026-09-22 用户要求允许所有已获应用登录授权的用户控制 GPU VM。代码已在本地移除独立 VM 管理员白名单，仍保留原有 Easy Auth、租户和用户白名单校验，不允许匿名或仅持有其他租户账号的用户操作。
+
+已为当前 Web App 系统托管身份创建、分配并回读以下最小角色，未授予个人 Azure 账号：
+
+| 角色 | 分配范围 | 允许动作 |
+| --- | --- | --- |
+| Qwen Studio VM Power Operator | 目标 GPU VM | Microsoft.Compute/virtualMachines/read、instanceView/read、start/action、restart/action、deallocate/action |
+| Qwen Studio VM Operation Reader | GPU 所在资源组 | Microsoft.Compute/locations/operations/read |
+
+异步状态查询需要资源组级读取权限，参见 [Azure 异步操作权限要求](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/async-operations#permission-for-tracking-async-status)。电源操作仍仅限目标 VM，不授予删除、改配、执行脚本或 RBAC 管理权限。
+
+本次没有更新线上镜像、创建云端 `VM_CONFIG`、修改网络或实际启停 VM。云端启用还需要部署新版本、配置 `/home/` 下的 VM 配置文件并使用 `auth: "managed-identity"`；Web App 到 GPU 的受控私网连接仍待配置，以支持 ComfyUI 状态、队列及生成请求。角色分配回读不等于云端端到端操作已验收。
+
 ## 资源
 
 - 订阅 2：`00000000-0000-0000-0000-000000000000`。

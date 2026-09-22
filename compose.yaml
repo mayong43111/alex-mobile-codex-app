@@ -14,6 +14,8 @@ services:
     pids_limit: 128
     mem_limit: 2g
     cpus: 2
+    environment:
+      COMFYUI_SERVER_URL: ${COMFYUI_SERVER_URL:-}
     tmpfs:
       - /tmp:size=256m,mode=1777
     volumes:

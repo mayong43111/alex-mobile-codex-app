@@ -33,6 +33,15 @@ class AzureImageTest(unittest.TestCase):
         self.directory.cleanup()
 
     @patch("azure_image.requests.post")
+    def test_quality_is_forwarded_for_generation_and_edit(self, post):
+        post.return_value = self.response
+        for quality in ['low', 'medium', 'high']:
+            for operation in ['generate', 'edit']:
+                result = AzureImage('test-token').execute({'prompt': 'test', 'size': '1024x1024', 'quality': quality, 'operation': operation, **({'sourceImage': self.source} if operation == 'edit' else {})})
+                self.assertTrue(result.success)
+                self.assertEqual(post.call_args.kwargs['data' if operation == 'edit' else 'json']['quality'], quality)
+
+    @patch("azure_image.requests.post")
     def test_main_saves_image_and_real_checkpoint(self, post):
         post.return_value = self.response
         run_id = str(uuid4())

@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { randomUUID, createHash } from 'node:crypto'
 import type { AgentInput, AgentRun, Asset, Job, Message, Project, Snapshot, Submission } from '../src/domain.ts'
+import { assetExtension, assetHasThumbnail } from '../src/domain.ts'
 
 export class HttpError extends Error {
   statusCode: number
@@ -30,6 +31,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS agent_runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL, input_hash TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(project_id, request_id));
       CREATE TABLE IF NOT EXISTS sessions (project_id TEXT PRIMARY KEY REFERENCES projects(id), thread_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS message_resends (project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL, input_hash TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(project_id, request_id));
+      CREATE TABLE IF NOT EXISTS asset_cleanup (name TEXT PRIMARY KEY);
     `)
   }
 
@@ -72,6 +74,31 @@ export class Store {
     })
   }
 
+  deleteProject(id: string, expectedUpdatedAt: string) {
+    return this.transaction(() => {
+      const snapshot = this.snapshot(id)
+      if (snapshot.project.updatedAt !== expectedUpdatedAt) throw new HttpError(409, '项目已更新，请重新确认删除。')
+      if (snapshot.runs.some(run => ['queued', 'running'].includes(run.status))) throw new HttpError(409, '请先停止并等待项目任务结束。')
+      for (const asset of snapshot.assets) {
+        for (const extension of [assetExtension(asset), ...(assetHasThumbnail(asset) ? ['webp'] : [])]) this.db.prepare('INSERT OR IGNORE INTO asset_cleanup VALUES (?)').run(`${asset.id}.${extension}`)
+      }
+      for (const table of ['messages', 'assets', 'jobs', 'agent_runs', 'sessions', 'events', 'message_resends']) this.db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(id)
+      this.db.prepare('DELETE FROM projects WHERE id = ?').run(id)
+    })
+  }
+
+  pendingAssetCleanup(): string[] {
+    return this.db.prepare('SELECT name FROM asset_cleanup').all().map(row => row.name as string)
+  }
+
+  completeAssetCleanup(name: string) {
+    this.db.prepare('DELETE FROM asset_cleanup WHERE name = ?').run(name)
+  }
+
+  hasPendingRuns() {
+    return Number(this.db.prepare("SELECT COUNT(*) AS count FROM agent_runs WHERE json_extract(data, '$.status') IN ('queued', 'running')").get()!.count) > 0
+  }
+
   event(projectId: string, kind: string) {
     const project = { ...this.project(projectId), updatedAt: new Date().toISOString() }
     this.db.prepare('UPDATE projects SET data = ? WHERE id = ?').run(JSON.stringify(project), projectId)
@@ -104,10 +131,15 @@ export class Store {
         if (existing.input_hash !== hash) throw new HttpError(409, 'Request ID already used')
         return JSON.parse(existing.data as string)
       }
+      const assetIds = input.assetIds ?? []
+      if (assetIds.length > 10 || new Set(assetIds).size !== assetIds.length) throw new HttpError(400, 'Invalid attachments')
+      for (const id of assetIds) {
+        if (this.asset(id).projectId !== projectId) throw new HttpError(400, 'Attachment belongs to another project')
+      }
       const pending = this.db.prepare("SELECT COUNT(*) AS count FROM agent_runs WHERE json_extract(data, '$.status') IN ('queued', 'running')").get()!
       if (Number(pending.count) >= 10) throw new HttpError(429, 'Too many pending requests')
       const now = new Date().toISOString()
-      const message: Message = { id: randomUUID(), projectId, text: input.text, assetIds: [], role: 'user', createdAt: now }
+      const message: Message = { id: randomUUID(), projectId, text: input.text, assetIds, role: 'user', createdAt: now }
       const run: AgentRun = { id: randomUUID(), projectId, messageId: message.id, assistantId: randomUUID(), input,
         status: 'queued', stage: 'codex', reply: '', threadId: null, createdAt: now, updatedAt: now }
       this.db.prepare('INSERT INTO messages VALUES (?, ?, ?)').run(message.id, projectId, JSON.stringify(message))
@@ -143,7 +175,6 @@ export class Store {
       const originalRun = snapshot.runs.find(run => run.messageId === messageId)
       const originalJob = snapshot.jobs.find(job => job.messageId === messageId)
       if (!originalRun && !originalJob) throw new HttpError(400, '找不到这条消息的发送参数。')
-      if (agent && message.assetIds.length) throw new HttpError(400, '当前 Codex 不支持带参考图的消息重发。')
       const history = snapshot.messages.slice(0, position)
       if (agent && (history.length > 200 || history.reduce((total, entry) => total + entry.text.length, 0) > 200000)) throw new HttpError(400, '保留的历史过长，请新建项目。')
       if (agent && Number(this.db.prepare("SELECT COUNT(*) AS count FROM agent_runs WHERE json_extract(data, '$.status') IN ('queued', 'running')").get()!.count) >= 10) throw new HttpError(429, 'Too many pending requests')
@@ -157,7 +188,7 @@ export class Store {
       let result: AgentRun | Job
       if (agent) {
         const input: AgentInput = originalRun ? { ...originalRun.input, requestId: request.requestId } : {
-          requestId: request.requestId, text: message.text, mode: 'auto', ratio: '1:1',
+          requestId: request.requestId, text: message.text, assetIds: message.assetIds, mode: 'auto', ratio: '1:1',
         }
         result = { id: randomUUID(), projectId, messageId, assistantId: randomUUID(), input, status: 'queued', stage: 'codex', reply: '', threadId: null, createdAt: now, updatedAt: now }
         this.db.prepare('INSERT INTO agent_runs VALUES (?, ?, ?, ?, ?)').run(result.id, projectId, request.requestId, createHash('sha256').update(JSON.stringify(input)).digest('hex'), JSON.stringify(result))
