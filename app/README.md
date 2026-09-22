@@ -52,7 +52,7 @@ docker compose up -d --build runtime
 
 Web Search 随固定版本 Codex CLI 一起安装，运行时设为 `webSearchMode: 'live'`，不是额外的浏览器或第三方搜索插件。保留 `shell_tool=false`、`apply_patch_freeform=false`、只读沙箱及 `approvalPolicy=never`，不新增 MCP、Skill 安装或系统网络执行权限。指令要求引用实际查阅的 HTTPS 来源、将网页视为不可信数据、不把凭证或私人历史作为搜索词；这是模型行为约束，不是独立的数据防泄露过滤器。
 
-2026-09-22 本地真实搜索 Microsoft Edge PWA 文档成功，收到三条已完成的 SDK `web_search` 事件，回复包含 Microsoft 官方来源，未生成图片。事件在“处理过程”中显示；云端尚未发布，托管身份下搜索未验收。仓库根目录可手动运行 `WEB_SEARCH_TEST=1 node runtime/smoke.mjs`：必须有搜索完成事件、来源链接且无图片才通过，禁止与出图验收开关混用。该测试调用真实模型/搜索，可能计费，不属于默认离线测试。
+2026-09-22 本地真实搜索 Microsoft Edge PWA 文档成功，收到三条已完成的 SDK `web_search` 事件，回复包含 Microsoft 官方来源，未生成图片。事件在“处理过程”中显示；已随 `20260922-web-search-dc11780` 发布，云端托管身份下搜索未验收。仓库根目录可手动运行 `WEB_SEARCH_TEST=1 node runtime/smoke.mjs`：必须有搜索完成事件、来源链接且无图片才通过，禁止与出图验收开关混用。该测试调用真实模型/搜索，可能计费，不属于默认离线测试。
 
 每个项目复用一个 Codex thread，SQLite 保存 thread ID、消息和运行状态；Codex 自身会话、运行结果及 OpenMontage 检查点保存在 Docker 命名卷 `qwen-studio_runtime-state`。图片工具继承上游 `BaseTool`，返回 `ToolResult` 并写入标准 `asset_manifest` 检查点，不是完整 OpenMontage 视频流水线。上游源码位于容器 `/opt/openmontage`，遵循其 AGPL-3.0 许可，分发或提供网络服务前需评估对应义务。
 
@@ -62,7 +62,7 @@ Web Search 随固定版本 Codex CLI 一起安装，运行时设为 `webSearchMo
 
 ## 已实现
 
-本地新增、尚未发布：Codex 可决定 `edit`，仅编辑保留对话中本轮之前最近一张已完成生成图。工具读取存储中的原始 PNG，通过 Azure multipart 编辑接口上传；输出另存为新素材，记录来源 ID/哈希并保留原尺寸。清理掉的重发分支图片即使仍在素材库也不会被选中。Codex 只接收来源元数据，原始像素只交给图片工具；无原图时澄清，不静默重新生成。对话按轮次排列，时间左置，重发/复制右置，出图和修改均显示持续加载状态。
+已随 `20260922-web-search-dc11780` 发布：Codex 可决定 `edit`，仅编辑保留对话中本轮之前最近一张已完成生成图。工具读取存储中的原始 PNG，通过 Azure multipart 编辑接口上传；输出另存为新素材，记录来源 ID/哈希并保留原尺寸。清理掉的重发分支图片即使仍在素材库也不会被选中。Codex 只接收来源元数据，原始像素只交给图片工具；无原图时澄清，不静默重新生成。对话按轮次排列，时间左置，重发/复制右置，出图和修改均显示持续加载状态。
 
 2026-09-22 本地真实生成后编辑已验证蓝杯变红杯、同一 thread、1024×1024、原图字节不变。生成阶段曾因新增检查点字段不兼容而在出图后失败，修复并离线恢复原图后仅执行一次编辑；无重复生成，详细记录见部署文档。手动 `EDIT_TEST=1 node runtime/smoke.mjs`（仓库根目录）会收费生成及编辑各一张，不进入自动测试；`PROJECT_ID` 与 `GENERATION_RUN_ID` 可指定已完成且已导入的原图，只执行编辑。云端托管身份编辑未验收。
 
