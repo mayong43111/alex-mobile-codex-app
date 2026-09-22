@@ -20,6 +20,18 @@
 
 ## 最新发布
 
+### 图片裁剪压缩工具
+
+2026-09-22 应用提交 `7f98728` 已签入、推送并发布至东南亚站点。镜像标签 `20260922-image-tools-7f98728`，摘要 `sha256:4f787848a79a3cfab98daa8ceed85b151ef794710e624bab3517ef678f7daec6`。
+
+- Codex 的受控附件 MCP 新增 `process_image`，使用已安装的 Sharp/libvips 进行裁剪、缩放和 PNG 压缩。默认保留分辨率，无损编码；缩放及有损调色板压缩必须显式指定。仅操作本轮可读附件，不开放 shell、任意文件写入或外部图片服务。
+- 结果另存为素材并展示在对话中，保留原图及来源 ID/哈希；Codex 可选处理后的新 ID 继续 AI 编辑。纯图片处理不调用图片模型，Codex 对话仍可能计费。每轮最多 4 次处理尝试，每个输出最多 16 MiB，不保证指定文件大小。
+- 修复上传照片归一化后超过旧 32 MiB 编辑交付限制而出现“无法确认运行结果”的问题。Azure 原图限小于 50,000,000 字节，内部 base64/HTTP 限制同步调整；Qwen 仍为 32 MiB。超限在图片接口前明确拒绝，不自动压缩或重试。
+
+25 项后端、28 项手机浏览器、15 项 Node、16 项 Python 测试共 84 项通过；生产构建、lint、MCP stdio 实际调用和公开文件敏感信息扫描通过。覆盖实际裁剪像素、保留分辨率压缩、原图保护、非法来源/哈希拒绝、处理图入库及继续编辑、38.8 MB HTTP 原图交付和 50 MB 拒绝边界。本轮未新增真实 Codex/图片模型调用或启动 GPU；云端模型自主调用工具及用户登录后的完整工作流仍待实际使用验证。
+
+发布前后 SQLite 完整性均为 `ok`、待处理任务为 0、项目数为 2。停站后仅更新 `linuxFxVersion`，认证、应用设置、托管身份和私网配置回读不变。13:37:27 UTC 新镜像拉取成功，13:37:35 Blob 写入/读取/删除探针成功且迁移 0 文件，13:37:36 启动探针成功，13:37:44 站点启动。健康及 PWA 资源 200、安装资源 `no-store`、匿名 API 401、Entra 登录 302 且回调正确。历史失败任务保持原状态，未自动重试。
+
 ### 尺寸、Process 与 iPhone 修复
 
 2026-09-22 应用提交 `cb8bbe8` 已签入、推送并发布至东南亚站点。镜像标签 `20260922-fixes-cb8bbe8`，摘要 `sha256:c32f90c5aa232831e61a99da3b2dd2ee1bcd8801a3e98dd4c324ee257f17dd1e`。
@@ -88,7 +100,7 @@ Web App 集成到 GPU 所在 VNet 的独立委派子网，Blob 专用终结点�
 - Linux App Service Plan：`asp-example-studio`，B2，单实例。
 - Web App：`example-studio-web`，仅 HTTPS，Always On。
 - ACR：`examplestudioregistry`，Basic，管理员密码禁用。
-- 镜像：`examplestudioregistry.azurecr.io/qwen-studio:20260922-fixes-cb8bbe8`。
+- 镜像：`examplestudioregistry.azurecr.io/qwen-studio:20260922-image-tools-7f98728`。
 - 镜像摘要：`sha256:REDACTED_SHA256`。
 - Blob 账户：`examplestudiostorage`，Standard LRS，私有容器 `assets`。
 - 私网：复用 GPU 所在 VNet，独立的 Web App 集成子网及 Blob 专用终结点子网，私有 DNS 区 `privatelink.blob.core.windows.net`；无需 Web App 到 GPU 的跨区域 peering。
