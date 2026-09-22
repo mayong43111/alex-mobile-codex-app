@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseDecision, renderSettings, editOutputSize, imageOutputSize } from './decision.mjs'
-import { ImageSourceRequest } from './image-source.mjs'
+import { ImageSourceRequest, sourceBodyLimit } from './image-source.mjs'
+import Fastify from 'fastify'
 import { createHash, randomUUID } from 'node:crypto'
 
 test('Azure edits accept phone photos without changing the source or GPU dimensions', () => {
@@ -17,13 +18,19 @@ test('Azure edits accept phone photos without changing the source or GPU dimensi
 })
 
 test('selected source delivery validates identity and bytes and supports cancellation', async () => {
-  const bytes = Buffer.from('selected source test')
+  const bytes = Buffer.alloc(38_823_614, 42)
   const candidate = { assetId: randomUUID(), name: 'original.png', hash: createHash('sha256').update(bytes).digest('hex'), width: 64, height: 32, kind: 'reference', messageId: randomUUID(), context: 'first upload' }
   const source = { assetId: candidate.assetId, hash: candidate.hash, width: 64, height: 32, png: bytes.toString('base64') }
   const request = new ImageSourceRequest(candidate, new AbortController().signal)
   assert.throws(() => request.provide({ ...source, assetId: randomUUID() }), /selection/)
   assert.throws(() => request.provide({ ...source, png: Buffer.from('other bytes').toString('base64') }), /selection/)
-  request.provide(source)
+  const app = Fastify({ bodyLimit: sourceBodyLimit })
+  app.put('/source', async requestBody => { request.provide(requestBody.body); return { accepted: true } })
+  try {
+    const response = await app.inject({ method: 'PUT', url: '/source', payload: source })
+    assert.equal(response.statusCode, 200)
+    assert.equal(response.json().accepted, true)
+  } finally { await app.close() }
   assert.deepEqual(await request.promise, source)
   request.provide(source)
   const controller = new AbortController()
@@ -31,6 +38,16 @@ test('selected source delivery validates identity and bytes and supports cancell
   controller.abort()
   await assert.rejects(stopped.promise, /stopped/)
   assert.throws(() => stopped.provide(source), /closed/)
+})
+
+test('source delivery refuses the 50 MB boundary before resolving', async () => {
+  const bytes = Buffer.alloc(50_000_000)
+  const candidate = { assetId: randomUUID(), name: 'oversize.png', hash: createHash('sha256').update(bytes).digest('hex'), width: 64, height: 32, kind: 'reference', messageId: randomUUID(), context: '' }
+  const controller = new AbortController()
+  const request = new ImageSourceRequest(candidate, controller.signal)
+  assert.throws(() => request.provide({ assetId: candidate.assetId, hash: candidate.hash, width: 64, height: 32, png: bytes.toString('base64') }), /selection/)
+  controller.abort()
+  await assert.rejects(request.promise, /stopped/)
 })
 
 test('conversation settings override defaults without provider substitution', () => {

@@ -498,7 +498,8 @@ test('Codex can select either uploaded image while unselected, foreign and non-i
   const { storage, objects } = memoryAssets()
   const project = store.createProject('Uploaded originals')
   const other = store.createProject('Other project')
-  const bytes = await sharp({ create: { width: 64, height: 32, channels: 3, background: '#0088aa' } }).png().toBuffer()
+  const png = await sharp({ create: { width: 64, height: 32, channels: 3, background: '#0088aa' } }).png().toBuffer()
+  const bytes = Buffer.concat([png, Buffer.alloc(38_823_614 - png.length)])
   const original = { projectId: project.id, name: 'upload.png', kind: 'reference' as const, mediaType: 'image' as const, width: 64, height: 32, bytes: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), createdAt: new Date().toISOString() }
   const first = store.addAsset({ ...original, id: randomUUID() })
   const second = store.addAsset({ ...original, id: randomUUID(), name: 'second.png' })
@@ -540,6 +541,95 @@ test('Codex can select either uploaded image while unselected, foreign and non-i
     assert.equal(deliveries, 2)
     assert.deepEqual(objects.get(`${first.id}.png`), bytes)
     assert.deepEqual(objects.get(`${second.id}.png`), bytes)
+  } finally { await worker.close(); store.db.close() }
+})
+
+test('processed images persist in chat and are selectable as the exact edit source', async () => {
+  const store = new Store(':memory:')
+  const { storage, objects } = memoryAssets()
+  const project = store.createProject('Processing')
+  const original = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#16785d' } }).png().toBuffer()
+  const processed = await sharp(original).resize(32, 32).png().toBuffer()
+  const source = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'photo.png', width: 64, height: 64, bytes: original.length, hash: createHash('sha256').update(original).digest('hex'), kind: 'reference', createdAt: new Date().toISOString() })
+  objects.set(`${source.id}.png`, original)
+  const result = { assetId: randomUUID(), sourceAssetId: source.id, sourceHash: source.hash, hash: createHash('sha256').update(processed).digest('hex'), width: 32, height: 32, bytes: processed.length, name: 'processed.png', png: processed.toString('base64') }
+  let current: RemoteRun
+  const deliveries: SourceImage[] = []
+  const worker = new AgentWorker(store, '', {
+    async health() { return {} }, async stop() {}, async get() { return current },
+    async submit(run) { current = { id: run.id, threadId: null, status: run.input.mode === 'chat' ? 'completed' : 'running', stage: 'codex', reply: 'Processed', processedImages: [result], ...(run.input.mode === 'chat' ? {} : { imageOperation: 'edit', sourceAssetId: result.assetId, needsSource: true }) } },
+    async provideSource(_id, image) { deliveries.push(image); current = { ...current, status: 'completed', needsSource: false, stage: 'image', image: { png: result.png, width: 32, height: 32, model: 'test', checkpoint: 'test', operation: 'edit', sourceAssetId: image.assetId, sourceHash: image.hash } } },
+  }, storage)
+  try {
+    const chat = store.queueAgent(project.id, { requestId: randomUUID(), text: 'Crop', mode: 'chat', ratio: '1:1', assetIds: [source.id] })
+    await worker.tick(); await worker.tick()
+    assert.equal(store.agentRun(chat.id).status, 'completed')
+    assert.equal(deliveries.length, 0)
+    assert.deepEqual(store.snapshot(project.id).messages.find(message => message.id === chat.assistantId)?.assetIds, [result.assetId])
+    const firstProcessedId = result.assetId
+    result.assetId = randomUUID()
+    const edit = store.queueAgent(project.id, { requestId: randomUUID(), text: 'Crop and edit', mode: 'auto', ratio: '1:1', assetIds: [source.id] })
+    await worker.tick(); await worker.tick()
+    assert.equal(deliveries[0].assetId, result.assetId)
+    assert.equal(deliveries[0].png, result.png)
+    await worker.tick()
+    assert.equal(store.agentRun(edit.id).status, 'completed')
+    assert.equal(store.asset(edit.id).sourceAssetId, result.assetId)
+    assert.equal(store.asset(result.assetId).sourceAssetId, source.id)
+    assert.equal(store.asset(firstProcessedId).runId, chat.id)
+    assert.equal(store.snapshot(project.id).assets.length, 4)
+    assert.deepEqual(store.snapshot(project.id).messages.find(message => message.id === edit.assistantId)?.assetIds, [result.assetId, edit.id])
+    assert.deepEqual(objects.get(`${source.id}.png`), original)
+  } finally { await worker.close(); store.db.close() }
+})
+
+test('invalid processed outputs cannot overwrite originals or import unselected sources', async () => {
+  const store = new Store(':memory:')
+  const { storage, objects } = memoryAssets()
+  const project = store.createProject('Processing validation')
+  const bytes = await sharp({ create: { width: 64, height: 32, channels: 3, background: '#0088aa' } }).png().toBuffer()
+  const source = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'photo.png', width: 64, height: 32, bytes: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), kind: 'reference', createdAt: new Date().toISOString() })
+  const unselected = store.addAsset({ ...source, id: randomUUID() })
+  objects.set(`${source.id}.png`, bytes)
+  let result: NonNullable<RemoteRun['processedImages']>[number] = { assetId: randomUUID(), sourceAssetId: source.id, sourceHash: source.hash, hash: source.hash, width: 64, height: 32, bytes: bytes.length, name: 'processed.png', png: bytes.toString('base64') }
+  const valid = { ...result }
+  let current: RemoteRun
+  const worker = new AgentWorker(store, '', {
+    async health() { return {} }, async stop() {}, async get() { return current },
+    async submit(run) { current = { id: run.id, threadId: null, status: 'completed', stage: 'codex', reply: 'Processed', processedImages: [result] } },
+  }, storage)
+  try {
+    for (const invalid of [{ assetId: source.id }, { sourceAssetId: unselected.id }, { hash: '0'.repeat(64) }, { width: 32 }]) {
+      result = { ...valid, ...invalid }
+      const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'Process', mode: 'chat', ratio: '1:1', assetIds: [source.id] })
+      await worker.tick(); await worker.tick()
+      assert.equal(store.agentRun(run.id).status, 'interrupted')
+      assert.equal(store.snapshot(project.id).assets.length, 2)
+      assert.deepEqual(objects.get(`${source.id}.png`), bytes)
+    }
+  } finally { await worker.close(); store.db.close() }
+})
+
+test('oversized Azure edit source is explicitly rejected without delivering or reading bytes', async () => {
+  const store = new Store(':memory:')
+  const { storage } = memoryAssets()
+  const reads: string[] = []
+  storage.read = async name => { reads.push(name); throw new Error('Must not read') }
+  const project = store.createProject('Oversize')
+  const source = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'large.png', width: 4284, height: 5712, bytes: 50_000_000, hash: '0'.repeat(64), kind: 'reference', createdAt: new Date().toISOString() })
+  let current: RemoteRun
+  let stopped = 0
+  const worker = new AgentWorker(store, '', {
+    async health() { return {} }, async stop() { stopped++ }, async get() { return current }, async provideSource() { assert.fail('Must not deliver') },
+    async submit(run) { current = { id: run.id, threadId: null, status: 'running', stage: 'image', reply: 'Edit', imageOperation: 'edit', sourceAssetId: source.id, needsSource: true } },
+  }, storage)
+  try {
+    const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'Edit', mode: 'auto', ratio: '1:1', assetIds: [source.id] })
+    await worker.tick(); await worker.tick()
+    assert.equal(store.agentRun(run.id).status, 'failed')
+    assert.match(store.agentRun(run.id).error!, /50 MB/)
+    assert.equal(stopped, 1)
+    assert.deepEqual(reads, [])
   } finally { await worker.close(); store.db.close() }
 })
 

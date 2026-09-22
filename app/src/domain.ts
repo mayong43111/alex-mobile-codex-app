@@ -29,7 +29,7 @@ export type AgentRun = {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
   stage: 'codex' | 'image' | 'video'; reply: string; threadId: string | null; error?: string
   imageOperation?: 'generate' | 'edit'; sourceAssetId?: string
-  assetId?: string; progress?: AgentProgress[]; createdAt: string; updatedAt: string
+  assetId?: string; processedAssetIds?: string[]; progress?: AgentProgress[]; createdAt: string; updatedAt: string
 }
 export type Snapshot = { project: Project; messages: Message[]; assets: Asset[]; jobs: Job[]; runs: AgentRun[]; threadId: string | null }
 export type Submission = { requestId: string; text: string; assetIds: string[]; ratio: Ratio }

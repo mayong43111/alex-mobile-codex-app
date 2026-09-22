@@ -55,7 +55,7 @@ class AzureImageTest(unittest.TestCase):
     def test_phone_photo_edit_uses_auto_without_resizing_source(self, post):
         original = io.BytesIO()
         Image.new("RGB", (3024, 4032), "white").save(original, format="PNG")
-        raw = original.getvalue()
+        raw = original.getvalue().ljust(38_823_614, b'\0')
         source = {**self.source, "width": 3024, "height": 4032,
             "png": base64.b64encode(raw).decode(), "hash": hashlib.sha256(raw).hexdigest()}
         post.return_value = self.response

@@ -6,6 +6,7 @@ import { attachmentSchema } from './attachments.mjs'
 
 export const readableAttachmentSchema = attachmentSchema.safeExtend({ sha256: z.string().regex(/^[a-f0-9]{64}$/) })
 export const attachmentManifestSchema = z.object({ runId: z.string().uuid(), files: z.array(readableAttachmentSchema).max(10) }).strict()
+export const processedImageSchema = z.object({ assetId: z.string().uuid(), sourceAssetId: z.string().uuid(), sourceHash: z.string().regex(/^[a-f0-9]{64}$/), hash: z.string().regex(/^[a-f0-9]{64}$/), width: z.number().int().positive().max(40_000_000), height: z.number().int().positive().max(40_000_000), bytes: z.number().int().positive().max(16 * 1024 * 1024), name: z.string().min(1).max(160) }).strict().refine(image => image.width * image.height <= 40_000_000)
 
 export class AttachmentStore {
   constructor(root) { this.root = root; this.writing = Promise.resolve() }
@@ -45,6 +46,18 @@ export class AttachmentStore {
     return path
   }
   async remove(runId) { await rm(this.directory(runId), { recursive: true, force: true }) }
+  async processed(runId) {
+    const directory = join(this.directory(runId), 'processed')
+    const names = await readdir(directory).catch(error => { if (error.code === 'ENOENT') return []; throw error })
+    const records = names.filter(name => name.endsWith('.json'))
+    if (records.length > 4) throw new Error('Too many processed images')
+    return Promise.all(records.map(async name => {
+      const metadata = processedImageSchema.parse(JSON.parse(await readFile(join(directory, name), 'utf8')))
+      const bytes = await readFile(join(directory, `${metadata.assetId}.png`))
+      if (bytes.length !== metadata.bytes || createHash('sha256').update(bytes).digest('hex') !== metadata.hash) throw new Error('Processed image changed')
+      return { ...metadata, png: bytes.toString('base64') }
+    }))
+  }
   async prune(activeId) {
     await mkdir(this.root, { recursive: true, mode: 0o700 })
     for (const name of await readdir(this.root)) {

@@ -209,14 +209,14 @@ export class Store {
     return row ? JSON.parse(row.data as string) : null
   }
 
-  updateAgent(id: string, changes: Partial<Pick<AgentRun, 'status' | 'stage' | 'reply' | 'threadId' | 'error' | 'assetId' | 'progress' | 'imageOperation' | 'sourceAssetId'>>): AgentRun {
+  updateAgent(id: string, changes: Partial<Pick<AgentRun, 'status' | 'stage' | 'reply' | 'threadId' | 'error' | 'assetId' | 'processedAssetIds' | 'progress' | 'imageOperation' | 'sourceAssetId'>>): AgentRun {
     return this.transaction(() => {
       const run = { ...this.agentRun(id), ...changes, updatedAt: new Date().toISOString() }
       this.db.prepare('UPDATE agent_runs SET data = ? WHERE id = ?').run(JSON.stringify(run), id)
       if (run.threadId) this.db.prepare('INSERT INTO sessions VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET thread_id = excluded.thread_id').run(run.projectId, run.threadId)
       if (run.reply) {
         const message: Message = { id: run.assistantId, projectId: run.projectId, role: 'assistant', text: run.reply,
-          assetIds: run.assetId ? [run.assetId] : [], createdAt: run.createdAt }
+          assetIds: [...(run.processedAssetIds ?? []), ...(run.assetId ? [run.assetId] : [])], createdAt: run.createdAt }
         this.db.prepare('INSERT INTO messages VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data').run(message.id, message.projectId, JSON.stringify(message))
       }
       this.event(run.projectId, 'agent.changed')

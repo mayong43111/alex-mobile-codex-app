@@ -20,6 +20,7 @@ const remoteSchema = z.object({
   stage: z.enum(['codex', 'image', 'video']), reply: z.string().max(20000), error: z.string().optional(),
   imageOperation: z.enum(['generate', 'edit']).optional(),
   sourceAssetId: z.string().uuid().optional(), needsSource: z.boolean().optional(),
+  processedImages: z.array(z.object({ assetId: z.string().uuid(), sourceAssetId: z.string().uuid(), sourceHash: z.string().regex(/^[a-f0-9]{64}$/), hash: z.string().regex(/^[a-f0-9]{64}$/), width: z.number().int().positive().max(40_000_000), height: z.number().int().positive().max(40_000_000), bytes: z.number().int().positive().max(16 * 1024 * 1024), name: z.string().min(1).max(160), png: z.string().max(24 * 1024 * 1024) }).refine(image => image.width * image.height <= 40_000_000)).max(4).optional(),
   progress: z.array(z.object({ id: z.string().max(200), label: z.string().max(120), detail: z.string().optional(), createdAt: z.string().datetime() })).optional(),
   image: z.object({ png: z.string().max(48 * 1024 * 1024), width: z.number(), height: z.number(), model: z.string(), checkpoint: z.string(),
     provider: z.enum(['azure', 'comfyui']).optional(), operation: z.enum(['generate', 'edit']).optional(), sourceAssetId: z.string().uuid().optional(), sourceHash: z.string().regex(/^[0-9a-f]{64}$/).optional() }).optional(),
@@ -179,7 +180,7 @@ export class AgentWorker {
     try {
       const remote = await this.transport.get(id)
       if (remote.id !== id) throw new Error('Mismatched runtime result')
-      const local = this.store.agentRun(id)
+      let local = this.store.agentRun(id)
       const progress = remote.progress ?? local.progress
       const progressChanged = JSON.stringify(progress) !== JSON.stringify(local.progress)
       if (local.status === 'cancelled') {
@@ -188,13 +189,25 @@ export class AgentWorker {
         return
       }
       let assetId: string | undefined
+      if (remote.processedImages?.length) {
+        const processedAssetIds = []
+        for (const image of remote.processedImages) processedAssetIds.push((await this.saveProcessedImage(local, image)).id)
+        if (JSON.stringify(processedAssetIds) !== JSON.stringify(local.processedAssetIds)) local = this.store.updateAgent(id, { processedAssetIds })
+      }
       if (remote.needsSource) {
         if (remote.status !== 'running' || remote.imageOperation !== 'edit' || local.input.mode === 'chat' || !this.transport.provideSource) throw new Error('Unexpected source request')
-        const candidate = this.imageCandidates(local).find(candidate => candidate.assetId === remote.sourceAssetId)
+        const candidate = this.imageCandidates(local).find(candidate => candidate.assetId === remote.sourceAssetId) ?? (local.processedAssetIds?.includes(remote.sourceAssetId ?? '') ? { assetId: remote.sourceAssetId! } : undefined)
         if (!candidate || (local.sourceAssetId && local.sourceAssetId !== candidate.assetId)) throw new Error('Source outside run candidates')
         const source = this.store.asset(candidate.assetId)
+        const azure = (local.input.imageModel ?? 'azure-image2') === 'azure-image2'
+        if (azure ? source.bytes >= 50_000_000 : source.bytes > 32 * 1024 * 1024) {
+          await this.transport.stop(id)
+          this.store.updateAgent(id, { status: 'failed', threadId: remote.threadId, progress, error: azure ? '编辑原图必须小于 50 MB；未调用图片接口，请先让 Codex 缩放或压缩图片。' : 'Qwen 编辑原图不能超过 32 MiB；未调用图片接口，请先让 Codex 缩放或压缩图片。' })
+          this.activeId = null
+          return
+        }
         const bytes = await this.assetStorage.read(`${source.id}.${assetExtension(source)}`)
-        if (bytes.length !== source.bytes || bytes.length > 32 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== source.hash) throw new Error('Invalid source image')
+        if (bytes.length !== source.bytes || createHash('sha256').update(bytes).digest('hex') !== source.hash) throw new Error('Invalid source image')
         this.store.updateAgent(id, { sourceAssetId: source.id, imageOperation: 'edit', reply: remote.reply, threadId: remote.threadId, progress })
         await this.transport.provideSource(id, { assetId: source.id, png: bytes.toString('base64'), hash: source.hash, width: source.width, height: source.height })
         return
@@ -218,6 +231,24 @@ export class AgentWorker {
       }
       this.activeId = null
     }
+  }
+
+  private async saveProcessedImage(run: AgentRun, image: NonNullable<RemoteRun['processedImages']>[number]): Promise<Asset> {
+    const source = this.imageCandidates(run).find(candidate => candidate.assetId === image.sourceAssetId)
+    if (!source || source.hash !== image.sourceHash || image.assetId === source.assetId) throw new Error('Invalid processed image source')
+    const existing = this.store.snapshot(run.projectId).assets.find(asset => asset.id === image.assetId)
+    if (existing) {
+      if (existing.hash !== image.hash || existing.runId !== run.id || existing.sourceAssetId !== source.assetId || existing.bytes !== image.bytes || existing.width !== image.width || existing.height !== image.height) throw new Error('Processed image conflict')
+      return existing
+    }
+    const bytes = Buffer.from(image.png, 'base64')
+    if (bytes.length !== image.bytes || bytes.length > 16 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== image.hash) throw new Error('Invalid processed image bytes')
+    const metadata = await sharp(bytes, { limitInputPixels: 40_000_000 }).metadata()
+    if (metadata.format !== 'png' || metadata.width !== image.width || metadata.height !== image.height) throw new Error('Invalid processed image dimensions')
+    const thumbnail = await sharp(bytes).resize(480, 480, { fit: 'inside', withoutEnlargement: true }).webp().toBuffer()
+    await this.assetStorage.put(`${image.assetId}.png`, bytes)
+    await this.assetStorage.put(`${image.assetId}.webp`, thumbnail)
+    return this.store.addAsset({ id: image.assetId, projectId: run.projectId, name: image.name, width: image.width, height: image.height, bytes: image.bytes, hash: image.hash, kind: 'reference', mediaType: 'image', storageExtension: 'png', mimeType: 'image/png', hasThumbnail: true, model: 'sharp', provider: 'local', runId: run.id, sourceAssetId: source.assetId, sourceHash: source.hash, createdAt: new Date().toISOString() })
   }
 
   private async saveImage(run: AgentRun, image: NonNullable<RemoteRun['image']>): Promise<Asset> {

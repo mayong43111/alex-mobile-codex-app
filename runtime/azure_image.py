@@ -32,7 +32,7 @@ class AzureImage(BaseTool):
             "quality": {"enum": ["low", "medium", "high"]},
             "operation": {"enum": ["generate", "edit"]},
             "sourceImage": {"type": "object", "required": ["assetId", "png", "hash", "width", "height"],
-                "properties": {"assetId": {"type": "string"}, "png": {"type": "string", "maxLength": 48 * 1024 * 1024},
+                "properties": {"assetId": {"type": "string"}, "png": {"type": "string", "maxLength": 66_666_668},
                     "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "width": {"type": "integer"}, "height": {"type": "integer"}},
                 "additionalProperties": False},
         },
@@ -60,7 +60,7 @@ class AzureImage(BaseTool):
             endpoint = settings["endpoint"].rstrip("/") + "/openai/v1/images/"
             if source:
                 original = base64.b64decode(source["png"], validate=True)
-                if len(original) > 32 * 1024 * 1024 or hashlib.sha256(original).hexdigest() != source["hash"]:
+                if len(original) >= 50_000_000 or hashlib.sha256(original).hexdigest() != source["hash"]:
                     raise ValueError("Invalid source image")
                 with Image.open(io.BytesIO(original)) as original_image:
                     if original_image.format != "PNG" or original_image.width * original_image.height > 40_000_000:
