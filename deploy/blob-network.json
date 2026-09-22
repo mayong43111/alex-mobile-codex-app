@@ -1,0 +1,115 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "storageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "vnet-example-studio",
+      "location": "eastasia",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.30.0.0/24"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "webapp",
+            "properties": {
+              "addressPrefix": "10.30.0.0/26",
+              "delegations": [
+                {
+                  "name": "webapp",
+                  "properties": {
+                    "serviceName": "Microsoft.Web/serverFarms"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "name": "endpoints",
+            "properties": {
+              "addressPrefix": "10.30.0.64/27",
+              "privateEndpointNetworkPolicies": "Disabled"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/privateDnsZones",
+      "apiVersion": "2024-06-01",
+      "name": "privatelink.blob.core.windows.net",
+      "location": "global"
+    },
+    {
+      "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+      "apiVersion": "2024-06-01",
+      "name": "privatelink.blob.core.windows.net/example-studio",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-example-studio')]",
+        "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.blob.core.windows.net')]"
+      ],
+      "properties": {
+        "registrationEnabled": false,
+        "virtualNetwork": {
+          "id": "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-example-studio')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/privateEndpoints",
+      "apiVersion": "2024-05-01",
+      "name": "pe-example-blob",
+      "location": "eastasia",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-example-studio')]"
+      ],
+      "properties": {
+        "subnet": {
+          "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', 'vnet-example-studio', 'endpoints')]"
+        },
+        "privateLinkServiceConnections": [
+          {
+            "name": "assets",
+            "properties": {
+              "privateLinkServiceId": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+              "groupIds": [
+                "blob"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+      "apiVersion": "2024-05-01",
+      "name": "pe-example-blob/default",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/privateEndpoints', 'pe-example-blob')]",
+        "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.blob.core.windows.net')]"
+      ],
+      "properties": {
+        "privateDnsZoneConfigs": [
+          {
+            "name": "blob",
+            "properties": {
+              "privateDnsZoneId": "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.blob.core.windows.net')]"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+app/node_modules/
+app/dist/
+app/.data/
+app/.test-data/
+app/test-results/
+app/playwright-report/
+.env
+.env.*
+!.env.example
+.local/
+runtime/__pycache__/

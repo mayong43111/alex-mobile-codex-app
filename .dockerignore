@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+**/.data
+**/test-results
+**/playwright-report
+**/__pycache__
+.local
+.git
+**/.env*
+deploy

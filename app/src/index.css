@@ -1,0 +1,19 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
+
+:root { font-family: 'DM Sans', 'Noto Sans SC', sans-serif; color: #262c2a; background: #f7f8f7; font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; letter-spacing: 0; --accent: #087f6b; --muted: #747e79; --line: #e3e8e5; --surface: #fff; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button, select { cursor: pointer; }
+button { border: 0; background: none; }
+button:disabled { cursor: not-allowed; opacity: .5; }
+input, textarea, select { border: 1px solid var(--line); border-radius: 5px; background: #fff; }
+input, textarea { min-width: 0; }
+button, a, input, textarea, select { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+h1, h2, h3, p { margin: 0; }
+a { color: inherit; }
+button, p, h1, h2, h3, strong { overflow-wrap: anywhere; }
+svg { flex-shrink: 0; }
+button, a { touch-action: manipulation; }
+button:hover:not(:disabled) { filter: brightness(.97); }

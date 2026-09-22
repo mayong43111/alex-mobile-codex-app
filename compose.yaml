@@ -1,0 +1,27 @@
+name: qwen-studio
+services:
+  runtime:
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+      target: runtime
+    ports:
+      - "127.0.0.1:3199:3199"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 2g
+    cpus: 2
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      - runtime-state:/state
+    secrets:
+      - services
+secrets:
+  services:
+    file: .local/services.json
+volumes:
+  runtime-state:

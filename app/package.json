@@ -1,0 +1,43 @@
+{
+  "name": "app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/create-icons.mjs",
+    "prebuild": "node scripts/create-icons.mjs",
+    "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite\"",
+    "test": "node --import tsx --test server/app.test.ts",
+    "test:e2e": "playwright test",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.13.3",
+    "@azure/storage-blob": "^12.33.0",
+    "@fastify/multipart": "^10.1.1",
+    "@fastify/static": "^10.1.4",
+    "@openai/codex-sdk": "0.155.1",
+    "@radix-ui/react-dialog": "^1.1.23",
+    "fastify": "^5.12.5",
+    "lucide-react": "^1.47.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-zoom-pan-pinch": "^4.2.0",
+    "sharp": "^0.35.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^22.20.4",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "oxlint": "^1.81.0",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}
