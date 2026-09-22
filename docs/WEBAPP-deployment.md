@@ -20,6 +20,18 @@
 
 ## 最新发布
 
+### 尺寸、Process 与 iPhone 修复
+
+2026-09-22 应用提交 `cb8bbe8` 已签入、推送并发布至东南亚站点。镜像标签 `20260922-fixes-cb8bbe8`，摘要 `sha256:c32f90c5aa232831e61a99da3b2dd2ee1bcd8801a3e98dd4c324ee257f17dd1e`。
+
+- Codex 显式像素尺寸或比例优先于默认值，生成与编辑均传递目标尺寸；GPT-image-2 按现行自定义尺寸规则校验，不再套用旧三尺寸限制。普通照片编辑可使用 `auto` 输出，原图字节与来源哈希保留，不静默取整或改为默认尺寸。
+- Process 默认折叠，完整保留 SDK 实际返回的原始 JSON 事件，不再改写或裁剪为 200 条/6000 字符。工具返回可能包含附件内容，沿用项目权限；不额外采集凭据，也不补造服务未返回的推理。
+- iPhone 输入界面同时跟踪可视视口高度和偏移，处理键盘展开及视口滚动。320/390 手机模拟定位回归与截图检查通过，真实 iPhone 软键盘仍需实机确认。
+
+22 项后端、28 项手机浏览器、14 项 Node、16 项 Python 测试共 80 项通过，构建、lint、生产镜像构建及敏感标识扫描通过。发布前两次只读检查 SQLite 完整性为 `ok`、排队/运行任务为 0；采用停站后仅更新 `linuxFxVersion` 再启动，两个现有项目保留，认证、应用设置、托管身份和私网配置回读不变。
+
+12:13:57 UTC 平台确认新标签镜像拉取成功，12:14:05 Blob 写入/读取/删除探针成功且迁移 0 文件，12:14:06 启动探针成功，12:14:14 站点启动。健康与 PWA 资源 200、安装资源 `no-store`、匿名 API 401、Entra 登录入口 302 且回调正确。本轮未新增收费模型调用或启动 GPU；自定义尺寸的真实模型生成、Qwen 改画幅和用户登录后操作仍待端到端验证。
+
 ### 东南亚重建
 
 2026-09-22 按用户要求在 Southeast Asia 全新创建 Web App、Linux B2 单实例计划、Basic ACR、Standard LRS Blob 私有容器及专用终结点，不迁移旧数据库、素材或运行历史。应用仍使用 `20260922-assets-96762a2`，镜像摘要与下方已验收版本一致。新数据库 `PRAGMA integrity_check` 为 `ok`，项目数为 0。
@@ -76,7 +88,7 @@ Web App 集成到 GPU 所在 VNet 的独立委派子网，Blob 专用终结点�
 - Linux App Service Plan：`asp-example-studio`，B2，单实例。
 - Web App：`example-studio-web`，仅 HTTPS，Always On。
 - ACR：`examplestudioregistry`，Basic，管理员密码禁用。
-- 镜像：`examplestudioregistry.azurecr.io/qwen-studio:20260922-assets-96762a2`。
+- 镜像：`examplestudioregistry.azurecr.io/qwen-studio:20260922-fixes-cb8bbe8`。
 - 镜像摘要：`sha256:REDACTED_SHA256`。
 - Blob 账户：`examplestudiostorage`，Standard LRS，私有容器 `assets`。
 - 私网：复用 GPU 所在 VNet，独立的 Web App 集成子网及 Blob 专用终结点子网，私有 DNS 区 `privatelink.blob.core.windows.net`；无需 Web App 到 GPU 的跨区域 peering。
