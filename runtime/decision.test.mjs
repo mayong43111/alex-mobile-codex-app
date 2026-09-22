@@ -1,8 +1,20 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseDecision, renderSettings } from './decision.mjs'
+import { parseDecision, renderSettings, editOutputSize, imageOutputSize } from './decision.mjs'
 import { ImageSourceRequest } from './image-source.mjs'
 import { createHash, randomUUID } from 'node:crypto'
+
+test('Azure edits accept phone photos without changing the source or GPU dimensions', () => {
+  const source = { width: 3024, height: 4032 }
+  assert.equal(editOutputSize(source, 'azure-image2'), 'auto')
+  assert.equal(editOutputSize({ width: 4032, height: 3024 }, 'azure-image2'), 'auto')
+  assert.equal(editOutputSize({ width: 640, height: 640 }, 'azure-image2'), 'auto')
+  for (const [width, height] of [[1024, 1024], [1536, 1024], [1024, 1536]]) {
+    assert.equal(editOutputSize({ width, height }, 'azure-image2'), `${width}x${height}`)
+  }
+  assert.equal(editOutputSize(source, 'qwen-image-2.1'), '3024x4032')
+  assert.deepEqual(source, { width: 3024, height: 4032 })
+})
 
 test('selected source delivery validates identity and bytes and supports cancellation', async () => {
   const bytes = Buffer.from('selected source test')
@@ -26,7 +38,23 @@ test('conversation settings override defaults without provider substitution', ()
   const decision = parseDecision(JSON.stringify({ action: 'image', reply: '准备', imagePrompt: 'wide scene', ratio: '16:9', quality: 'high' }), 'auto')
   assert.deepEqual(renderSettings(decision, defaults), { ratio: '16:9', quality: 'high' })
   assert.deepEqual(renderSettings({ action: 'image', ratio: null, quality: null }, defaults), { ratio: '1:1', quality: 'low' })
-  assert.throws(() => renderSettings(decision, { ...defaults, imageModel: 'azure-image2' }), /未发送/)
+  assert.equal(imageOutputSize(decision, { ...defaults, imageModel: 'azure-image2' }), '1536x864')
+})
+
+test('explicit conversational pixels and edit aspect override default and source dimensions', () => {
+  const defaults = { ratio: '1:1', imageModel: 'azure-image2' }
+  const source = { width: 1024, height: 1024 }
+  for (const action of ['image', 'edit']) {
+    const decision = parseDecision(JSON.stringify({ action, reply: '准备', imagePrompt: 'test', size: '2048x1152', ratio: '16:9', sourceAssetId: action === 'edit' ? '00000000-0000-4000-8000-000000000001' : null }), 'auto', ['00000000-0000-4000-8000-000000000001'])
+    assert.equal(imageOutputSize(decision, defaults, source), '2048x1152')
+    assert.equal(imageOutputSize({ action, ratio: '9:16' }, defaults, source), '864x1536')
+    assert.throws(() => imageOutputSize({ action, size: '1920x1080' }, defaults, source), /不会替换/)
+    assert.throws(() => imageOutputSize({ action, size: '4096x4096' }, defaults, source), /不会替换/)
+    assert.throws(() => imageOutputSize({ action, size: '2048x1152', ratio: '1:1' }, defaults, source), /冲突/)
+  }
+  assert.equal(imageOutputSize({ action: 'edit' }, defaults, source), '1024x1024')
+  assert.equal(imageOutputSize({ action: 'edit' }, defaults, { width: 1536, height: 864 }), '1536x864')
+  assert.equal(imageOutputSize({ action: 'edit', size: '2048x1152' }, { ...defaults, imageModel: 'qwen-image-2.1' }, source), '2048x1152')
 })
 
 test('automatic decisions permit images only for an explicit image action', () => {

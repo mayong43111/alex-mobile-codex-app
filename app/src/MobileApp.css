@@ -4,7 +4,8 @@
 .generated-video { display: block; width: 100%; max-height: 65dvh; aspect-ratio: 16 / 9; object-fit: contain; background: #111; }
 .video-result { width: 100%; min-width: 0; }
 .video-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
-.studio { width: 100%; height: var(--app-height, 100dvh); background: #f7f8f7; }
+.studio { position: fixed; top: var(--app-top, 0px); left: 0; width: 100%; height: var(--app-height, 100dvh); overflow: hidden; background: #f7f8f7; }
+.run-progress pre { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; }
 .workspace { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
 .topbar { display: flex; align-items: center; gap: 4px; flex-shrink: 0; padding: calc(4px + env(safe-area-inset-top)) 8px 4px; min-height: 52px; background: #fff; border-bottom: 1px solid var(--line); }
 .breadcrumb { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }

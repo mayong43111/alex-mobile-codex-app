@@ -33,6 +33,40 @@ class AzureImageTest(unittest.TestCase):
         self.directory.cleanup()
 
     @patch("azure_image.requests.post")
+    def test_custom_output_dimensions_are_sent_for_generation_and_edit(self, post):
+        output = io.BytesIO()
+        Image.new('RGB', (2048, 1152), 'white').save(output, format='PNG')
+        self.response.json.return_value = {'data': [{'b64_json': base64.b64encode(output.getvalue()).decode()}]}
+        post.return_value = self.response
+        for operation in ['generate', 'edit']:
+            result = AzureImage('test-token').execute({'prompt': 'wide', 'size': '2048x1152', 'operation': operation, **({'sourceImage': self.source} if operation == 'edit' else {})})
+            self.assertTrue(result.success)
+            self.assertEqual(post.call_args.kwargs['data' if operation == 'edit' else 'json']['size'], '2048x1152')
+            self.assertEqual((result.data['width'], result.data['height']), (2048, 1152))
+
+    @patch("azure_image.requests.post")
+    def test_invalid_output_size_is_not_silently_replaced(self, post):
+        for size in ['1920x1080', '4096x2048', '512x512', '3840x512', '3840x3840']:
+            result = AzureImage('test-token').execute({'prompt': 'test', 'size': size})
+            self.assertFalse(result.success)
+        post.assert_not_called()
+
+    @patch("azure_image.requests.post")
+    def test_phone_photo_edit_uses_auto_without_resizing_source(self, post):
+        original = io.BytesIO()
+        Image.new("RGB", (3024, 4032), "white").save(original, format="PNG")
+        raw = original.getvalue()
+        source = {**self.source, "width": 3024, "height": 4032,
+            "png": base64.b64encode(raw).decode(), "hash": hashlib.sha256(raw).hexdigest()}
+        post.return_value = self.response
+        result = AzureImage("test-token").execute({"prompt": "Edit photo", "size": "auto", "operation": "edit", "sourceImage": source})
+        self.assertTrue(result.success)
+        self.assertEqual(post.call_args.kwargs["data"]["size"], "auto")
+        self.assertEqual(post.call_args.kwargs["files"]["image"][1], raw)
+        self.assertEqual((result.data["width"], result.data["height"]), (1024, 1024))
+        self.assertEqual(result.data["sourceHash"], source["hash"])
+
+    @patch("azure_image.requests.post")
     def test_quality_is_forwarded_for_generation_and_edit(self, post):
         post.return_value = self.response
         for quality in ['low', 'medium', 'high']:
@@ -45,7 +79,7 @@ class AzureImageTest(unittest.TestCase):
     def test_main_saves_image_and_real_checkpoint(self, post):
         post.return_value = self.response
         run_id = str(uuid4())
-        request = {"runId": run_id, "accessToken": "test-token", "prompt": "Make it red", "size": "1024x1024", "operation": "edit", "sourceImage": self.source}
+        request = {"runId": run_id, "accessToken": "test-token", "prompt": "Make it red", "size": "auto", "operation": "edit", "sourceImage": self.source}
         with patch("azure_image.sys.stdin", io.StringIO(json.dumps(request))), patch("azure_image.sys.stdout", new_callable=io.StringIO) as output, patch("azure_image.Path", side_effect=lambda value: Path(self.directory.name) if value == "/state/montage" else Path(value)):
             main()
         result = json.loads(output.getvalue())

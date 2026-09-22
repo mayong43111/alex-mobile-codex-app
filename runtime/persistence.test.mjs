@@ -3,7 +3,23 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, stat, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { saveRun } from './persistence.mjs'
+import { saveRun, appendCodexEvent } from './persistence.mjs'
+
+test('Codex events retain original payloads and updates without truncation or rewriting', async () => {
+  const run = { id: 'run' }
+  const events = Array.from({ length: 205 }, (_, index) => ({ type: index === 204 ? 'item.completed' : 'item.updated', item: { id: 'same-item', type: 'reasoning', text: `${index}: ${'original\n'.repeat(900)}` } }))
+  events.push({ type: 'item.completed', item: { id: 'tool', type: 'mcp_tool_call', result: { content: [{ type: 'text', text: 'Original tool result' }] } } })
+  for (const event of events) appendCodexEvent(run, event)
+  assert.equal(run.progress.length, events.length)
+  assert.equal(new Set(run.progress.map(entry => entry.id)).size, events.length)
+  assert.deepEqual(run.progress.map(entry => JSON.parse(entry.detail)), events)
+  const directory = await mkdtemp(join(tmpdir(), 'studio-events-'))
+  try {
+    const file = join(directory, 'run.json')
+    await saveRun(file, run)
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), run)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
 
 test('concurrent run saves never share a temporary path or leave partial JSON', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'studio-run-save-'))

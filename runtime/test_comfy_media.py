@@ -14,6 +14,15 @@ from comfy_media import workflow, checked_source, validate_media, MODELS, ComfyM
 
 
 class ComfyMediaTest(unittest.TestCase):
+    def test_explicit_edit_dimensions_use_target_latent_and_unchanged_reference(self):
+        source = {'filename': 'original.png', 'width': 1024, 'height': 1024}
+        graph, width, height, _ = workflow('qwen-image-2.1', 'reframe wide', '1:1', 1, source, size='2048x1152')
+        self.assertEqual((width, height), (2048, 1152))
+        self.assertEqual(graph['5']['inputs']['width'], 2048)
+        self.assertEqual(graph['6']['inputs']['latent_image'], ['5', 0])
+        self.assertEqual(graph['4']['inputs']['images.image_1'], ['9', 0])
+        self.assertEqual(graph['9']['inputs']['image'], 'original.png')
+
     def test_exact_ratios_and_quality_steps(self):
         for model in MODELS:
             for ratio in ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']:

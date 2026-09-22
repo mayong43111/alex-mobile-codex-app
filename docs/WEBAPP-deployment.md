@@ -20,6 +20,18 @@
 
 ## 最新发布
 
+### 东南亚重建
+
+2026-09-22 按用户要求在 Southeast Asia 全新创建 Web App、Linux B2 单实例计划、Basic ACR、Standard LRS Blob 私有容器及专用终结点，不迁移旧数据库、素材或运行历史。应用仍使用 `20260922-assets-96762a2`，镜像摘要与下方已验收版本一致。新数据库 `PRAGMA integrity_check` 为 `ok`，项目数为 0。
+
+Web App 集成到 GPU 所在 VNet 的独立委派子网，Blob 专用终结点使用另一独立子网；私有 DNS 链接到该 VNet。NSG 仅允许新 Web App 子网访问 GPU 的 TCP 8188，保留开发机规则，不增加公网或 SSH 入口。已配置 `VM_CONFIG=/home/studio/vm-config.json` 和 `COMFYUI_SERVER_URL`，VM 配置使用 `auth: "managed-identity"`。
+
+新系统托管身份已分配并回读六项最小授权：ACR 拉取、容器范围 Blob 读写、两个模型账户的 OpenAI User、目标 VM 电源操作与异步操作读取。沿用既有 Entra 应用、用户分配及白名单，登录回调已更新为新站点。健康检查 200、匿名 API 401、登录入口 302；11:26:55 UTC 应用日志确认 Blob 写入/读取/删除成功、迁移 0 文件。GPU 保持已解除分配，未发起模型调用；实际用户登录、云端模型调用及 GPU 启停/生成仍未端到端验收。
+
+旧 East Asia 专用资源组已删除并回读确认不存在，包含旧 Web App、B2、ACR、Blob 数据及配套网络。旧身份六项授权、旧登录回调、旧 Web App 的跨区域 peering 和 NSG 规则均已清理。GPU、系统盘、模型盘、模型账户及开发网络保留。下方旧环境发布、数据迁移及镜像保留说明均为历史记录，旧 ACR 的历史标签不再可用。
+
+### 重建前的应用发布
+
 2026-09-22 新版应用提交 `96762a2` 已推送并部署，镜像标签 `20260922-assets-96762a2`，摘要 `sha256:39b352546249668134b0c5272d7b2247962f49e570a0ba9222fe3e5a295d1675`。包含通用文件上传入库、按需只读 MCP、Codex 决定生成/编辑及选择来源图片、模型选择、项目删除和 VM 控制界面。22 项后端、26 项手机浏览器、11 项 Node 运行时、12 项 Python 测试共 71 项通过，构建、lint、敏感信息扫描及生产镜像离线认证检查通过。
 
 本轮仅更新 `linuxFxVersion`，两次只读核对云端无排队/运行任务；认证配置与应用设置前后完全一致。10:44:45 UTC 新版 Blob 读写删除探针成功、无需迁移，10:44:46 启动探针成功，10:44:54 站点启动。健康/PWA 资源正常，匿名 API 401，登录入口重定向 Entra。旧镜像标签保留，不自动回滚或恢复历史失败任务。
@@ -55,19 +67,19 @@
 
 异步状态查询需要资源组级读取权限，参见 [Azure 异步操作权限要求](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/async-operations#permission-for-tracking-async-status)。电源操作仍仅限目标 VM，不授予删除、改配、执行脚本或 RBAC 管理权限。
 
-本次没有更新线上镜像、创建云端 `VM_CONFIG`、修改网络或实际启停 VM。云端启用还需要部署新版本、配置 `/home/` 下的 VM 配置文件并使用 `auth: "managed-identity"`；Web App 到 GPU 的受控私网连接仍待配置，以支持 ComfyUI 状态、队列及生成请求。角色分配回读不等于云端端到端操作已验收。
+东南亚重建后，新身份已重新取得上述授权，`VM_CONFIG`、`COMFYUI_SERVER_URL` 和同 VNet 私网连接均已配置。GPU 未实际启停；角色分配回读不等于云端端到端操作已验收。
 
 ## 资源
 
 - 订阅 2：`00000000-0000-0000-0000-000000000000`。
-- 独立资源组：`rg-example-studio`，East Asia。
+- 独立资源组：`rg-example-studio`，Southeast Asia。
 - Linux App Service Plan：`asp-example-studio`，B2，单实例。
 - Web App：`example-studio-web`，仅 HTTPS，Always On。
 - ACR：`examplestudioregistry`，Basic，管理员密码禁用。
-- 镜像：`examplestudioregistry.azurecr.io/qwen-studio:20260922-web-search-dc11780`。
+- 镜像：`examplestudioregistry.azurecr.io/qwen-studio:20260922-assets-96762a2`。
 - 镜像摘要：`sha256:REDACTED_SHA256`。
 - Blob 账户：`examplestudiostorage`，Standard LRS，私有容器 `assets`。
-- 私网：`vnet-example-studio`（10.30.0.0/24），Web App 集成子网 `webapp`，专用终结点 `pe-example-blob`，私有 DNS 区 `privatelink.blob.core.windows.net`。
+- 私网：复用 GPU 所在 VNet，独立的 Web App 集成子网及 Blob 专用终结点子网，私有 DNS 区 `privatelink.blob.core.windows.net`；无需 Web App 到 GPU 的跨区域 peering。
 
 B2 与 ACR 持续收费，停止 Web App 不停止计划收费；Blob 容量和读写请求、模型调用另按 Azure 账单计费。用户已确认增加私网接入，专用终结点与 DNS 预计新增约 US$8–10/月基础费用，另计流量和查询，以账单为准。没有改动其他项目资源或恢复 GPU 申请。
 

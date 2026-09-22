@@ -52,7 +52,7 @@ function RunProgress({ run }: { run: AgentRun }) {
   const running = run.status === 'running' || run.status === 'queued'
   return <details className="run-progress">
     <summary aria-label="处理过程" title="处理过程"><Aperture size={16} /><strong>Codex</strong><span className="progress-state">{running && <LoaderCircle size={13} className="spin" />}{runLabel(run)}</span><ChevronRight size={14} className="progress-chevron" /></summary>
-    {entries.length ? <ol>{entries.map(entry => <li key={entry.id}><div className="progress-heading"><strong>{entry.label}</strong><time dateTime={entry.createdAt}>{time(entry.createdAt)}</time></div>{entry.detail && <p>{entry.detail}</p>}</li>)}</ol> : <p className="progress-empty">{running ? (run.status === 'queued' ? '等待开始处理' : '等待 Codex 运行事件') : '此运行未记录详细过程'}</p>}
+    {entries.length ? <ol>{entries.map(entry => <li key={entry.id}><div className="progress-heading"><strong>{entry.label}</strong><time dateTime={entry.createdAt}>{time(entry.createdAt)}</time></div>{entry.detail && (entry.id.startsWith('codex:') ? <pre>{entry.detail}</pre> : <p>{entry.detail}</p>)}</li>)}</ol> : <p className="progress-empty">{running ? (run.status === 'queued' ? '等待开始处理' : '等待 Codex 运行事件') : '此运行未记录详细过程'}</p>}
   </details>
 }
 
@@ -211,14 +211,18 @@ export default function App() {
     const resize = () => {
       if (viewport && viewport.scale !== 1) return
       document.documentElement.style.setProperty('--app-height', `${viewport?.height ?? window.innerHeight}px`)
+      document.documentElement.style.setProperty('--app-top', `${viewport?.offsetTop ?? 0}px`)
     }
     resize()
     viewport?.addEventListener('resize', resize)
+    viewport?.addEventListener('scroll', resize)
     window.addEventListener('resize', resize)
     return () => {
       viewport?.removeEventListener('resize', resize)
+      viewport?.removeEventListener('scroll', resize)
       window.removeEventListener('resize', resize)
       document.documentElement.style.removeProperty('--app-height')
+      document.documentElement.style.removeProperty('--app-top')
     }
   }, [])
 

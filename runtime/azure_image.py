@@ -28,7 +28,7 @@ class AzureImage(BaseTool):
         "required": ["prompt", "size"],
         "properties": {
             "prompt": {"type": "string", "minLength": 1, "maxLength": 6000},
-            "size": {"enum": ["1024x1024", "1536x1024", "1024x1536"]},
+            "size": {"type": "string", "pattern": "^(auto|[1-9][0-9]{0,4}x[1-9][0-9]{0,4})$"},
             "quality": {"enum": ["low", "medium", "high"]},
             "operation": {"enum": ["generate", "edit"]},
             "sourceImage": {"type": "object", "required": ["assetId", "png", "hash", "width", "height"],
@@ -43,6 +43,10 @@ class AzureImage(BaseTool):
         import jsonschema
 
         jsonschema.validate(inputs, self.input_schema)
+        if inputs['size'] != 'auto':
+            width, height = map(int, inputs['size'].split('x'))
+            if width % 16 or height % 16 or max(width, height) > 3840 or max(width, height) > 3 * min(width, height) or not 655360 <= width * height <= 8294400:
+                return ToolResult(success=False, error='Unsupported output dimensions; image API not called')
         settings = json.loads(Path(os.environ["SERVICES_FILE"]).read_text())["image"]
         started = time.monotonic()
         try:
@@ -75,8 +79,10 @@ class AzureImage(BaseTool):
             if len(raw) > 32 * 1024 * 1024:
                 raise ValueError("Image too large")
             image = Image.open(io.BytesIO(raw))
+            if image.width * image.height > 40_000_000:
+                raise ValueError("Image too large")
             image.load()
-            expected = tuple(int(value) for value in inputs["size"].split("x"))
+            expected = image.size if inputs["size"] == "auto" else tuple(int(value) for value in inputs["size"].split("x"))
             if image.size != expected or image.format != "PNG":
                 raise ValueError("Unexpected image dimensions or format")
             return ToolResult(success=True, data={"png": base64.b64encode(raw).decode(),
@@ -107,7 +113,7 @@ def main():
     output.write_bytes(base64.b64decode(result.data["png"]))
     manifest = {"version": "1.0", "assets": [{"id": run_id, "type": "image", "path": "image.png",
         "source_tool": "azure_image2", "scene_id": "single", "model": result.model,
-        "provider": "azure", "resolution": request["size"], "format": "png", "prompt": request["prompt"]}],
+        "provider": "azure", "resolution": f"{result.data['width']}x{result.data['height']}", "format": "png", "prompt": request["prompt"]}],
         "metadata": {"cost_status": "unknown", "quality": request.get("quality", "low"), "usage": result.data.get("usage"),
             "operation": result.data["operation"], "source_asset_id": result.data.get("sourceAssetId"), "source_hash": result.data.get("sourceHash")}}
     write_checkpoint(root, run_id, "assets", "completed", {"asset_manifest": manifest})

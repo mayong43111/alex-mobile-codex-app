@@ -20,7 +20,7 @@ const remoteSchema = z.object({
   stage: z.enum(['codex', 'image', 'video']), reply: z.string().max(20000), error: z.string().optional(),
   imageOperation: z.enum(['generate', 'edit']).optional(),
   sourceAssetId: z.string().uuid().optional(), needsSource: z.boolean().optional(),
-  progress: z.array(z.object({ id: z.string().max(200), label: z.string().max(120), detail: z.string().max(6000).optional(), createdAt: z.string().datetime() })).max(200).optional(),
+  progress: z.array(z.object({ id: z.string().max(200), label: z.string().max(120), detail: z.string().optional(), createdAt: z.string().datetime() })).optional(),
   image: z.object({ png: z.string().max(48 * 1024 * 1024), width: z.number(), height: z.number(), model: z.string(), checkpoint: z.string(),
     provider: z.enum(['azure', 'comfyui']).optional(), operation: z.enum(['generate', 'edit']).optional(), sourceAssetId: z.string().uuid().optional(), sourceHash: z.string().regex(/^[0-9a-f]{64}$/).optional() }).optional(),
   video: z.object({ mp4: z.string().max(64 * 1024 * 1024), thumbnail: z.string().max(4 * 1024 * 1024), width: z.number().int().positive().max(1920), height: z.number().int().positive().max(1920), duration: z.number().positive().max(15), fps: z.literal(24), model: z.literal('minimax-h3'), provider: z.literal('comfyui'), checkpoint: z.string() }).optional(),

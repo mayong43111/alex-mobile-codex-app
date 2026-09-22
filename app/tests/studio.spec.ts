@@ -3,6 +3,34 @@ import type { Page } from '@playwright/test'
 import { resolve } from 'node:path'
 import sharp from 'sharp'
 
+test('composer follows the iPhone keyboard visual viewport and its scroll offset', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '键盘定位' } })).json()
+  await page.addInitScript(projectId => {
+    localStorage.setItem('qwen-project', projectId)
+    const viewport = new EventTarget()
+    Object.assign(viewport, { height: innerHeight, offsetTop: 0, scale: 1 })
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport })
+  }, project.id)
+  await page.goto('/')
+  const input = page.getByRole('textbox', { name: '创作需求' })
+  await input.fill('修改这张照片')
+  for (const [height, offsetTop, event] of [[300, 120, 'resize'], [300, 40, 'scroll'], [280, 60, 'resize'], [568, 0, 'resize']] as const) {
+    await page.evaluate(({ height, offsetTop, event }) => {
+      Object.assign(window.visualViewport!, { height, offsetTop })
+      window.visualViewport!.dispatchEvent(new Event(event))
+    }, { height, offsetTop, event })
+    await expect.poll(() => page.locator('.studio').evaluate(element => Math.round(element.getBoundingClientRect().top))).toBe(offsetTop)
+    const bounds = await input.boundingBox()
+    expect(bounds!.y).toBeGreaterThanOrEqual(offsetTop)
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(offsetTop + height)
+    const send = await page.locator('.composer .send').boundingBox()
+    expect(send!.y + send!.height).toBeLessThanOrEqual(offsetTop + height)
+    await expect(input).toBeFocused()
+    await expect(input).toHaveValue('修改这张照片')
+    if (offsetTop === 40) await page.screenshot({ path: testInfo.outputPath('keyboard-viewport.png') })
+  }
+})
+
 async function openProjectPanel(page: Page, name: '素材库' | '任务记录') {
   if (await page.getByRole('dialog').count()) await page.getByRole('button', { name: '关闭', exact: true }).click()
   await page.getByRole('button', { name: '项目列表', exact: true }).click()
@@ -511,6 +539,8 @@ test('configured chat displays assistant, Azure assets and run history', async (
   let submitCount = 0
   let runStatus = 'completed'
   const progress = [{ id: 'reasoning:1', label: 'Codex 推理摘要', detail: '这是测试夹具的公开摘要。', createdAt: now }]
+  const rawEvent = JSON.stringify({ type: 'item.completed', item: { id: 'tool-1', type: 'mcp_tool_call', arguments: { assetId: 'fixture' }, result: { content: [{ type: 'text', text: `${'original-text\n'.repeat(550)}UNTRUNCATED-END` }] } } }, null, 2)
+  progress.push({ id: 'codex:1', label: 'item.completed', detail: rawEvent, createdAt: now })
   await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', openmontage: 'installed', models: { images: ['azure-image2', 'qwen-image-2.1'], videos: ['minimax-h3'] } } }))
   await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: { project, threadId, jobs: [],
     messages: submitted ? [{ id: messageId, projectId: project.id, text: '手机对话测试', assetIds: [], createdAt: now, role: 'user' },
@@ -550,9 +580,12 @@ test('configured chat displays assistant, Azure assets and run history', async (
   })).toBe(true)
   const process = page.locator('.run-progress')
   await expect(process).not.toHaveAttribute('open')
+  await expect(process.locator('pre')).not.toBeVisible()
   await expect(process.getByText('这是测试夹具的公开摘要。')).not.toBeVisible()
   await process.locator('summary').click()
   await expect(process.getByText('这是测试夹具的公开摘要。')).toBeVisible()
+  expect(await process.locator('pre').textContent()).toBe(rawEvent)
+  await expect(process.locator('pre')).toContainText('UNTRUNCATED-END')
   progress.push({ id: 'image-start', label: 'OpenMontage 正在调用 Azure image2', detail: 'long-detail-'.repeat(40), createdAt: now })
   await request.patch(`/api/projects/${project.id}`, { data: { title: '过程更新测试' } })
   await expect(process.getByText('OpenMontage 正在调用 Azure image2')).toBeVisible()

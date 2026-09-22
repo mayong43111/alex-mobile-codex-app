@@ -19,7 +19,7 @@ MODELS = {
 }
 
 
-def workflow(model, prompt, ratio, seed, source=None, quality='low'):
+def workflow(model, prompt, ratio, seed, source=None, quality='low', size=None):
     weights = MODELS[model]
     video = model == 'minimax-h3'
     width, height = ({'1:1': (640, 640), '3:2': (768, 512), '2:3': (512, 768), '4:3': (768, 576), '3:4': (576, 768), '16:9': (1024, 576), '9:16': (576, 1024)} if video else {'1:1': (1024, 1024), '3:2': (1536, 1024), '2:3': (1024, 1536), '4:3': (1280, 960), '3:4': (960, 1280), '16:9': (1536, 864), '9:16': (864, 1536)})[ratio]
@@ -28,8 +28,10 @@ def workflow(model, prompt, ratio, seed, source=None, quality='low'):
         if video:
             raise ValueError('Video source inputs are not enabled')
         width, height = source['width'], source['height']
-        if width % 32 or height % 32 or width * height > 4_194_304:
-            raise ValueError('Unsupported Qwen edit dimensions')
+    if size and not video:
+        width, height = map(int, size.split('x'))
+    if not video and (width <= 0 or height <= 0 or width % 32 or height % 32 or width * height > 4_194_304):
+        raise ValueError('Unsupported Qwen output dimensions')
     graph = {
         '1': {'class_type': 'UNETLoader', 'inputs': {'unet_name': weights[0], 'weight_dtype': 'default'}},
         '2': {'class_type': 'CLIPLoader', 'inputs': {'clip_name': weights[1], 'type': 'minimax' if video else 'qwen_image', 'device': 'default'}},
@@ -46,7 +48,8 @@ def workflow(model, prompt, ratio, seed, source=None, quality='low'):
         if source:
             graph['9'] = {'class_type': 'LoadImage', 'inputs': {'image': source['filename']}}
             graph['4']['inputs'].update({'vae': ['3', 0], 'images.image_1': ['9', 0]})
-            graph['6']['inputs']['latent_image'] = ['4', 2]
+            if (width, height) == (source['width'], source['height']):
+                graph['6']['inputs']['latent_image'] = ['4', 2]
     else:
         graph.update({
             '4': {'class_type': 'VAELoader', 'inputs': {'vae_name': weights[3]}},
@@ -156,7 +159,7 @@ class ComfyMedia(BaseTool):
                 uploaded = response.json()
                 source = {**source, 'filename': '/'.join(filter(None, [uploaded.get('subfolder'), uploaded['name']]))}
             seed = int(UUID(run_id)) % (2**53)
-            graph, width, height, output_node = workflow(model, inputs['prompt'], inputs['ratio'], seed, source, inputs.get('quality', 'low'))
+            graph, width, height, output_node = workflow(model, inputs['prompt'], inputs['ratio'], seed, source, inputs.get('quality', 'low'), inputs.get('size'))
             workflow_hash = hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
             record = {'run_id': run_id, 'model': model, 'seed': seed, 'workflow_hash': workflow_hash, 'ratio': inputs['ratio'], 'quality': inputs.get('quality', 'low'), 'status': 'submitting'}
             ledger.write_text(json.dumps(record))

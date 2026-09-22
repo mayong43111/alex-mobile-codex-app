@@ -397,7 +397,7 @@ test('worker serializes turns, imports one image, stops queued work and does not
     assert.equal(submitted.length, 1)
     await worker.tick()
     assert.equal(submitted.length, 1)
-    const progress = [{ id: 'reasoning:1', label: 'Codex 推理摘要', detail: '测试用公开摘要', createdAt: new Date().toISOString() }]
+    const progress = Array.from({ length: 205 }, (_, index) => ({ id: `codex:${index}`, label: 'item.updated', detail: JSON.stringify({ type: 'item.updated', item: { id: 'same-item', type: 'reasoning', text: `${index}: ${'原始内容'.repeat(1600)}` } }), createdAt: new Date().toISOString() }))
     remote.get(first.id)!.progress = progress
     await worker.tick()
     assert.deepEqual(store.agentRun(first.id).progress, progress)

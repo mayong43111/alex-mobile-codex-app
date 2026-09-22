@@ -94,7 +94,11 @@ try {
       if (process.env.NO_IMAGE === '1') assert.equal(current.assetId, undefined, 'Unexpected generated image')
       if (process.env.EXPECT_INTENT) assert.equal(current.progress?.find(entry => entry.id === 'intent')?.label, process.env.EXPECT_INTENT)
       if (process.env.WEB_SEARCH_TEST === '1') {
-        const searches = current.progress?.filter(entry => entry.id.startsWith('web-search:') && entry.label === '网页搜索已完成') ?? []
+        const searches = current.progress?.filter(entry => {
+          if (!entry.id.startsWith('codex:') || !entry.detail) return false
+          const event = JSON.parse(entry.detail)
+          return event.type === 'item.completed' && event.item?.type === 'web_search'
+        }) ?? []
         assert(searches.length > 0, 'No completed web search tool event')
         assert.match(current.reply, /https:\/\//, 'No source URL in reply')
         assert.equal(current.assetId, undefined, 'Search unexpectedly generated an image')
