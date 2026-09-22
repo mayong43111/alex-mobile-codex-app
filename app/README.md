@@ -48,7 +48,11 @@ docker compose up -d --build runtime
 | Codex 决策 | `example-gpt-account` / `gpt-5.4` | southeastasia，服务端 API key |
 | 图片工具 | `example-image-account` / `gpt-image-2` | eastus2，Entra token |
 
-图片账户保持 `disableLocalAuth=true`，未开启密钥认证。自动识别和显式图片请求在提交前，后端通过 `$HOME/.local/share/qwen-azure-cli/bin/az` 获取短期 Cognitive Services token，只经内存传给工具，不写入会话或检查点。自动识别时获取 token 失败仍可对话，但图片动作会在调用图片 API 前报错。登录过期需在本机 Azure CLI 重新登录；不在聊天中输入密码或 token。Codex 不接收图片 token，也没有 shell、写文件或网络搜索工具。
+图片账户保持 `disableLocalAuth=true`，未开启密钥认证。自动识别和显式图片请求在提交前，后端通过 `$HOME/.local/share/qwen-azure-cli/bin/az` 获取短期 Cognitive Services token，只经内存传给工具，不写入会话或检查点。自动识别时获取 token 失败仍可对话，但图片动作会在调用图片 API 前报错。登录过期需在本机 Azure CLI 重新登录；不在聊天中输入密码或 token。Codex 不接收图片 token，没有 shell、写文件或自行安装工具的权限；仅新增下面的原生 Web Search。
+
+Web Search 随固定版本 Codex CLI 一起安装，运行时设为 `webSearchMode: 'live'`，不是额外的浏览器或第三方搜索插件。保留 `shell_tool=false`、`apply_patch_freeform=false`、只读沙箱及 `approvalPolicy=never`，不新增 MCP、Skill 安装或系统网络执行权限。指令要求引用实际查阅的 HTTPS 来源、将网页视为不可信数据、不把凭证或私人历史作为搜索词；这是模型行为约束，不是独立的数据防泄露过滤器。
+
+2026-09-22 本地真实搜索 Microsoft Edge PWA 文档成功，收到三条已完成的 SDK `web_search` 事件，回复包含 Microsoft 官方来源，未生成图片。事件在“处理过程”中显示；云端尚未发布，托管身份下搜索未验收。仓库根目录可手动运行 `WEB_SEARCH_TEST=1 node runtime/smoke.mjs`：必须有搜索完成事件、来源链接且无图片才通过，禁止与出图验收开关混用。该测试调用真实模型/搜索，可能计费，不属于默认离线测试。
 
 每个项目复用一个 Codex thread，SQLite 保存 thread ID、消息和运行状态；Codex 自身会话、运行结果及 OpenMontage 检查点保存在 Docker 命名卷 `qwen-studio_runtime-state`。图片工具继承上游 `BaseTool`，返回 `ToolResult` 并写入标准 `asset_manifest` 检查点，不是完整 OpenMontage 视频流水线。上游源码位于容器 `/opt/openmontage`，遵循其 AGPL-3.0 许可，分发或提供网络服务前需评估对应义务。
 

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
 
 const base = 'http://127.0.0.1:3188/api'
+if (process.env.WEB_SEARCH_TEST === '1' && ['EDIT_TEST', 'IMAGE_TEST', 'AUTO_TEST'].some(name => process.env[name] === '1')) throw new Error('Web search verification must run in chat mode without image tests')
 const request = async (path, body) => {
   const response = await fetch(base + path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {})
   assert(response.ok, `HTTP ${response.status}`)
@@ -64,7 +65,9 @@ if (process.env.EDIT_TEST === '1') {
 }
 const project = process.env.PROJECT_ID ? { id: process.env.PROJECT_ID } : await request('/projects', { title: 'Codex 与 Azure 接入验收' })
 const mode = process.env.AUTO_TEST === '1' ? 'auto' : process.env.IMAGE_TEST === '1' ? 'image' : 'chat'
-const text = process.env.PROMPT ?? '请记住本项目的验收代号是青竹七号。只回复已记住，不要生成图片。'
+const text = process.env.PROMPT ?? (process.env.WEB_SEARCH_TEST === '1'
+  ? '请实际使用网页搜索，查找 Microsoft 官方关于 Edge 安装 PWA 的文档，说明官方安装入口并附上本次查阅的官方 HTTPS 链接。不要凭记忆回答，不生成图片；搜索失败就明确说明。'
+  : '请记住本项目的验收代号是青竹七号。只回复已记住，不要生成图片。')
 const run = await request(`/projects/${project.id}/chat`, { requestId: randomUUID(), text, mode, ratio: '1:1' })
 console.log(JSON.stringify({ projectId: project.id, runId: run.id, mode }))
 const stream = await fetch(`${base}/projects/${project.id}/events`, { signal: AbortSignal.timeout(330000) })
@@ -81,6 +84,13 @@ try {
       if (mode === 'image') assert(current.assetId, 'No generated image')
       if (process.env.NO_IMAGE === '1') assert.equal(current.assetId, undefined, 'Unexpected generated image')
       if (process.env.EXPECT_INTENT) assert.equal(current.progress?.find(entry => entry.id === 'intent')?.label, process.env.EXPECT_INTENT)
+      if (process.env.WEB_SEARCH_TEST === '1') {
+        const searches = current.progress?.filter(entry => entry.id.startsWith('web-search:') && entry.label === '网页搜索已完成') ?? []
+        assert(searches.length > 0, 'No completed web search tool event')
+        assert.match(current.reply, /https:\/\//, 'No source URL in reply')
+        assert.equal(current.assetId, undefined, 'Search unexpectedly generated an image')
+        console.log(JSON.stringify({ webSearchVerified: true, searches }))
+      }
       break
     }
     if ((await reader.read()).done) throw new Error('SSE closed before completion')
