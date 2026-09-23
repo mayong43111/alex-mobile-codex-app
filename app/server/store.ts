@@ -20,6 +20,8 @@ export class Store {
       PRAGMA foreign_keys = ON;
       PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS project_owners (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS project_owners_user ON project_owners(user_id);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL, input_hash TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(project_id, request_id));
@@ -53,15 +55,23 @@ export class Store {
     return JSON.parse(row.data as string)
   }
 
-  projects(): Project[] {
+  requireOwner(projectId: string, userId: string) {
+    if (!this.db.prepare('SELECT 1 FROM project_owners WHERE project_id = ? AND user_id = ?').get(projectId, userId)) throw new HttpError(404, 'Project not found')
+  }
+
+  projects(userId?: string): Project[] {
+    if (userId !== undefined) return this.db.prepare("SELECT projects.data FROM projects JOIN project_owners ON projects.id = project_owners.project_id WHERE user_id = ? ORDER BY json_extract(projects.data, '$.updatedAt') DESC").all(userId).map(row => JSON.parse(row.data as string))
     return this.db.prepare("SELECT data FROM projects ORDER BY json_extract(data, '$.updatedAt') DESC").all()
       .map(row => JSON.parse(row.data as string))
   }
 
-  createProject(title: string): Project {
+  createProject(title: string, userId?: string): Project {
     const now = new Date().toISOString()
     const project: Project = { id: randomUUID(), title, createdAt: now, updatedAt: now }
-    this.db.prepare('INSERT INTO projects VALUES (?, ?)').run(project.id, JSON.stringify(project))
+    this.transaction(() => {
+      this.db.prepare('INSERT INTO projects VALUES (?, ?)').run(project.id, JSON.stringify(project))
+      if (userId !== undefined) this.db.prepare('INSERT INTO project_owners VALUES (?, ?)').run(project.id, userId)
+    })
     return project
   }
 

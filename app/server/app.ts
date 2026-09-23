@@ -13,6 +13,8 @@ import type { AgentTransport } from './agent.ts'
 import { BlobAssetStorage, LocalAssetStorage, prepareUpload } from './assets.ts'
 import type { AssetStorage } from './assets.ts'
 import type { VmControl } from './vm.ts'
+import { registerAuth } from './auth.ts'
+import type { AuthOptions } from './auth.ts'
 
 const titleSchema = z.object({ title: z.string().trim().min(1).max(80) }).strict()
 const submissionSchema = z.object({
@@ -21,7 +23,7 @@ const submissionSchema = z.object({
   ratio: z.enum(['1:1', '4:3', '3:4', '16:9']),
 }).strict()
 
-export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; entra?: { tenantId: string; userIds: string[] }; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl }) {
+export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; auth?: AuthOptions; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl }) {
   await mkdir(join(options.dataDir, 'images'), { recursive: true, mode: 0o700 })
   const store = new Store(join(options.dataDir, 'studio.sqlite'), options.journalMode)
   const assetStorage = options.assetStorage ?? new LocalAssetStorage(options.dataDir)
@@ -64,19 +66,9 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     const host = request.headers.host?.split(':')[0]
     if (!host || !(options.hosts ?? ['localhost', '127.0.0.1']).includes(host)) throw new HttpError(403, 'Host not allowed')
     reply.header('X-Content-Type-Options', 'nosniff').header('Cache-Control', 'no-store')
+    if (options.auth) reply.header('Referrer-Policy', 'no-referrer').header('X-Frame-Options', 'DENY')
     const publicPaths = ['/manifest.webmanifest', '/sw.js', '/icons/icon-180.png', '/icons/icon-192.png', '/icons/icon-512.png']
     if (['GET', 'HEAD'].includes(request.method) && publicPaths.includes(request.url.split('?')[0])) return
-    if (options.entra) {
-      const encoded = request.headers['x-ms-client-principal']
-      if (typeof encoded !== 'string') throw new HttpError(401, 'Sign in required')
-      let principal: { auth_typ?: string; claims?: { typ: string; val: string }[] }
-      try { principal = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')) }
-      catch { throw new HttpError(401, 'Invalid identity') }
-      const claims = Array.isArray(principal?.claims) ? principal.claims : []
-      const tenant = claims.find(claim => claim.typ === 'http://schemas.microsoft.com/identity/claims/tenantid' || claim.typ === 'tid')?.val
-      const user = claims.find(claim => claim.typ === 'http://schemas.microsoft.com/identity/claims/objectidentifier' || claim.typ === 'oid')?.val
-      if (principal?.auth_typ !== 'aad' || tenant !== options.entra.tenantId || !user || !options.entra.userIds.includes(user)) throw new HttpError(403, 'User not authorized')
-    }
     const origin = request.headers.origin
     if (origin && !origins.has(origin)) throw new HttpError(403, 'Origin not allowed')
     reply.header('X-Content-Type-Options', 'nosniff').header('Cache-Control', 'no-store')
@@ -88,6 +80,26 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
   })
   app.addHook('preClose', async () => { for (const close of streams) close() })
   app.addHook('onClose', async () => { clearInterval(vmTimer); await vmCheck; await worker?.close(); store.db.close() })
+
+  const authentication = options.auth ? await registerAuth(app, store.db, options.auth) : undefined
+  if (!authentication) app.get('/api/auth/session', async () => ({ enabled: false, user: null }))
+  app.addHook('preHandler', async request => {
+    if (!authentication || !request.routeOptions.url?.startsWith('/api/')) return
+    const route = request.routeOptions.url
+    const params = request.params as { id?: string }
+    if (!params.id) return
+    const user = request.studioSession!.user
+    let projectId: string | undefined
+    if (route.startsWith('/api/projects/:id')) projectId = params.id
+    else if (route.startsWith('/api/assets/:id')) projectId = store.asset(params.id).projectId
+    else if (route.startsWith('/api/agent-runs/:id')) projectId = store.agentRun(params.id).projectId
+    else if (route.startsWith('/api/jobs/:id')) {
+      const row = store.db.prepare('SELECT project_id FROM jobs WHERE id = ?').get(params.id)
+      if (!row) throw new HttpError(404, 'Project not found')
+      projectId = row.project_id as string
+    }
+    if (projectId) store.requireOwner(projectId, user.id)
+  })
 
   app.get('/healthz', async () => ({ status: 'ok' }))
   app.get('/api/vm', async () => options.vm ? options.vm.status() : { configured: false })
@@ -104,7 +116,7 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     const ready = status !== null
     const models = z.object({ models: z.object({ images: z.array(z.enum(['azure-image2', 'qwen-image-2.1'])), videos: z.array(z.literal('minimax-h3')) }) }).safeParse(status)
     return { storage: 'ready', agentConfigured: !!options.agent, agent: ready ? 'configured' : 'not_connected', renderer: ready ? 'azure_image2' : 'not_connected',
-      openmontage: ready ? 'installed' : 'not_connected', mode: options.entra ? 'entra-shared-workspace' : 'local-development', models: models.success ? models.data.models : { images: ready ? ['azure-image2'] : [], videos: [] } }
+      openmontage: ready ? 'installed' : 'not_connected', mode: options.auth ? 'private-user-workspace' : 'local-development', models: models.success ? models.data.models : { images: ready ? ['azure-image2'] : [], videos: [] } }
   })
   app.post<{ Params: { id: string } }>('/api/projects/:id/chat', async (request, reply) => {
     if (!worker) throw new HttpError(503, 'Codex 未配置')
@@ -124,10 +136,10 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     const result = worker ? worker.resend(request.params.id, request.params.messageId, input) : store.resend(request.params.id, request.params.messageId, input, false)
     return reply.code(202).send(result)
   })
-  app.get('/api/projects', async () => store.projects())
+  app.get('/api/projects', async request => store.projects(request.studioSession?.user.id))
   app.post('/api/projects', async (request, reply) => {
     reply.code(201)
-    return store.createProject(titleSchema.parse(request.body).title)
+    return store.createProject(titleSchema.parse(request.body).title, request.studioSession?.user.id)
   })
   app.patch<{ Params: { id: string } }>('/api/projects/:id', async request => store.rename(request.params.id, titleSchema.parse(request.body).title))
   app.delete<{ Params: { id: string } }>('/api/projects/:id', async request => {
@@ -201,6 +213,11 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     reply.raw.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' })
     reply.raw.write('event: connected\ndata: {}\n\n')
     const pump = () => {
+      if (authentication && !authentication.authenticate(request)) {
+        reply.raw.write('event: expired\ndata: {}\n\n')
+        reply.raw.end()
+        return
+      }
       try { store.project(request.params.id) } catch {
         reply.raw.write('event: deleted\ndata: {}\n\n')
         reply.raw.end()

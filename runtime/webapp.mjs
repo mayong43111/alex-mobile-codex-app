@@ -6,6 +6,8 @@ import { z } from 'zod'
 const environment = z.object({
   WEBSITE_HOSTNAME: z.string().min(1), ENTRA_TENANT_ID: z.string().uuid(),
   ENTRA_ALLOWED_USER_IDS: z.string().min(1),
+  ENTRA_CLIENT_ID: z.string().uuid(), ENTRA_CLIENT_SECRET: z.string().min(1),
+  ENTRA_ADMIN_USER_IDS: z.string().optional(),
   AZURE_GPT_ENDPOINT: z.url().startsWith('https://'), AZURE_GPT_DEPLOYMENT: z.string().min(1),
   AZURE_IMAGE_ENDPOINT: z.url().startsWith('https://'), AZURE_IMAGE_DEPLOYMENT: z.string().min(1),
   AZURE_MODEL_SUBSCRIPTION: z.string().uuid(),
@@ -14,6 +16,7 @@ const environment = z.object({
   VM_CONFIG: z.string().startsWith('/home/').optional(),
 }).parse(process.env)
 environment.ENTRA_ALLOWED_USER_IDS.split(',').forEach(id => z.string().uuid().parse(id))
+environment.ENTRA_ADMIN_USER_IDS?.split(',').forEach(id => { z.string().uuid().parse(id); if (!environment.ENTRA_ALLOWED_USER_IDS.split(',').includes(id)) throw new Error('Administrator outside allowed users') })
 await mkdir('/home/studio/runtime', { recursive: true })
 await mkdir('/home/node', { recursive: true })
 const temporary = await mkdtemp('/tmp/studio-')
@@ -63,6 +66,8 @@ gateway.once('message', message => {
     ...(environment.VM_CONFIG ? { VM_CONFIG: environment.VM_CONFIG } : {}),
     APP_ORIGINS: `https://${environment.WEBSITE_HOSTNAME}`,
     WEBSITE_HOSTNAME: environment.WEBSITE_HOSTNAME, ENTRA_TENANT_ID: environment.ENTRA_TENANT_ID, ENTRA_ALLOWED_USER_IDS: environment.ENTRA_ALLOWED_USER_IDS,
+    ENTRA_CLIENT_ID: environment.ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET: environment.ENTRA_CLIENT_SECRET,
+    ...(environment.ENTRA_ADMIN_USER_IDS ? { ENTRA_ADMIN_USER_IDS: environment.ENTRA_ADMIN_USER_IDS } : {}),
     IDENTITY_ENDPOINT: process.env.IDENTITY_ENDPOINT, IDENTITY_HEADER: process.env.IDENTITY_HEADER,
     AZURE_STORAGE_BLOB_ENDPOINT: environment.AZURE_STORAGE_BLOB_ENDPOINT, AZURE_STORAGE_CONTAINER: environment.AZURE_STORAGE_CONTAINER,
   } })

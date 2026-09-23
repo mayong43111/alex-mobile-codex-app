@@ -7,12 +7,14 @@
 `deploy/configure-webapp.mjs` 没有真实账户或镜像默认值。运行前必须在终端提供以下环境变量；缺失时在调用 Azure 前退出：
 
 - 站点：`AZURE_HOSTING_SUBSCRIPTION`、`AZURE_RESOURCE_GROUP`、`AZURE_WEBAPP_NAME`、`AZURE_CONTAINER_IMAGE`（完整 registry/image:tag）。
-- Entra：`ENTRA_TENANT_ID`、`ENTRA_APPLICATION_OBJECT_ID`、`ENTRA_CLIENT_ID`、`ENTRA_SERVICE_PRINCIPAL_ID`、`ENTRA_ALLOWED_USER_IDS`（逗号分隔对象 ID）。
+- Entra：`ENTRA_TENANT_ID`、`ENTRA_APPLICATION_OBJECT_ID`、`ENTRA_CLIENT_ID`、`ENTRA_SERVICE_PRINCIPAL_ID`、`ENTRA_ALLOWED_USER_IDS`、`ENTRA_ADMIN_USER_IDS`（逗号分隔对象 ID，管理员必须在允许用户中）。
 - 模型：`AZURE_MODEL_SUBSCRIPTION`、`AZURE_GPT_ENDPOINT`、`AZURE_GPT_DEPLOYMENT`、`AZURE_IMAGE_ENDPOINT`、`AZURE_IMAGE_DEPLOYMENT`。
 - 存储：`AZURE_STORAGE_BLOB_ENDPOINT`、`AZURE_STORAGE_CONTAINER`。
 - 可选：`AZURE_CLI_PATH`，默认使用 PATH 中的 `az`。
 
 这些值不是自动读取的 `.env` 文件。真实配置应留在忽略目录或安全环境设置中，不提交密钥。执行脚本会修改身份分配、认证、应用设置和容器镜像，必须先确认目标和授权；提交代码本身不会执行它。
+
+应用认证版本必须停站后切换，脚本会拒绝修改运行中站点。新增回调 `/api/auth/callback`，使用 MSAL 授权码 + PKCE，不启用隐式 ID/access token；客户端密钥放在 `ENTRA_CLIENT_SECRET` 应用设置中，可复用已有登录凭据。必须部署带应用内认证的新镜像后才关闭 Easy Auth，并核验 `/api/auth/session`、匿名 API 401 及 Entra 重定向；不得在旧共享工作区镜像仍运行时先关闭平台认证。部署后启动和验证由操作者完成，失败需停站恢复旧镜像、应用设置及认证配置。
 
 `deploy/blob-network.json` 要求提供 `storageAccountName` 参数，指向同一部署资源组内的既有存储账户。网络名称和 `10.30.0.0/24` 仅是示例，使用前检查名称、地址段、区域冲突及私网费用，不可直接套用于既有部署。
 

@@ -4,12 +4,24 @@
 
 新增 PWA 安装清单、PNG 图标及不保存响应的 Service Worker。云端素材改用系统托管身份访问私有 Blob；聊天数据库和运行时检查点仍保存在 Web App 持久目录。启动时迁移已有素材并保留旧文件回退，详见部署记录。以下本地磁盘存储说明仅适用于本地开发模式。
 
-订阅 2 Web App 已启用 Entra 登录，GPT/image 均配置为系统托管身份。详见 [云端部署记录](../docs/WEBAPP-deployment.md)。以下“本机访问、CLI 图片认证、未配置生产认证”描述仅适用于本地开发入口；云端为授权用户共享工作区，指定来宾已授权并接受邀请，实际登录待验证。
+云端使用应用内会话认证，支持 Microsoft Entra ID 和管理员创建的本地账号密码，不再依赖 Web App Easy Auth 或 `x-ms-client-principal` 身份头。GPT/image 继续使用系统托管身份。详见 [云端部署记录](../docs/WEBAPP-deployment.md)。以下无认证说明只适用于回环地址的本地开发模式。
+
+## 登录与用户隔离
+
+- Entra 使用官方 `@azure/msal-node` 的服务端授权码流程，包含 PKCE、一次性 state、nonce 和浏览器绑定；回调为 `/api/auth/callback`。仅允许配置租户及 `ENTRA_ALLOWED_USER_IDS` 内用户，保留企业应用用户分配要求。客户端密钥只在服务端，登录令牌不传给 Codex。
+- 本地密码使用 Argon2id 哈希，关闭公开注册。`ENTRA_ADMIN_USER_IDS` 是获准 Entra 用户的子集；管理员登录后在“设置 / 本地账号管理”创建账号或明确重置密码。密码至少 12 字符，账号为 3 至 64 个小写字母、数字、点、下划线或连字符，以字母或数字开头。重置会撤销该本地账号的所有会话，不改变其项目归属。不要把密码发到聊天或提交到仓库。
+- Cookie 为 HTTPS 下的 `__Host-`、HttpOnly、Secure、SameSite=Lax；服务端仅保存随机会话令牌哈希，固定 12 小时过期。写操作验证精确 Origin 和 CSRF token，密码登录有全局限速。适用于 1 至 2 人低频单实例使用，不是分布式身份平台；不提供公开注册、邮箱找回或自动账号合并。
+- Entra 使用租户 ID + 对象 ID 标识，本地账号使用独立 UUID；同名或同邮箱不会自动合并。两个入口登录同一个人也可能得到不同工作区。
+- 项目列表、对话、重发、上传下载、缩略图、视频 Range、任务操作及 SSE 均由服务端校验项目所有者；越权 ID 返回 404。管理员权限不绕过项目所有权。既有共享项目保留但无所有者，默认不向任何新账号展示，不自动分配或删除。
+- Codex 继续按项目使用独立 thread 和工作目录；候选素材及对话只来自该项目。模型凭据、执行进程和 GPU 仍共享，全局串行队列适用于低频使用，不为每个用户启单独容器，也不强制新建模型账户。
+- 本地默认无认证，仅限回环地址；需要验证本地密码登录可设置 `AUTH_ORIGIN=http://127.0.0.1:5188` 并使用独立测试数据目录。生产必须配置 `WEBSITE_HOSTNAME`、`ENTRA_TENANT_ID`、`ENTRA_CLIENT_ID`、`ENTRA_CLIENT_SECRET`、`ENTRA_ALLOWED_USER_IDS`，缺失时拒绝启动。管理员可选配置 `ENTRA_ADMIN_USER_IDS`。
+
+助手正文使用 Markdown/GFM 渲染，支持标题、列表、引用、表格及代码块。禁用原始 HTML 和回复内外部图片自动加载；长表格/代码块在手机内横向滚动。复制保留原始 Markdown，Process 仍展示 SDK 原文。
 
 
 # Qwen Studio 本地工作台
 
-React 19 + TypeScript + Vite，Fastify + SQLite。面向单用户的纯手机开发界面；已接入真实 Codex 对话及 Azure image2 单图生成，启动本身不创建或启动云资源。
+React 19 + TypeScript + Vite，Fastify + SQLite。面向低频多用户的纯手机界面；已接入真实 Codex 对话及 Azure image2 单图生成，启动本身不创建或启动云资源。
 
 ## 启动
 

@@ -2,14 +2,18 @@ import { useEffect, useRef, useState } from 'react'
 import type { ButtonHTMLAttributes, FormEvent, ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch'
+import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film } from 'lucide-react'
 import type { AgentRun, Asset, ImageModel, VideoModel, Job, Message, Project, Ratio, Quality, Snapshot, Submission } from './domain'
 import { assetHasThumbnail } from './domain'
 import type { VmStatus, VmAction } from '../server/vm'
 import './MobileApp.css'
+import { authenticatedFetch } from './auth-client'
+import type { SignedInUser } from './auth-client'
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, options)
+  const response = await authenticatedFetch(`/api${path}`, options)
   if (!response.ok) {
     const detail = await response.json().catch(() => null)
     throw new Error(detail?.error ?? `请求失败 (${response.status})`)
@@ -69,6 +73,36 @@ function CopyReply({ text, createdAt }: { text: string; createdAt: string }) {
     catch { setState('failed') }
   }
   return <div className="reply-actions"><time dateTime={createdAt}>{time(createdAt)}</time><IconButton label={state === 'copied' ? '已复制回复' : '复制回复'} disabled={state === 'copying'} onClick={() => void copy()}>{state === 'copied' ? <Check size={16} /> : <Copy size={16} />}</IconButton><span role="status">{state === 'copied' ? '已复制' : state === 'failed' ? '复制失败，请重试或长按选择文字' : ''}</span></div>
+}
+
+function MarkdownReply({ text }: { text: string }) {
+  return <div className="markdown-reply"><Markdown remarkPlugins={[remarkGfm]} skipHtml components={{
+    a: ({ href, children }) => href ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> : <span>{children}</span>,
+    img: ({ alt }) => <span>{alt}</span>,
+    table: ({ children }) => <div className="markdown-table" role="region" aria-label="回复表格" tabIndex={0}><table>{children}</table></div>,
+  }}>{text}</Markdown></div>
+}
+
+function LocalAccounts() {
+  const [accounts, setAccounts] = useState<{ id: string; username: string; name: string }[]>([])
+  const [username, setUsername] = useState('')
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [reset, setReset] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  useEffect(() => { void api<typeof accounts>('/auth/users').then(setAccounts).catch(() => setMessage('无法读取账号')) }, [])
+  async function save(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setMessage('')
+    try {
+      await api('/auth/users', json('POST', { username, name, password, reset }))
+      setPassword(''); setUsername(''); setName(''); setReset(false)
+      setAccounts(await api('/auth/users'))
+      setMessage('账号已保存')
+    } catch (failure) { setMessage(failure instanceof Error ? failure.message : '保存失败') }
+    finally { setBusy(false) }
+  }
+  return <details className="local-accounts"><summary>本地账号管理</summary><ul>{accounts.map(account => <li key={account.id}><span>{account.name} <small>{account.username}</small></span><IconButton label={`重置 ${account.username} 密码`} disabled={busy} onClick={() => { setUsername(account.username); setName(account.name); setPassword(''); setReset(true); setMessage('') }}><RotateCw size={17} /></IconButton></li>)}</ul><form onSubmit={event => void save(event)}><label>账号<input autoComplete="off" autoCapitalize="none" required pattern="[a-z0-9][a-z0-9._-]{2,63}" maxLength={64} disabled={reset || busy} value={username} onChange={event => setUsername(event.target.value)} /></label><label>显示名称<input required maxLength={80} value={name} disabled={busy} onChange={event => setName(event.target.value)} /></label><label>新密码<input type="password" autoComplete="new-password" required minLength={12} maxLength={256} disabled={busy} value={password} onChange={event => setPassword(event.target.value)} /></label><button className="primary" disabled={busy} type="submit"><Check size={17} />{reset ? '确认重置密码' : '创建账号'}</button>{reset && <button type="button" disabled={busy} onClick={() => { setReset(false); setUsername(''); setName(''); setPassword('') }}>取消重置</button>}<p role="status">{message}</p></form></details>
 }
 
 function ImagePending({ run, connected }: { run: AgentRun; connected: boolean }) {
@@ -154,7 +188,7 @@ function VmPanel() {
   </div>
 }
 
-export default function App() {
+export default function App({ user, onLogout }: { user?: SignedInUser | null; onLogout?: () => Promise<void> }) {
   const [projects, setProjects] = useState<Project[]>([])
   const [projectId, setProjectId] = useState('')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
@@ -263,6 +297,7 @@ export default function App() {
     const sync = () => api<Snapshot>(`/projects/${projectId}`).then(result => { if (active) setSnapshot(result) }).catch(() => { if (active) setConnected(false) })
     void sync()
     const stream = new EventSource(`/api/projects/${projectId}/events`)
+    stream.addEventListener('expired', () => { stream.close(); window.dispatchEvent(new Event('studio-session-expired')) })
     stream.addEventListener('connected', () => { setConnected(true); void sync() })
     stream.addEventListener('changed', () => { void sync() })
     stream.addEventListener('deleted', () => {
@@ -401,7 +436,7 @@ export default function App() {
                 </article>
                 {run && <article className="message assistant-message" aria-label="Codex 回复">
                   <RunProgress run={run} />
-                  {reply && <div className="message-content"><p className="message-text">{reply.text}</p></div>}
+                  {reply && <div className="message-content"><MarkdownReply text={reply.text} /></div>}
                   <ImagePending run={run} connected={connected} />
                   {reply && reply.assetIds.length > 0 && <div className="message-images">{reply.assetIds.map(id => { const asset = assets.find(item => item.id === id); return asset && (asset.mediaType === 'video' ? <div className="video-result" key={id}><video className="generated-video" controls playsInline preload="metadata" poster={imageUrl(asset)} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="video-meta"><span>MiniMax H3 · {asset.duration?.toFixed(2)} 秒</span><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} aria-label="下载视频" title="下载视频"><ArrowDownToLine size={18} /></a></div></div> : <button key={id} onClick={() => setSelectedAsset(asset)}><img src={imageUrl(asset)} alt={asset.name} width={asset.width} height={asset.height} /></button>) })}</div>}
                   {run.stage === 'video' && ['failed', 'cancelled', 'interrupted'].includes(run.status) && <p className="image-outcome" role="status">{run.status === 'failed' ? '视频生成失败' : '视频任务结果待核实'}</p>}
@@ -429,6 +464,8 @@ export default function App() {
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
     <Modal open={sidebarOpen} onOpenChange={setSidebarOpen} title="项目列表" className="project-drawer">{projectList}<div className="project-shortcuts"><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setView('images') }}><Images size={19} />素材库</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setFilter('all'); setView('tasks') }}><ListTodo size={19} />任务记录{waiting > 0 && <small>{waiting}</small>}</button><button className="service-entry" type="button" onClick={() => { setSidebarOpen(false); setStorageStatus('checking'); setServicesOpen(true) }}><Cpu size={19} />{health?.agentConfigured ? '服务状态' : '服务未接入'}</button></div></Modal>
     <Modal open={optionsOpen} onOpenChange={setOptionsOpen} title="设置">
+      {user && <div className="account-settings"><span>{user.name}</span><small>{user.provider === 'entra' ? 'Microsoft Entra ID' : '本地账号'}</small><button type="button" onClick={() => void perform(async () => { await onLogout?.() })}>退出登录</button></div>}
+      {user?.admin && <LocalAccounts />}
       <div className="creation-options"><label className="ratio-control">默认比例<select aria-label="默认比例" value={ratio} disabled={busy} onChange={event => { setRatio(event.target.value as Ratio); localStorage.setItem('studio-ratio', event.target.value); submitRequest.current = null }}>{(health?.agentConfigured ? ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] : ['1:1', '4:3', '3:4', '16:9']).map(value => <option key={value}>{value}</option>)}</select></label>{health?.agentConfigured && <label className="ratio-control">默认质量<select aria-label="默认质量" value={quality} disabled={busy} onChange={event => { setQuality(event.target.value as Quality); localStorage.setItem('studio-quality', event.target.value); submitRequest.current = null }}>{(['low', 'medium', 'high'] as const).map(value => <option key={value} value={value}>{qualityNames[value]}</option>)}</select></label>}</div>
       {health?.agentConfigured && <div className="model-options"><label>图片模型<select aria-label="图片模型" value={imageModel} disabled={busy} onChange={event => { const value = event.target.value as ImageModel; setImageModel(value); localStorage.setItem('studio-image-model', value); submitRequest.current = null }}><option value="azure-image2">Azure image2</option><option value="qwen-image-2.1" disabled={!health.models?.images.includes('qwen-image-2.1')}>Qwen Image 2.1{health.models?.images.includes('qwen-image-2.1') ? '' : ' · 未就绪'}</option></select></label><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy} onChange={event => { const value = event.target.value as VideoModel; setVideoModel(value); localStorage.setItem('studio-video-model', value); submitRequest.current = null }}><option value="none">不启用</option><option value="minimax-h3" disabled={!health.models?.videos.includes('minimax-h3')}>MiniMax H3{health.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label></div>}
       {snapshot?.threadId && <p className="session-info">会话 {snapshot.threadId.slice(-8)}</p>}

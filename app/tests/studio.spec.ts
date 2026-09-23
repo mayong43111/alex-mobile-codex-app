@@ -523,6 +523,57 @@ test('video results use playback and download controls instead of image zoom', a
   await page.screenshot({ path: testInfo.outputPath('video-viewer.png') })
 })
 
+test('application login switches private users and provides admin account controls', async ({ page }, testInfo) => {
+  let signedIn = false
+  const user = { id: 'fixture-admin', name: '测试管理员', provider: 'entra', admin: true }
+  const accounts: { id: string; name: string; username: string }[] = []
+  await page.route('**/api/auth/session', route => route.fulfill({ json: { enabled: true, entra: true, user: signedIn ? user : null, csrf: signedIn ? 'test-csrf' : null } }))
+  await page.route('**/api/auth/login', async route => {
+    expect(route.request().postDataJSON()).toEqual({ username: 'test-admin', password: 'test-only-password' })
+    signedIn = true
+    await route.fulfill({ json: { user, csrf: 'test-csrf' } })
+  })
+  await page.route('**/api/auth/logout', async route => {
+    expect(route.request().headers()['x-csrf-token']).toBe('test-csrf')
+    signedIn = false
+    await route.fulfill({ json: { signedOut: true } })
+  })
+  await page.route('**/api/projects', route => route.fulfill({ json: [] }))
+  await page.route('**/api/auth/users', async route => {
+    if (route.request().method() === 'POST') {
+      expect(route.request().headers()['x-csrf-token']).toBe('test-csrf')
+      const body = route.request().postDataJSON()
+      expect(body.password).toBe('test-account-password')
+      accounts.push({ id: 'new-local', name: body.name, username: body.username })
+      await route.fulfill({ json: accounts[0] })
+    } else await route.fulfill({ json: accounts })
+  })
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: '登录', exact: true })).toBeVisible()
+  await expect(page.getByRole('link', { name: '使用 Microsoft Entra ID 登录' })).toHaveAttribute('href', '/api/auth/entra')
+  await expect(page.getByLabel('密码', { exact: true })).toHaveAttribute('type', 'password')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('application-login.png') })
+  await page.getByLabel('账号', { exact: true }).fill('test-admin')
+  await page.getByLabel('密码', { exact: true }).fill('test-only-password')
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(page.locator('.studio')).toBeVisible()
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await expect(page.getByText('测试管理员', { exact: true })).toBeVisible()
+  await page.locator('.local-accounts summary').click()
+  await page.getByLabel('账号', { exact: true }).fill('new-local')
+  await page.getByLabel('显示名称').fill('新用户')
+  await page.getByLabel('新密码').fill('test-account-password')
+  await page.getByRole('button', { name: '创建账号', exact: true }).click()
+  await expect(page.getByText('账号已保存')).toBeVisible()
+  await expect(page.getByLabel('新密码')).toHaveValue('')
+  expect(await page.locator('.modal').evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+  await page.getByRole('button', { name: '退出登录', exact: true }).click()
+  await expect(page.locator('.studio')).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: '登录', exact: true })).toBeVisible()
+  await expect(page.getByText('测试管理员', { exact: true })).toHaveCount(0)
+})
+
 test('configured chat displays assistant, Azure assets and run history', async ({ page, request }, testInfo) => {
   const project = await (await request.post('/api/projects', { data: { title: '会话界面测试' } })).json()
   const now = new Date().toISOString()
@@ -538,13 +589,14 @@ test('configured chat displays assistant, Azure assets and run history', async (
   let expectedVideoModel = 'none'
   let submitCount = 0
   let runStatus = 'completed'
+  const markdownReply = ['测试夹具中的助手回复', '', '## 输出方案', '', '**重点**与 *说明* 和 `inline_code`。', '', '1. 第一项', '2. 第二项', '   - 子项', '', '> 保留原图', '', '- [x] 已完成', '- [ ] 待确认', '', '| 尺寸 | 格式 | 用途 | 备注 |', '| --- | --- | --- | --- |', '| 1536 | PNG | 下载 | 原图不变 |', '', '```js', `const example = "${'long-code-'.repeat(25)}"`, '```', '', '[官方文档](https://example.com/docs)', '', '[危险链接](javascript:alert%281%29)', '', '<script>window.markdownInjected = true</script>', '', '![外部图片](https://example.com/private-tracker.png)'].join('\n')
   const progress = [{ id: 'reasoning:1', label: 'Codex 推理摘要', detail: '这是测试夹具的公开摘要。', createdAt: now }]
   const rawEvent = JSON.stringify({ type: 'item.completed', item: { id: 'tool-1', type: 'mcp_tool_call', arguments: { assetId: 'fixture' }, result: { content: [{ type: 'text', text: `${'original-text\n'.repeat(550)}UNTRUNCATED-END` }] } } }, null, 2)
   progress.push({ id: 'codex:1', label: 'item.completed', detail: rawEvent, createdAt: now })
   await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', openmontage: 'installed', models: { images: ['azure-image2', 'qwen-image-2.1'], videos: ['minimax-h3'] } } }))
   await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: { project, threadId, jobs: [],
     messages: submitted ? [{ id: messageId, projectId: project.id, text: '手机对话测试', assetIds: [], createdAt: now, role: 'user' },
-      { id: assistantId, projectId: project.id, text: '测试夹具中的助手回复', assetIds: [runId], createdAt: now, role: 'assistant' }] : [],
+      { id: assistantId, projectId: project.id, text: markdownReply, assetIds: [runId], createdAt: now, role: 'assistant' }] : [],
     assets: submitted ? [{ id: runId, projectId: project.id, name: 'Azure-test.png', kind: 'generated', provider: 'azure', model: 'gpt-image-2', width: 1024, height: 1024 }] : [],
     runs: submitted ? [{ id: runId, projectId: project.id, messageId, assistantId, threadId, status: runStatus, stage: 'image', reply: '测试夹具中的助手回复', createdAt: now,
       input: { mode: 'image', text: '手机对话测试', ratio: '1:1' }, progress }] : [],
@@ -571,6 +623,23 @@ test('configured chat displays assistant, Azure assets and run history', async (
   await page.getByLabel('创作需求').fill('手机对话测试')
   await page.getByRole('button', { name: '提交需求' }).click()
   await expect(page.locator('.assistant-message')).toContainText('测试夹具中的助手回复')
+  const markdown = page.locator('.markdown-reply')
+  await expect(markdown.getByRole('heading', { name: '输出方案', level: 2 })).toBeVisible()
+  await expect(markdown.locator('strong')).toHaveText('重点')
+  await expect(markdown.locator('em')).toHaveText('说明')
+  await expect(markdown.locator('ol > li')).toHaveCount(2)
+  await expect(markdown.locator('ol ul > li')).toHaveText('子项')
+  await expect(markdown.locator('blockquote')).toHaveText('保留原图')
+  await expect(markdown.getByRole('checkbox').first()).toBeChecked()
+  await expect(markdown.getByRole('checkbox').first()).toBeDisabled()
+  await expect(markdown.locator('pre code')).toContainText('const example')
+  await expect(markdown.getByRole('table')).toHaveCount(1)
+  await expect(markdown.getByRole('link', { name: '官方文档' })).toHaveAttribute('rel', 'noopener noreferrer')
+  await expect(markdown.getByRole('link', { name: '危险链接' })).toHaveCount(0)
+  await expect(markdown.locator('script, img')).toHaveCount(0)
+  expect(await markdown.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await markdown.screenshot({ path: testInfo.outputPath('markdown-reply.png') })
   await expect(page.getByRole('article', { name: '你的消息' })).toBeVisible()
   expect(await page.locator('.messages').evaluate(element => {
     const user = element.querySelector('.user-message')!.getBoundingClientRect()

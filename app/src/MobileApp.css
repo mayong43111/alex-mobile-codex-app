@@ -125,6 +125,53 @@
 .message-heading strong { font-weight: 600; }
 .message-heading time { margin-left: 4px; color: #7c8781; font-size: 10px; font-variant-numeric: tabular-nums; }
 .message-text { font-size: 15px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.login-page { min-height: 100dvh; background: #f5f7f6; overflow-wrap: anywhere; }
+.login-header { position: relative; height: 180px; overflow: hidden; }
+.login-header > img { width: 100%; height: 100%; object-fit: cover; }
+.login-header > div { position: absolute; inset: auto 0 0; padding: 20px 24px; display: flex; align-items: center; gap: 10px; background: #ffffffed; }
+.login-header h1 { font-size: 24px; }
+.login-content { width: 100%; max-width: 440px; padding: 28px 24px; margin: 0 auto; }
+.login-content h2 { font-size: 20px; margin-bottom: 24px; }
+.login-content form { display: flex; flex-direction: column; gap: 10px; }
+.login-content input { width: 100%; font-size: 16px; min-height: 48px; padding: 10px; border: 1px solid var(--line); border-radius: 4px; background: white; margin-bottom: 8px; }
+.login-content button, .entra-login { min-height: 48px; width: 100%; justify-content: center; display: flex; gap: 8px; align-items: center; }
+.entra-login { padding: 10px; border: 1px solid var(--accent); color: var(--accent); border-radius: 4px; text-decoration: none; font-size: 14px; }
+.login-divider { display: flex; align-items: center; gap: 12px; margin: 20px 0; color: var(--muted); font-size: 12px; }
+.login-divider::before, .login-divider::after { content: ''; flex: 1; border-top: 1px solid var(--line); }
+.account-settings { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding-bottom: 16px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.account-settings small { color: var(--muted); }
+.account-settings button { min-height: 44px; color: var(--accent); margin-left: auto; }
+.local-accounts { margin-bottom: 20px; font-size: 14px; }
+.local-accounts summary { padding: 10px 0; cursor: pointer; }
+.local-accounts li { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.local-accounts small { color: var(--muted); }
+.local-accounts form, .local-accounts label { display: flex; flex-direction: column; gap: 8px; }
+.local-accounts form { margin-top: 12px; }
+.local-accounts input { font-size: 16px; padding: 10px; min-height: 44px; width: 100%; border: 1px solid var(--line); border-radius: 4px; }
+.local-accounts button { min-height: 44px; }
+.markdown-reply { min-width: 0; max-width: 100%; font-size: 15px; line-height: 1.7; overflow-wrap: anywhere; }
+.markdown-reply > * + * { margin-top: 12px; }
+.markdown-reply :is(h1, h2, h3, h4, h5, h6) { font-size: 16px; line-height: 1.5; font-weight: 600; margin: 18px 0 8px; }
+.markdown-reply h1 { font-size: 20px; }
+.markdown-reply h2 { font-size: 18px; }
+.markdown-reply > :first-child { margin-top: 0; }
+.markdown-reply :is(ul, ol) { padding-left: 24px; }
+.markdown-reply ul { list-style: disc; }
+.markdown-reply ol { list-style: decimal; }
+.markdown-reply li + li { margin-top: 4px; }
+.markdown-reply li > :is(p, ul, ol) { margin: 6px 0; }
+.markdown-reply .contains-task-list { list-style: none; padding-left: 4px; }
+.markdown-reply .task-list-item input { margin-right: 8px; accent-color: var(--accent); }
+.markdown-reply blockquote { margin-left: 0; padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
+.markdown-reply a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.markdown-reply code { font-family: monospace; font-size: 13px; background: #edf1ef; border-radius: 3px; padding: 2px 4px; }
+.markdown-reply pre { max-width: 100%; overflow-x: auto; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: #f2f5f3; white-space: pre; overflow-wrap: normal; }
+.markdown-reply pre code { background: none; padding: 0; border-radius: 0; }
+.markdown-table { max-width: 100%; overflow-x: auto; }
+.markdown-table table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.markdown-table :is(th, td) { min-width: 100px; padding: 8px 10px; border: 1px solid var(--line); text-align: left; }
+.markdown-table th { background: #edf1ef; font-weight: 600; }
+.markdown-reply hr { border: 0; border-top: 1px solid var(--line); }
 .user-message { align-self: flex-end; width: fit-content; max-width: 90%; }
 .user-message .message-heading { justify-content: flex-end; margin-bottom: 5px; }
 .resend-confirmation { display: flex; flex-direction: column; gap: 16px; font-size: 13px; line-height: 1.7; }

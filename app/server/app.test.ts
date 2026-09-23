@@ -11,6 +11,33 @@ import { AgentWorker, managedModelToken } from './agent.ts'
 import type { AgentTransport, ImageCandidate, RemoteRun, SourceImage } from './agent.ts'
 import type { AssetStorage } from './assets.ts'
 import { VmController } from './vm.ts'
+import { provisionLocalUser } from './auth.ts'
+
+async function loginHeaders(app: Awaited<ReturnType<typeof buildApp>>, dataDir: string, host = 'localhost') {
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  await provisionLocalUser(store.db, 'test-user', 'local-test-password', 'Test')
+  store.db.close()
+  const origin = `https://${host}`
+  const response = await app.inject({ method: 'POST', url: '/api/auth/login', headers: { host, origin }, payload: { username: 'test-user', password: 'local-test-password' } })
+  assert.equal(response.statusCode, 200)
+  return { host, origin, cookie: `${response.cookies[0].name}=${response.cookies[0].value}`, 'x-csrf-token': response.json().csrf }
+}
+
+test('project ownership fails closed for foreign and legacy unowned projects', () => {
+  const store = new Store(':memory:')
+  try {
+    const first = store.createProject('Private A', 'user-a')
+    const second = store.createProject('Private B', 'user-b')
+    const legacy = store.createProject('Unowned')
+    assert.deepEqual(store.projects('user-a').map(project => project.id), [first.id])
+    assert.deepEqual(store.projects('user-b').map(project => project.id), [second.id])
+    store.requireOwner(first.id, 'user-a')
+    assert.throws(() => store.requireOwner(second.id, 'user-a'), /not found/)
+    assert.throws(() => store.requireOwner(legacy.id, 'user-a'), /not found/)
+    store.deleteProject(first.id, first.updatedAt)
+    assert.deepEqual(store.projects('user-a'), [])
+  } finally { store.db.close() }
+})
 
 test('VM controller pins the target, deduplicates operations and refuses busy GPU shutdown', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'studio-vm-'))
@@ -77,16 +104,17 @@ test('cloud VM control uses the application login authorization', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'studio-vm-auth-'))
   const tenantId = randomUUID(), userId = randomUUID()
   let calls = 0
-  const app = await buildApp({ dataDir, entra: { tenantId, userIds: [userId] }, vm: { busy: false, async status() { return { configured: true } }, async act() { calls++; return { configured: true } } } })
+  const app = await buildApp({ dataDir, auth: { origin: 'https://localhost' }, origins: ['https://localhost'], vm: { busy: false, async status() { return { configured: true } }, async act() { calls++; return { configured: true } } } })
   const principal = Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [{ typ: 'tid', val: tenantId }, { typ: 'oid', val: userId }] })).toString('base64')
   try {
     const payload = { action: 'start', requestId: randomUUID(), confirmedName: 'test' }
-    assert.equal((await app.inject({ url: '/api/vm', headers: { 'x-ms-client-principal': principal } })).statusCode, 200)
-    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', headers: { 'x-ms-client-principal': principal }, payload })).statusCode, 202)
+    const authenticated = await loginHeaders(app, dataDir)
+    assert.equal((await app.inject({ url: '/api/vm', headers: authenticated })).statusCode, 200)
+    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', headers: authenticated, payload })).statusCode, 202)
+    assert.equal((await app.inject({ url: '/api/vm', headers: { 'x-ms-client-principal': principal } })).statusCode, 401)
     for (const headers of [{}, { 'x-ms-client-principal': Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [{ typ: 'tid', val: tenantId }, { typ: 'oid', val: randomUUID() }] })).toString('base64') }]) {
-      const expectedStatus = 'x-ms-client-principal' in headers ? 403 : 401
-      assert.equal((await app.inject({ url: '/api/vm', headers })).statusCode, expectedStatus)
-      assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', headers, payload })).statusCode, expectedStatus)
+      assert.equal((await app.inject({ url: '/api/vm', headers })).statusCode, 401)
+      assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', headers, payload })).statusCode, 403)
     }
     assert.equal(calls, 1)
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
@@ -299,7 +327,7 @@ test('managed model identity uses the model audience and rejects failed or stale
   await assert.rejects(managedModelToken(environment, async () => Response.json({ access_token: 'stale', expires_on: 0 })), /expires/)
 })
 
-test('cloud routes require a tenant-matched assigned Entra identity except health', async () => {
+test('cloud routes require application sessions and ignore platform identity headers', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'studio-cloud-'))
   const tenantId = randomUUID()
   const userId = randomUUID()
@@ -308,7 +336,7 @@ test('cloud routes require a tenant-matched assigned Entra identity except healt
   await writeFile(join(staticRoot, 'index.html'), '<!doctype html><html><body>Studio</body></html>')
   await writeFile(join(staticRoot, 'manifest.webmanifest'), JSON.stringify({ name: 'Qwen Studio' }))
   await writeFile(join(staticRoot, 'sw.js'), 'self.addEventListener("fetch", () => {})')
-  const app = await buildApp({ dataDir, staticRoot, hosts: ['studio.example'], origins: ['https://studio.example'], entra: { tenantId, userIds: [userId] }, journalMode: 'DELETE' })
+  const app = await buildApp({ dataDir, staticRoot, hosts: ['studio.example'], origins: ['https://studio.example'], auth: { origin: 'https://studio.example' }, journalMode: 'DELETE' })
   const principal = (tenant: string, user: string) => Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [{ typ: 'tid', val: tenant }, { typ: 'oid', val: user }] })).toString('base64')
   try {
     assert.equal((await app.inject('/healthz')).statusCode, 200)
@@ -317,12 +345,12 @@ test('cloud routes require a tenant-matched assigned Entra identity except healt
       assert.equal(response.statusCode, 200)
       assert.equal(response.headers['cache-control'], 'no-store')
     }
-    for (const url of ['/', '/index.html', '/api/projects', '/api/health', '/api/assets/unknown/content']) {
+    for (const url of ['/api/projects', '/api/health', '/api/assets/unknown/content']) {
       assert.equal((await app.inject({ url, headers: { host: 'studio.example' } })).statusCode, 401)
-      assert.equal((await app.inject({ url, headers: { host: 'studio.example', 'x-ms-client-principal': principal(tenantId, randomUUID()) } })).statusCode, 403)
+      assert.equal((await app.inject({ url, headers: { host: 'studio.example', 'x-ms-client-principal': principal(tenantId, randomUUID()) } })).statusCode, 401)
     }
-    assert.equal((await app.inject({ url: '/api/projects', headers: { host: 'studio.example', 'x-ms-client-principal': principal(randomUUID(), userId) } })).statusCode, 403)
-    const headers = { host: 'studio.example', 'x-ms-client-principal': principal(tenantId, userId) }
+    assert.equal((await app.inject({ url: '/api/projects', headers: { host: 'studio.example', 'x-ms-client-principal': principal(randomUUID(), userId) } })).statusCode, 401)
+    const headers = await loginHeaders(app, dataDir, 'studio.example')
     for (const url of ['/', '/index.html', '/?from=login']) {
       const response = await app.inject({ url, headers })
       assert.equal(response.statusCode, 200)
