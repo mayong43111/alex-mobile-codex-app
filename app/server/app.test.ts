@@ -120,6 +120,66 @@ test('cloud VM control uses the application login authorization', async () => {
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
 })
 
+test('VM allocation rejection and fresh failure recover without retrying uncertain requests', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-vm-recovery-'))
+  const config = { subscription: randomUUID(), resourceGroup: 'test', name: 'test', comfyUrl: 'http://gpu.invalid', auth: 'cli' as const }
+  let posts = 0
+  let mode = 'rejected'
+  let failureTime = '2000-01-01T00:00:00Z'
+  let power = 'deallocated'
+  const request = async (_url: string, method?: string) => {
+    if (method === 'POST') {
+      posts++
+      if (mode === 'rejected') return Response.json({ error: { code: 'AllocationFailed', message: 'No Spot capacity' } }, { status: 500 })
+      throw new Error('Connection lost')
+    }
+    return Response.json({ statuses: [{ code: `PowerState/${power}` }, { code: 'ProvisioningState/failed', time: failureTime, message: 'Allocation failed' }] })
+  }
+  try {
+    let controller = new VmController(config, join(directory, 'vm.json'), request, async () => new Response(null, { status: 503 }))
+    const firstId = randomUUID()
+    await assert.rejects(controller.act('start', firstId, 'test', false), /AllocationFailed/)
+    assert.equal((await controller.status()).operation?.status, 'failed')
+    assert.equal(controller.busy, false)
+    await controller.act('start', firstId, 'test', false)
+    assert.equal(posts, 1)
+    mode = 'lost'
+    await assert.rejects(controller.act('start', randomUUID(), 'test', false), /待核实/)
+    controller = new VmController(config, join(directory, 'vm.json'), request, async () => new Response(null, { status: 503 }))
+    await controller.initialize()
+    assert.equal((await controller.status()).operation?.status, 'unknown')
+    assert(controller.busy)
+    failureTime = new Date(Date.now() + 1000).toISOString()
+    assert.equal((await controller.status()).operation?.status, 'failed')
+    assert.equal(controller.busy, false)
+    failureTime = '2000-01-01T00:00:00Z'
+    await assert.rejects(controller.act('start', randomUUID(), 'test', false), /待核实/)
+    power = 'running'
+    assert.equal((await controller.status()).operation?.status, 'succeeded')
+    assert.equal(posts, 3)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('VM unknown asynchronous operation is checked after restart and retains its failure reason', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-vm-async-'))
+  const config = { subscription: randomUUID(), resourceGroup: 'test', name: 'test', comfyUrl: 'http://gpu.invalid', auth: 'cli' as const }
+  const id = randomUUID()
+  const stateFile = join(directory, 'vm.json')
+  try {
+    await writeFile(stateFile, JSON.stringify({ operation: { id, action: 'start', status: 'unknown', createdAt: new Date().toISOString(), url: 'https://management.azure.com/test-operation' }, requests: { [id]: 'start' } }))
+    const controller = new VmController(config, stateFile, async (url, method) => {
+      assert.notEqual(method, 'POST')
+      return Response.json(url.endsWith('/test-operation') ? { status: 'Failed', error: { code: 'AllocationFailed', message: 'No capacity' } } : { statuses: [{ code: 'PowerState/deallocated' }] })
+    })
+    await controller.initialize()
+    assert.equal((await controller.status()).operation?.status, 'failed')
+    assert.equal(controller.busy, false)
+    const restarted = new VmController(config, stateFile, async () => Response.json({ statuses: [{ code: 'PowerState/deallocated' }] }))
+    await restarted.initialize()
+    assert.match((await restarted.status()).operation!.error!, /AllocationFailed/)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 function memoryAssets() {
   const objects = new Map<string, Buffer>()
   const storage: AssetStorage = {
@@ -834,6 +894,41 @@ test('file uploads preserve bytes, force document downloads and support video ra
     assert.equal(removed.statusCode, 200)
     assert.equal(objects.size, 0)
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('disconnected upload removes stored bytes instead of adding an asset', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-upload-cancel-'))
+  const storage = memoryAssets()
+  function deferred() {
+    let resolve!: () => void
+    const promise = new Promise<void>(done => { resolve = done })
+    return { promise, resolve }
+  }
+  const entered = deferred()
+  const release = deferred()
+  const disconnected = deferred()
+  const finished = deferred()
+  const app = await buildApp({ dataDir, assetStorage: { ...storage.storage, async put(name, bytes) { await storage.storage.put(name, bytes); entered.resolve(); await release.promise } } })
+  app.addHook('onRequest', async (request, reply) => {
+    if (request.url.endsWith('/uploads')) reply.raw.once('close', () => disconnected.resolve())
+  })
+  app.addHook('onError', async () => { finished.resolve() })
+  const controller = new AbortController()
+  try {
+    const project = (await app.inject({ method: 'POST', url: '/api/projects', payload: { title: 'Cancel upload' } })).json()
+    const origin = await app.listen({ host: '127.0.0.1', port: 0 })
+    const body = new FormData()
+    body.append('file', new Blob(['cancel this upload']), 'cancel.txt')
+    const pending = fetch(`${origin}/api/projects/${project.id}/uploads`, { method: 'POST', body, signal: controller.signal }).catch(error => error)
+    await entered.promise
+    controller.abort()
+    assert.equal((await pending).name, 'AbortError')
+    await disconnected.promise
+    release.resolve()
+    await finished.promise
+    assert.equal(storage.objects.size, 0)
+    assert.equal((await app.inject(`/api/projects/${project.id}`)).json().assets.length, 0)
+  } finally { controller.abort(); release.resolve(); await app.close(); await rm(dataDir, { recursive: true, force: true }) }
 })
 
 test('uploads validate actual image data, thumbnails and project ownership', async () => {

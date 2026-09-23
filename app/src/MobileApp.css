@@ -88,6 +88,14 @@
 .actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 5px; color: #6f7b73; flex-shrink: 0; text-decoration: none; }
 .icon-button:hover { background: #eaf0eb; }
+.icon-button:is([aria-label="停止当前回复"], [aria-label="停止运行"]) { color: #b52e35; background: #fff0f0; }
+.icon-button:is([aria-label="停止当前回复"], [aria-label="停止运行"]) .lucide-square { fill: currentColor; }
+.conversation-content { min-width: 0; display: flow-root; }
+.upload-status { display: flex; flex-shrink: 0; align-items: center; gap: 8px; padding: 4px 8px; font-size: 12px; color: #426257; background: #edf3ef; }
+.upload-status > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.upload-status > svg { flex-shrink: 0; }
+.upload-status .icon-button { color: #b52e35; }
+.modal .upload-status { position: sticky; top: 56px; z-index: 1; }
 .send { display: grid; place-items: center; position: relative; isolation: isolate; width: 44px; height: 44px; padding: 0; background: transparent; color: #fff; }
 .send::before { content: ''; position: absolute; width: 32px; height: 32px; border-radius: 6px; background: var(--accent); z-index: -1; }
 .primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; background: var(--accent); color: white; border-radius: 5px; padding: 10px 14px; font-size: 12px; min-height: 44px; }
@@ -303,6 +311,10 @@
 .zoom-content img { max-width: 100%; max-height: 100%; object-fit: contain; }
 .viewer-footer { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; font-size: 11px; color: var(--muted); }
 .viewer-footer>.actions { width: 100%; justify-content: space-between; gap: 2px; }
+.asset-share { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; min-width: 0; padding: 4px 0; }
+.viewer .actions > .asset-share { display: contents; }
+.viewer .actions .share-status { flex-basis: 100%; order: 1; }
+.share-status { min-width: 0; font-size: 12px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
 .error-banner { display: flex; flex-shrink: 0; align-items: center; gap: 8px; max-height: 100px; overflow: auto; padding: 6px 16px; background: #fff0ec; color: #a44430; font-size: 12px; }
 .error-banner>span { flex: 1; }
 .form-error { color: #a44430; font-size: 12px; }

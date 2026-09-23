@@ -11,7 +11,7 @@ const configSchema = z.object({
   subscription: z.string().uuid(), resourceGroup: z.string().regex(/^[\w.-]{1,90}$/), name: z.string().regex(/^[\w.-]{1,64}$/),
   comfyUrl: z.url(), cliPath: z.string().min(1).optional(), auth: z.enum(['cli', 'managed-identity']).default('cli'),
 }).strict()
-const operationSchema = z.object({ id: z.string().uuid(), action: z.enum(['start', 'deallocate', 'restart']), status: z.enum(['pending', 'succeeded', 'failed', 'unknown']), createdAt: z.string(), url: z.string().optional() })
+const operationSchema = z.object({ id: z.string().uuid(), action: z.enum(['start', 'deallocate', 'restart']), status: z.enum(['pending', 'succeeded', 'failed', 'unknown']), createdAt: z.string(), url: z.string().optional(), error: z.string().optional() })
 type Operation = z.infer<typeof operationSchema>
 export type VmAction = Operation['action']
 export type VmStatus = { configured: boolean; name?: string; powerState?: string; gpuReady?: boolean; operation?: Omit<Operation, 'url'> }
@@ -65,11 +65,11 @@ export class VmController implements VmControl {
     await this.writing
   }
 
-  private async powerState() {
+  private async instanceView() {
     const response = await this.request(`${this.base}/instanceView?api-version=2024-07-01`)
     if (!response.ok) throw new HttpError(503, '无法读取 VM 状态，请检查 Azure 权限或连接。')
-    const data = await response.json() as { statuses?: { code?: string }[] }
-    return data.statuses?.find(entry => entry.code?.startsWith('PowerState/'))?.code?.slice(11) ?? 'unknown'
+    const data = await response.json() as { statuses?: { code?: string; time?: string; message?: string }[] }
+    return { powerState: data.statuses?.find(entry => entry.code?.startsWith('PowerState/'))?.code?.slice(11) ?? 'unknown', provisioning: data.statuses?.find(entry => entry.code?.startsWith('ProvisioningState/')) }
   }
 
   async status(): Promise<VmStatus> {
@@ -78,21 +78,27 @@ export class VmController implements VmControl {
   }
 
   private async inspect(): Promise<VmStatus> {
-    if (!this.lock && this.operation?.status === 'pending' && this.operation.url) {
+    if (!this.lock && this.operation && ['pending', 'unknown'].includes(this.operation.status) && this.operation.url) {
       const current = this.operation
       const response = await this.request(current.url!)
       if (response.ok) {
-        const data = await response.json() as { status?: string }
+        const data = await response.json() as { status?: string; error?: { code?: string; message?: string } }
         if (this.operation === current && ['Succeeded', 'Failed', 'Canceled'].includes(data.status ?? '')) {
           current.status = data.status === 'Succeeded' ? 'succeeded' : 'failed'
+          current.error = current.status === 'failed' ? [data.error?.code, data.error?.message].filter(Boolean).join(': ').slice(0, 600) || 'Azure 操作失败或已取消。' : undefined
           await this.save()
         }
       }
     }
-    const powerState = await this.powerState()
-    if (!this.lock && this.operation?.status === 'pending' && !this.operation.url) {
-      if ((this.operation.action === 'start' && powerState === 'running') || (this.operation.action === 'deallocate' && powerState === 'deallocated')) {
+    const { powerState, provisioning } = await this.instanceView()
+    if (!this.lock && this.operation && ['pending', 'unknown'].includes(this.operation.status)) {
+      if (!this.operation.url && ((this.operation.action === 'start' && powerState === 'running') || (this.operation.action === 'deallocate' && powerState === 'deallocated'))) {
         this.operation.status = 'succeeded'
+        this.operation.error = undefined
+        await this.save()
+      } else if (provisioning?.code === 'ProvisioningState/failed' && Date.parse(provisioning.time ?? '') >= Date.parse(this.operation.createdAt)) {
+        this.operation.status = 'failed'
+        this.operation.error = provisioning.message?.slice(0, 600) || 'Azure 已确认此次 VM 操作失败。'
         await this.save()
       }
     }
@@ -100,7 +106,7 @@ export class VmController implements VmControl {
     if (powerState === 'running') {
       try { gpuReady = (await this.gpuFetch(`${this.config.comfyUrl.replace(/\/$/, '')}/system_stats`, { signal: AbortSignal.timeout(3000) })).ok } catch { gpuReady = false }
     }
-    const operation = this.operation ? { id: this.operation.id, action: this.operation.action, status: this.operation.status, createdAt: this.operation.createdAt } : undefined
+    const operation = this.operation ? { id: this.operation.id, action: this.operation.action, status: this.operation.status, createdAt: this.operation.createdAt, error: this.operation.error } : undefined
     return { configured: true, name: this.config.name, powerState, gpuReady, operation }
   }
 
@@ -115,7 +121,7 @@ export class VmController implements VmControl {
     if (this.busy) throw new HttpError(409, 'VM 操作尚未结束或结果待核实，禁止重复提交。')
     this.lock = true
     try {
-      const power = await this.powerState()
+      const { powerState: power } = await this.instanceView()
       if (action === 'start' ? !['deallocated', 'stopped'].includes(power) : power !== 'running') throw new HttpError(409, '当前 VM 状态不允许此操作，请刷新。')
       if (action !== 'start') {
         let queue: { queue_running?: unknown[]; queue_pending?: unknown[] } | undefined
@@ -131,9 +137,12 @@ export class VmController implements VmControl {
       try {
         const response = await this.request(`${this.base}/${action}?api-version=2024-07-01`, 'POST')
         if (!response.ok) {
-          this.operation.status = response.status >= 500 ? 'unknown' : 'failed'
+          const detail = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null
+          const rejected = ['AllocationFailed', 'ZonalAllocationFailed', 'OverconstrainedAllocationRequest', 'OverconstrainedZonalAllocationRequest', 'SkuNotAvailable', 'OperationNotAllowed', 'QuotaExceeded'].includes(detail?.error?.code ?? '')
+          this.operation.status = response.status >= 500 && !rejected ? 'unknown' : 'failed'
+          this.operation.error = [detail?.error?.code, detail?.error?.message].filter(Boolean).join(': ').slice(0, 600) || 'Azure 未确认操作成功。'
           await this.save()
-          throw new HttpError(503, 'Azure 未确认操作成功；未自动重试，请刷新核实。')
+          throw new HttpError(503, `${this.operation.error} ${this.operation.status === 'failed' ? '本次操作失败，可重新确认后重试。' : '结果待核实，未自动重试。'}`)
         }
         const operationUrl = response.headers.get('azure-asyncoperation')
         if (operationUrl) {

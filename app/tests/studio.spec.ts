@@ -3,6 +3,219 @@ import type { Page } from '@playwright/test'
 import { resolve } from 'node:path'
 import sharp from 'sharp'
 
+async function mockFileSharing(page: Page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'canShare', { configurable: true, value: (data: ShareData) => Reflect.get(window, 'rejectFileShare') !== true && data.files?.every(file => file instanceof File) })
+    Object.defineProperty(navigator, 'share', { configurable: true, value: async (data: ShareData) => {
+      if (Reflect.get(window, 'cancelFileShare')) throw new DOMException('Cancelled', 'AbortError')
+      const activated = navigator.userActivation.isActive
+      const files = await Promise.all((data.files ?? []).map(async file => ({ name: file.name, type: file.type, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) })))
+      Reflect.set(window, 'sharedFiles', { files, activated, keys: Object.keys(data) })
+    } })
+  })
+}
+
+test('file forwarding shares original files through a fresh user gesture without private URLs', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '文件转发' } })).json()
+  const image = await sharp({ create: { width: 32, height: 16, channels: 3, background: '#197d65' } }).jpeg().toBuffer()
+  const samples = [{ name: 'photo.jpg', mimeType: 'image/jpeg', buffer: image, expectedName: 'photo.png', expectedType: 'image/png' }, { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('original document'), expectedName: 'notes.txt', expectedType: 'text/plain' }]
+  const assets = []
+  for (const sample of samples) {
+    const response = await request.post(`/api/projects/${project.id}/uploads`, { multipart: { file: sample } })
+    expect(response.status()).toBe(201)
+    assets.push(await response.json())
+  }
+  await mockFileSharing(page)
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  const originalURL = page.url()
+  for (const [index, sample] of samples.entries()) {
+    await openProjectPanel(page, '素材库')
+    await page.locator('.asset').filter({ hasText: sample.name }).click()
+    const dialog = page.getByRole('dialog')
+    await expect(dialog.locator('.actions').getByRole('button', { name: '转发', exact: true })).toBeVisible()
+    const shareButton = dialog.getByRole('button', { name: '转发', exact: true })
+    await expect(shareButton).toHaveClass('icon-button')
+    await expect(shareButton).toHaveText('')
+    await expect(shareButton).toHaveCSS('width', '44px')
+    await expect(shareButton).toHaveCSS('height', '44px')
+    await expect(shareButton).toHaveCSS('color', 'rgb(111, 123, 115)')
+    await expect(dialog.locator(':scope > .asset-share')).toHaveCount(0)
+    await dialog.getByRole('button', { name: '转发', exact: true }).click()
+    await expect(dialog.getByText('文件已就绪', { exact: true })).toBeVisible()
+    expect(await page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toBeUndefined()
+    await page.evaluate(() => Reflect.set(window, 'cancelFileShare', true))
+    await dialog.getByRole('button', { name: '选择转发应用', exact: true }).click()
+    await expect(dialog.getByRole('button', { name: '选择转发应用', exact: true })).toBeEnabled()
+    await expect(dialog.getByText('未能打开系统分享，请重试')).toHaveCount(0)
+    await page.evaluate(() => Reflect.set(window, 'cancelFileShare', false))
+    await page.screenshot({ path: testInfo.outputPath(`share-${index}.png`) })
+    await dialog.getByRole('button', { name: '选择转发应用', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toBeTruthy()
+    const original = await (await request.get(`/api/assets/${assets[index].id}/content`)).body()
+    expect(await page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toEqual({ files: [{ name: sample.expectedName, type: sample.expectedType, bytes: Array.from(original) }], activated: true, keys: ['files'] })
+    expect(page.url()).toBe(originalURL)
+    expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+    await page.evaluate(() => Reflect.deleteProperty(window, 'sharedFiles'))
+  }
+})
+
+test('file forwarding handles unsupported browsers, denied access and cancelled preparation', async ({ page, request }) => {
+  const project = await (await request.post('/api/projects', { data: { title: '转发失败处理' } })).json()
+  const asset = await (await request.post(`/api/projects/${project.id}/uploads`, { multipart: { file: { name: 'document.txt', mimeType: 'text/plain', buffer: Buffer.from('private document') } } })).json()
+  await mockFileSharing(page)
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  await openProjectPanel(page, '素材库')
+  await page.locator('.asset').click()
+  const dialog = page.getByRole('dialog')
+  await page.evaluate(() => { Reflect.set(window, 'originalShare', navigator.share); Object.defineProperty(navigator, 'share', { configurable: true, value: undefined }) })
+  let reads = 0
+  let denied = true
+  await page.route(`**/api/assets/${asset.id}/content`, async route => { reads++; if (denied) await route.fulfill({ status: 403, json: { error: 'Forbidden' } }); else await route.continue() })
+  await dialog.getByRole('button', { name: '转发', exact: true }).click()
+  await expect(dialog.getByText('当前浏览器不支持文件转发', { exact: true })).toBeVisible()
+  expect(reads).toBe(0)
+  await page.evaluate(() => Object.defineProperty(navigator, 'share', { configurable: true, value: Reflect.get(window, 'originalShare') }))
+  await dialog.getByRole('button', { name: '转发', exact: true }).click()
+  await expect(dialog.getByText('文件读取失败，请重试', { exact: true })).toBeVisible()
+  denied = false
+  await page.evaluate(() => Reflect.set(window, 'rejectFileShare', true))
+  await dialog.getByRole('button', { name: '转发', exact: true }).click()
+  await expect(dialog.getByText('当前浏览器不支持转发此文件类型', { exact: true })).toBeVisible()
+  await page.evaluate(() => {
+    Reflect.set(window, 'rejectFileShare', false)
+    const original = window.fetch.bind(window)
+    window.fetch = (input, options) => String(input).endsWith('/content') ? new Promise((_resolve, reject) => {
+      options!.signal!.addEventListener('abort', () => { Reflect.set(window, 'sharePreparationAborted', true); reject(new DOMException('Cancelled', 'AbortError')) }, { once: true })
+    }) : original(input, options)
+  })
+  await dialog.getByRole('button', { name: '转发', exact: true }).click()
+  await dialog.getByRole('button', { name: '取消准备转发', exact: true }).click()
+  await expect(dialog.getByRole('button', { name: '转发', exact: true })).toBeEnabled()
+  expect(await page.evaluate(() => Reflect.get(window, 'sharePreparationAborted'))).toBe(true)
+  expect(await page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toBeUndefined()
+  await dialog.getByRole('button', { name: '转发', exact: true }).click()
+  await expect(dialog.getByRole('button', { name: '取消准备转发', exact: true })).toBeVisible()
+  await page.evaluate(() => Reflect.set(window, 'sharePreparationAborted', false))
+  await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'sharePreparationAborted'))).toBe(true)
+})
+
+test('conversation opens at latest, follows updates and respects reading history', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: `滚动验收-${testInfo.project.name}` } })).json()
+  const other = await (await request.post('/api/projects', { data: { title: `另一会话-${testInfo.project.name}` } })).json()
+  async function append(text: string) {
+    expect((await request.post(`/api/projects/${project.id}/messages`, { data: { requestId: crypto.randomUUID(), text, assetIds: [], ratio: '1:1' } })).status()).toBe(202)
+    await expect(page.getByText(text, { exact: true })).toHaveCount(1)
+  }
+  for (let index = 0; index < 12; index++) await request.post(`/api/projects/${project.id}/messages`, { data: { requestId: crypto.randomUUID(), text: `历史消息 ${index}\n${'多行内容\n'.repeat(5)}`, assetIds: [], ratio: '1:1' } })
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  const scroll = page.locator('.conversation-scroll')
+  const bottomGap = () => scroll.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)
+  await expect(page.getByRole('status', { name: '已同步', exact: true })).toBeVisible()
+  await expect.poll(bottomGap).toBeLessThan(2)
+  await append('最新消息\n持续更新\n保持底部')
+  await expect.poll(bottomGap).toBeLessThan(2)
+  await page.locator('.conversation-turn').last().evaluate(element => { element.style.minHeight = '700px' })
+  await expect.poll(bottomGap).toBeLessThan(2)
+  await scroll.evaluate(element => { element.scrollTop = 100; element.dispatchEvent(new Event('scroll')) })
+  await append('阅读历史时收到的新消息')
+  await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBe(100)
+  await scroll.evaluate(element => { element.scrollTop = element.scrollHeight; element.dispatchEvent(new Event('scroll')) })
+  await append('回到底部后继续跟随')
+  await expect.poll(bottomGap).toBeLessThan(2)
+  await page.getByRole('button', { name: '项目列表', exact: true }).click()
+  await page.getByRole('button', { name: other.title, exact: true }).click()
+  await page.getByRole('button', { name: '项目列表', exact: true }).click()
+  await page.getByRole('button', { name: project.title, exact: true }).click()
+  await expect(page.getByText('回到底部后继续跟随', { exact: true })).toBeVisible()
+  await expect.poll(bottomGap).toBeLessThan(2)
+  await page.screenshot({ path: testInfo.outputPath('conversation-latest.png') })
+})
+
+test('upload cancellation stops the batch and restores the composer', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '取消批量上传' } })).json()
+  await page.addInitScript(id => {
+    localStorage.setItem('qwen-project', id)
+    const original = window.fetch.bind(window)
+    let count = 0
+    window.fetch = (input, options) => {
+      if (String(input).endsWith('/uploads')) {
+        count++
+        Reflect.set(window, 'uploadCount', count)
+        if (count === 2 || Reflect.get(window, 'holdNextUpload')) return new Promise((_resolve, reject) => {
+          Reflect.set(window, 'holdNextUpload', false)
+          options!.signal!.addEventListener('abort', () => {
+            Reflect.set(window, 'uploadAborted', true)
+            reject(new DOMException('Cancelled', 'AbortError'))
+          }, { once: true })
+        })
+      }
+      return original(input, options)
+    }
+  }, project.id)
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: '上传文件', exact: true })).toBeEnabled()
+  await page.locator('input[type=file]').setInputFiles(['first.txt', 'second.txt', 'third.txt'].map(name => ({ name, mimeType: 'text/plain', buffer: Buffer.from(name) })))
+  await expect(page.getByText('正在上传 2 / 3 · second.txt', { exact: true })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('upload-cancel.png') })
+  await page.getByRole('button', { name: '取消上传', exact: true }).click()
+  await expect(page.getByRole('button', { name: '取消上传', exact: true })).toHaveCount(0)
+  await expect(page.getByLabel('创作需求')).toBeEnabled()
+  await expect(page.getByRole('button', { name: '移除附件 first.txt', exact: true })).toBeVisible()
+  expect(await page.evaluate(() => ({ count: Reflect.get(window, 'uploadCount'), aborted: Reflect.get(window, 'uploadAborted') }))).toEqual({ count: 2, aborted: true })
+  expect((await (await request.get(`/api/projects/${project.id}`)).json()).assets).toHaveLength(1)
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  await page.locator('input[type=file]').setInputFiles({ name: 'retry.txt', mimeType: 'text/plain', buffer: Buffer.from('retry') })
+  await expect(page.getByRole('button', { name: '移除附件 retry.txt', exact: true })).toBeVisible()
+  await openProjectPanel(page, '素材库')
+  await page.evaluate(() => Reflect.set(window, 'holdNextUpload', true))
+  await page.locator('input[type=file]').setInputFiles({ name: 'library.txt', mimeType: 'text/plain', buffer: Buffer.from('cancel') })
+  await page.getByRole('dialog').getByRole('button', { name: '取消上传', exact: true }).click()
+  await expect(page.getByRole('dialog').getByRole('button', { name: '上传文件', exact: true })).toBeEnabled()
+  await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click()
+  await page.getByRole('button', { name: '修改图片', exact: true }).click()
+  const guide = page.getByRole('dialog', { name: '修改图片', exact: true })
+  await guide.getByLabel('修改要求', { exact: true }).fill('保留修改要求')
+  await guide.getByLabel('上传原图', { exact: true }).setInputFiles(resolve('public/reference-interior.jpg'))
+  await page.evaluate(() => Reflect.set(window, 'holdNextUpload', true))
+  await guide.getByRole('button', { name: '带入草稿' }).click()
+  await guide.getByRole('button', { name: '取消上传', exact: true }).click()
+  await expect(guide.getByRole('button', { name: '带入草稿' })).toBeEnabled()
+  await expect(guide.getByLabel('修改要求', { exact: true })).toHaveValue('保留修改要求')
+  expect((await (await request.get(`/api/projects/${project.id}`)).json()).assets).toHaveLength(2)
+})
+
+test('VM failed start refreshes and permits cancelling a fresh retry confirmation', async ({ page }) => {
+  const ids: string[] = []
+  let operation: Record<string, unknown> | undefined
+  await page.route('**/api/vm', route => route.fulfill({ json: { configured: true, name: 'test-gpu', powerState: 'deallocated', gpuReady: false, operation } }))
+  await page.route('**/api/vm/actions', route => {
+    const body = route.request().postDataJSON()
+    ids.push(body.requestId)
+    operation = { id: body.requestId, action: 'start', status: 'failed', error: 'AllocationFailed: No capacity' }
+    return route.fulfill({ status: 503, json: { error: '容量不足，本次操作失败' } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'VM 管理', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'VM 管理' })
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  await panel.getByRole('button', { name: '确认启动', exact: true }).click()
+  await expect(panel.getByText('启动 · 失败', { exact: true })).toBeVisible()
+  await expect(panel.getByText('AllocationFailed: No capacity', { exact: true })).toBeVisible()
+  await expect(panel.getByRole('button', { name: '启动', exact: true })).toBeEnabled()
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  await panel.getByRole('button', { name: '取消', exact: true }).click()
+  expect(ids).toHaveLength(1)
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  await panel.getByRole('button', { name: '确认启动', exact: true }).click()
+  await expect.poll(() => ids.length).toBe(2)
+  expect(ids[0]).not.toBe(ids[1])
+})
+
 test('all modal layouts keep headers, fields and actions inside the mobile viewport', async ({ page, request }, testInfo) => {
   const project = await (await request.post('/api/projects', { data: { title: '弹层布局验收' } })).json()
   await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
@@ -769,6 +982,7 @@ test('image loading stays visible after reply, resend sits inside bubble, and re
 })
 
 test('video results use playback and download controls instead of image zoom', async ({ page, request }, testInfo) => {
+  await mockFileSharing(page)
   const project = await (await request.post('/api/projects', { data: { title: '视频展示回归' } })).json()
   const assetId = crypto.randomUUID()
   const messageId = crypto.randomUUID()
@@ -782,7 +996,7 @@ test('video results use playback and download controls instead of image zoom', a
   } }))
   await page.route(`**/api/assets/${assetId}/content*`, route => route.request().url().includes('thumbnail=1')
     ? route.fulfill({ path: resolve('public/reference-interior.jpg'), contentType: 'image/jpeg' })
-    : route.fulfill({ status: 204 }))
+    : route.fulfill({ body: Buffer.from('video-share-fixture'), contentType: 'video/mp4' }))
   await page.goto('/')
   await page.evaluate(id => localStorage.setItem('qwen-project', id), project.id)
   await page.reload()
@@ -791,6 +1005,9 @@ test('video results use playback and download controls instead of image zoom', a
   await expect(page.locator('video')).toHaveAttribute('playsinline', '')
   await expect(page.getByRole('link', { name: '下载视频' })).toHaveAttribute('href', `/api/assets/${assetId}/content?download=1`)
   await expect(page.getByText('MiniMax H3 · 5.17 秒')).toBeVisible()
+  await page.getByRole('button', { name: '转发', exact: true }).click()
+  await page.getByRole('button', { name: '选择转发应用', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toEqual({ files: [{ name: 'fixture.mp4', type: 'video/mp4', bytes: Array.from(Buffer.from('video-share-fixture')) }], activated: true, keys: ['files'] })
   await openProjectPanel(page, '素材库')
   await page.locator('.asset').click()
   await expect(page.getByRole('dialog').locator('video')).toBeVisible()
@@ -798,6 +1015,17 @@ test('video results use playback and download controls instead of image zoom', a
   await expect(page.getByRole('button', { name: '用作参考' })).toHaveCount(0)
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('video-viewer.png') })
+  await page.getByRole('dialog').getByRole('button', { name: '转发', exact: true }).click()
+  await expect(page.getByRole('dialog').getByRole('button', { name: '选择转发应用', exact: true })).toBeVisible()
+  await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click()
+  await page.route('**/api/avatar', route => route.fulfill({ json: { configured: true } }))
+  await page.route(`**/api/projects/${project.id}/avatar-jobs`, route => route.fulfill({ json: [{ id: assetId, assetId, projectId: project.id, status: 'completed', text: '口播测试', createdAt: now }] }))
+  await page.getByRole('button', { name: '创作引导', exact: true }).click()
+  await page.getByRole('dialog').getByRole('button', { name: '数字人口播', exact: true }).click()
+  const avatar = page.getByRole('dialog', { name: '数字人口播', exact: true })
+  await avatar.getByRole('button', { name: '转发', exact: true }).click()
+  await avatar.getByRole('button', { name: '选择转发应用', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toEqual({ files: [{ name: '数字人口播.mp4', type: 'video/mp4', bytes: Array.from(Buffer.from('video-share-fixture')) }], activated: true, keys: ['files'] })
 })
 
 test('application login switches private users and provides admin account controls', async ({ page }, testInfo) => {
@@ -990,6 +1218,8 @@ test('configured chat displays assistant, Azure assets and run history', async (
   runStatus = 'running'
   await request.patch(`/api/projects/${project.id}`, { data: { title: '运行中输入区测试' } })
   await expect(page.getByRole('button', { name: '停止当前回复' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '停止当前回复' })).toHaveCSS('color', 'rgb(181, 46, 53)')
+  await expect(page.getByRole('button', { name: '停止当前回复' }).locator('svg')).toHaveCSS('fill', 'rgb(181, 46, 53)')
   for (const size of [{ width: 320, height: 568 }, { width: 390, height: 420 }]) {
     await page.setViewportSize(size)
     await page.getByLabel('创作需求').fill('较长的图片需求，需要保留编辑空间。\n'.repeat(10))

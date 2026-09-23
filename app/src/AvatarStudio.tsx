@@ -3,6 +3,7 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { ArrowDownToLine, Film, LoaderCircle, RefreshCw, X } from 'lucide-react'
 import { authenticatedFetch } from './auth-client'
 import type { AvatarJob } from '../server/avatar'
+import { ShareAssetButton } from './ShareAssetButton'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await authenticatedFetch(`/api${path}`, options)
@@ -79,6 +80,7 @@ export function AvatarStudio({ projectId, open, onOpenChange }: { projectId: str
           {job.assetId && <><video className="generated-video" src={`/api/assets/${job.assetId}/content`} controls playsInline preload="metadata" aria-label="数字人口播视频" /><a className="icon-button" href={`/api/assets/${job.assetId}/content?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载口播视频" title="下载口播视频"><ArrowDownToLine size={20} /></a></>}
           {!['completed', 'failed'].includes(job.status) && <span className="avatar-job-pending"><RefreshCw size={14} />等待原任务结果</span>}
           <small className="avatar-job-id">{job.id}</small>
+          {job.assetId && <ShareAssetButton key={job.assetId} asset={{ id: job.assetId, name: '数字人口播.mp4', mediaType: 'video', mimeType: 'video/mp4' }} />}
         </article>)}
       </section>
     </Dialog.Content>

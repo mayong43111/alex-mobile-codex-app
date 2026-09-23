@@ -173,11 +173,16 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
 
   app.post<{ Params: { id: string } }>('/api/projects/:id/uploads', async (request, reply) => {
     store.project(request.params.id)
+    const checkConnection = () => {
+      if (request.raw.aborted || reply.raw.destroyed) throw new HttpError(499, 'Upload cancelled')
+    }
     const file = await request.file()
     if (!file) throw new HttpError(400, 'File required')
     const bytes = await file.toBuffer()
+    checkConnection()
     const name = (file.filename.split(/[\\/]/).at(-1) ?? 'file').replace(/\p{Cc}/gu, '').slice(0, 160) || 'file'
     const { original, thumbnail, metadata } = await prepareUpload(bytes, name, file.mimetype)
+    checkConnection()
     const id = randomUUID()
     const asset: Asset = {
       id, projectId: request.params.id, kind: 'reference', name, ...metadata,
@@ -186,7 +191,9 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     const keys = [`${id}.${assetExtension(asset)}`, ...(thumbnail ? [`${id}.webp`] : [])]
     try {
       await assetStorage.put(keys[0], original)
+      checkConnection()
       if (thumbnail) await assetStorage.put(`${id}.webp`, thumbnail)
+      checkConnection()
       store.addAsset(asset)
     } catch (error) {
       await Promise.allSettled(keys.map(key => assetStorage.remove(key)))
