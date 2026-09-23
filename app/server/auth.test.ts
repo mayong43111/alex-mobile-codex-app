@@ -11,6 +11,30 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { ConfidentialClientApplication } from '@azure/msal-node'
 
+test('real MSAL rejects an unbound token nonce and accepts the saved flow nonce', async () => {
+  const tenantId = randomUUID(), clientId = randomUUID(), userId = randomUUID(), nonce = randomUUID()
+  const authority = `https://login.microsoftonline.com/${tenantId}`
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
+  const claims = { aud: clientId, iss: `${authority}/v2.0`, tid: tenantId, oid: userId, sub: userId, nonce, name: 'Test', preferred_username: 'test@example.com', iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 3600 }
+  const metadata = { authorization_endpoint: `${authority}/oauth2/v2.0/authorize`, token_endpoint: `${authority}/oauth2/v2.0/token`, issuer: `${authority}/v2.0`, jwks_uri: `${authority}/discovery/v2.0/keys`, end_session_endpoint: `${authority}/oauth2/v2.0/logout` }
+  const client = new ConfidentialClientApplication({
+    auth: { clientId, clientSecret: 'offline-test-secret', authority, authorityMetadata: JSON.stringify(metadata), cloudDiscoveryMetadata: JSON.stringify({ tenant_discovery_endpoint: `${authority}/v2.0/.well-known/openid-configuration`, metadata: [{ preferred_network: 'login.microsoftonline.com', preferred_cache: 'login.windows.net', aliases: ['login.microsoftonline.com', 'login.windows.net'] }] }) },
+    system: { networkClient: {
+      async sendGetRequestAsync() { throw new Error('Unexpected network discovery') },
+      async sendPostRequestAsync<Response>(url: string) {
+        const endpoint = new URL(url)
+        assert.equal(`${endpoint.origin}${endpoint.pathname}`, metadata.token_endpoint)
+        return { status: 200, headers: {}, body: { token_type: 'Bearer', scope: 'openid profile email', expires_in: 3600, access_token: 'offline-access-token', id_token: `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode(claims)}.offline-signature`, client_info: encode({ uid: userId, utid: tenantId }) } as Response }
+      },
+    } },
+  })
+  const request = { code: 'offline-code', scopes: ['openid', 'profile', 'email'], redirectUri: 'https://studio.example/api/auth/callback', codeVerifier: 'offline-code-verifier-with-at-least-43-characters' }
+  await assert.rejects(client.acquireTokenByCode(request), { errorCode: 'nonce_mismatch' })
+  const result = await client.acquireTokenByCode({ ...request, nonce })
+  assert.equal((result.idTokenClaims as Record<string, unknown>).nonce, nonce)
+  assert.equal(result.account?.localAccountId, userId)
+})
+
 test('password sessions require origin and CSRF, rotate on login and revoke on logout', async () => {
   const database = new DatabaseSync(':memory:')
   const app = Fastify()
@@ -85,7 +109,8 @@ test('MSAL code flow binds state, nonce and browser, restricts identities and re
     assert.equal(request.redirectUri, `${origin}/api/auth/callback`)
     return `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?state=${state}`
   })
-  context.mock.method(ConfidentialClientApplication.prototype, 'acquireTokenByCode', async (request: { codeVerifier: string }) => {
+  context.mock.method(ConfidentialClientApplication.prototype, 'acquireTokenByCode', async (request: { codeVerifier: string; nonce: string }) => {
+    assert.equal(request.nonce, nonce)
     assert(request.codeVerifier.length >= 43); exchanges++
     return { idTokenClaims: { tid: rejection === 'tenant' ? randomUUID() : tenantId, oid: rejection === 'user' ? randomUUID() : userId, aud: clientId, iss: `https://login.microsoftonline.com/${tenantId}/v2.0`, exp: Date.now() / 1000 + 300, nonce: rejection === 'nonce' ? 'wrong' : nonce, name: 'Admin' } }
   })

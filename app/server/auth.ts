@@ -132,7 +132,7 @@ export async function registerAuth(app: FastifyInstance, database: DatabaseSync,
     reply.clearCookie(flowCookie, cookieOptions)
     if (!flow || Number(flow.expires) <= Date.now() || !binding || !equal(digest(binding), flow.binding_hash as string) || error || !code) return reply.redirect('/?login=failed')
     try {
-      const token = await client().acquireTokenByCode({ code, scopes: ['openid', 'profile', 'email'], redirectUri: `${origin}/api/auth/callback`, codeVerifier: flow.verifier as string })
+      const token = await client().acquireTokenByCode({ code, scopes: ['openid', 'profile', 'email'], redirectUri: `${origin}/api/auth/callback`, codeVerifier: flow.verifier as string, nonce: flow.nonce as string })
       const claims = token?.idTokenClaims as Record<string, unknown> | undefined
       const entra = options.entra!
       if (!claims || claims.nonce !== flow.nonce || claims.tid !== entra.tenantId || claims.aud !== entra.clientId || claims.iss !== `https://login.microsoftonline.com/${entra.tenantId}/v2.0` || typeof claims.exp !== 'number' || claims.exp * 1000 <= Date.now() || typeof claims.oid !== 'string' || !entra.userIds.includes(claims.oid)) throw new Error('Identity rejected')
