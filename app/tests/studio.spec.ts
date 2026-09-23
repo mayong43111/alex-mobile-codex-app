@@ -223,8 +223,12 @@ test('mixed uploads enter the library and chat submits only selected asset IDs',
 
 test('PWA manifest, icons and network-only worker protect private content', async ({ page, context, request }) => {
   await page.goto('/')
+  await expect(page).toHaveTitle('Codex Studio · 创作工作台')
+  await expect(page.locator('meta[name="apple-mobile-web-app-title"]')).toHaveAttribute('content', 'Codex Studio')
   await expect(page.locator('link[rel="manifest"]')).toHaveAttribute('href', '/manifest.webmanifest')
   const manifest = await (await request.get('/manifest.webmanifest')).json()
+  expect(manifest.name).toBe('Codex Studio')
+  expect(manifest.short_name).toBe('Codex Studio')
   expect(manifest.display).toBe('standalone')
   expect(manifest.start_url).toBe('/')
   for (const size of [180, 192, 512]) {

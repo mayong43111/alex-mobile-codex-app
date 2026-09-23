@@ -334,7 +334,7 @@ test('cloud routes require application sessions and ignore platform identity hea
   const staticRoot = join(dataDir, 'dist')
   await mkdir(staticRoot)
   await writeFile(join(staticRoot, 'index.html'), '<!doctype html><html><body>Studio</body></html>')
-  await writeFile(join(staticRoot, 'manifest.webmanifest'), JSON.stringify({ name: 'Qwen Studio' }))
+  await writeFile(join(staticRoot, 'manifest.webmanifest'), JSON.stringify({ name: 'Codex Studio' }))
   await writeFile(join(staticRoot, 'sw.js'), 'self.addEventListener("fetch", () => {})')
   const app = await buildApp({ dataDir, staticRoot, hosts: ['studio.example'], origins: ['https://studio.example'], auth: { origin: 'https://studio.example' }, journalMode: 'DELETE' })
   const principal = (tenant: string, user: string) => Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [{ typ: 'tid', val: tenant }, { typ: 'oid', val: user }] })).toString('base64')

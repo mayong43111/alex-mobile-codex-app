@@ -19,7 +19,7 @@
 助手正文使用 Markdown/GFM 渲染，支持标题、列表、引用、表格及代码块。禁用原始 HTML 和回复内外部图片自动加载；长表格/代码块在手机内横向滚动。复制保留原始 Markdown，Process 仍展示 SDK 原文。
 
 
-# Qwen Studio 本地工作台
+# Codex Studio 本地工作台
 
 React 19 + TypeScript + Vite，Fastify + SQLite。面向低频多用户的纯手机界面；已接入真实 Codex 对话及 Azure image2 单图生成，启动本身不创建或启动云资源。
 
