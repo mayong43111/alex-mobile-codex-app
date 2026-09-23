@@ -13,6 +13,7 @@ const environment = z.object({
   AZURE_MODEL_SUBSCRIPTION: z.string().uuid(),
   AZURE_STORAGE_BLOB_ENDPOINT: z.url().startsWith('https://'), AZURE_STORAGE_CONTAINER: z.string().min(1),
   COMFYUI_SERVER_URL: z.url().optional(),
+  SPEECH_AVATAR_ENDPOINT: z.url().startsWith('https://').optional(),
   VM_CONFIG: z.string().startsWith('/home/').optional(),
 }).parse(process.env)
 environment.ENTRA_ALLOWED_USER_IDS.split(',').forEach(id => z.string().uuid().parse(id))
@@ -63,6 +64,7 @@ gateway.once('message', message => {
   launch(['--experimental-strip-types', 'server/index.ts'], { cwd: '/opt/studio/app', env: {
     PATH: process.env.PATH, HOME: '/home/node', NODE_ENV: 'production', HOSTING_MODE: 'appservice', API_PORT: '8080',
     DATA_DIR: '/home/studio/data', RUNTIME_CONFIG: configFile,
+    ...(environment.SPEECH_AVATAR_ENDPOINT ? { SPEECH_AVATAR_ENDPOINT: environment.SPEECH_AVATAR_ENDPOINT } : {}),
     ...(environment.VM_CONFIG ? { VM_CONFIG: environment.VM_CONFIG } : {}),
     APP_ORIGINS: `https://${environment.WEBSITE_HOSTNAME}`,
     WEBSITE_HOSTNAME: environment.WEBSITE_HOSTNAME, ENTRA_TENANT_ID: environment.ENTRA_TENANT_ID, ENTRA_ALLOWED_USER_IDS: environment.ENTRA_ALLOWED_USER_IDS,

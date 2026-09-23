@@ -11,6 +11,7 @@ import type { VmStatus, VmAction } from '../server/vm'
 import './MobileApp.css'
 import { authenticatedFetch } from './auth-client'
 import type { SignedInUser } from './auth-client'
+import { AvatarStudio } from './AvatarStudio'
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await authenticatedFetch(`/api${path}`, options)
@@ -36,6 +37,13 @@ const references = [
   { name: '午后空间', file: '/reference-interior.jpg', prompt: '保留空间结构，营造午后自然光下安静、通透的室内氛围。' },
   { name: '静物与光', file: '/reference-still-life.jpg', prompt: '参考这张图片的构图，创作一幅自然光静物照片，保留细腻材质。' },
 ]
+const creationGuides = {
+  image: { title: '做图片', icon: Images, subject: '画面内容', placeholder: '例如：窗边的一束白色花，清晨自然光', detail: '风格与用途', prefix: '请生成一张图片。' },
+  edit: { title: '修改图片', icon: ImagePlus, subject: '修改要求', placeholder: '例如：把背景换成浅灰色，保留主体', detail: '需要保留的内容', prefix: '请修改我明确指定的原图，另存结果，不覆盖原图。' },
+  video: { title: '做短镜头', icon: Film, subject: '镜头内容', placeholder: '例如：雨后的街道，镜头缓慢向前推进', detail: '动作与运镜', prefix: '请制作一个约 5 秒的短镜头，使用我已启用的视频模型；未启用或不可用时先告知，不改用其他服务。' },
+  script: { title: '写脚本分镜', icon: FileText, subject: '主题与受众', placeholder: '例如：面向新手的咖啡冲煮介绍', detail: '时长与表达重点', prefix: '请编写脚本和分镜，包含镜号、时长、画面、运镜、旁白及字幕。只输出文字方案，不生成图片、音频或视频。' },
+}
+type CreationGuide = keyof typeof creationGuides
 
 function IconButton({ label, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; children: ReactNode }) {
   return <button type="button" className="icon-button" aria-label={label} title={label} {...props}>{children}</button>
@@ -112,12 +120,12 @@ function ImagePending({ run, connected }: { run: AgentRun; connected: boolean })
 
 function Viewer({ asset, close, reference }: { asset: Asset | null; close: () => void; reference: (asset: Asset) => void }) {
   return <Modal open={!!asset} onOpenChange={open => { if (!open) close() }} title={asset?.name ?? '图片'} className="viewer">
-    {asset?.mediaType === 'file' ? <div className="file-viewer"><AssetPreview asset={asset} /><p>{asset.mimeType ?? '文件'} · {fileSize(asset.bytes)}</p><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} aria-label="下载文件" title="下载文件"><ArrowDownToLine size={19} /></a><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div> : asset?.mediaType === 'video' ? <><video className="generated-video" controls playsInline preload="metadata" poster={assetHasThumbnail(asset) ? imageUrl(asset) : undefined} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="viewer-footer"><span>{assetDetails(asset)}</span><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} aria-label="下载视频" title="下载视频"><ArrowDownToLine size={19} /></a><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div></> : asset && <TransformWrapper initialScale={1} minScale={0.5} maxScale={8}>
+    {asset?.mediaType === 'file' ? <div className="file-viewer"><AssetPreview asset={asset} /><p>{asset.mimeType ?? '文件'} · {fileSize(asset.bytes)}</p><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载文件" title="下载文件"><ArrowDownToLine size={19} /></a><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div> : asset?.mediaType === 'video' ? <><video className="generated-video" controls playsInline preload="metadata" poster={assetHasThumbnail(asset) ? imageUrl(asset) : undefined} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="viewer-footer"><span>{assetDetails(asset)}</span><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={19} /></a><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div></> : asset && <TransformWrapper initialScale={1} minScale={0.5} maxScale={8}>
       {({ zoomIn, zoomOut, resetTransform }) => <>
         <div className="image-stage"><TransformComponent wrapperClass="zoom-wrapper" contentClass="zoom-content"><img src={imageUrl(asset, false)} alt={asset.name} /></TransformComponent></div>
         <div className="viewer-footer"><span>{asset.width} × {asset.height} · {asset.kind === 'generated' ? `${asset.provider} / ${asset.model}` : '参考图'}</span><div className="actions">
           <IconButton label="放大" onClick={() => zoomIn()}><ZoomIn size={19} /></IconButton><IconButton label="缩小" onClick={() => zoomOut()}><ZoomOut size={19} /></IconButton><IconButton label="重置缩放" onClick={() => resetTransform()}><Maximize size={19} /></IconButton>
-          <a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} aria-label="下载图片" title="下载图片"><ArrowDownToLine size={19} /></a>
+          <a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载图片" title="下载图片"><ArrowDownToLine size={19} /></a>
           <button className="primary" onClick={() => reference(asset)}><ImagePlus size={17} />用作参考</button>
         </div></div>
       </>}
@@ -212,6 +220,13 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [servicesOpen, setServicesOpen] = useState(false)
   const [optionsOpen, setOptionsOpen] = useState(false)
   const [vmOpen, setVmOpen] = useState(false)
+  const [avatarOpen, setAvatarOpen] = useState(false)
+  const [guide, setGuide] = useState<CreationGuide | null>(null)
+  const [guidesOpen, setGuidesOpen] = useState(false)
+  const [brief, setBrief] = useState('')
+  const [briefDetail, setBriefDetail] = useState('')
+  const [sourceId, setSourceId] = useState('')
+  const [sourceFile, setSourceFile] = useState<File | null>(null)
   const [deleting, setDeleting] = useState<Project | null>(null)
   const [resending, setResending] = useState<{ message: Message; requestId: string; expectedTailId: string } | null>(null)
   const [storageStatus, setStorageStatus] = useState<'checking' | 'ready' | 'offline'>('checking')
@@ -229,6 +244,9 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   useEffect(() => { currentProject.current = projectId }, [projectId])
 
   function switchProject(id: string) {
+    setAvatarOpen(false)
+    setGuide(null)
+    setGuidesOpen(false)
     setProjectId(id); setSnapshot(null); setAttachments([]); setDraft(''); setSidebarOpen(false); setView('chat'); setConnected(false)
     setResending(null)
     submitRequest.current = null
@@ -324,6 +342,39 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     })
   }
   function editDraft(text: string) { setDraft(text); submitRequest.current = null }
+  function openGuide(kind: CreationGuide) {
+    setGuidesOpen(false)
+    setSidebarOpen(false); setGuide(kind); setBrief(''); setBriefDetail(''); setSourceId(''); setSourceFile(null); setError('')
+  }
+  async function prepareCreation(event: FormEvent) {
+    event.preventDefault()
+    if (!guide || busy || !brief.trim()) return
+    const kind = guide
+    const selected = creationGuides[kind]
+    const requirement = `${selected.prefix}\n${selected.subject}：${brief.trim()}${briefDetail.trim() ? `\n${selected.detail}：${briefDetail.trim()}` : ''}`
+    const nextDraft = [draft.trim(), requirement].filter(Boolean).join('\n\n')
+    await perform(async () => {
+      if (nextDraft.length + (kind === 'edit' ? 60 : 0) > 6000) throw new Error('现有草稿与新需求合计超过 6000 字，请先精简草稿。')
+      let source = kind === 'edit' ? assets.find(asset => asset.id === sourceId && (asset.mediaType ?? 'image') === 'image') : undefined
+      if (kind === 'edit' && !source && !sourceFile) throw new Error('请明确选择或上传一张原图。')
+      if (kind === 'edit' && attachments.length >= 10 && !attachments.some(asset => asset.id === source?.id)) throw new Error('最多选择 10 个附件，请先移除一个附件。')
+      if (sourceFile && (!sourceFile.size || sourceFile.size > 64 * 1024 * 1024)) throw new Error('原图必须为非空文件且不超过 64 MB。')
+      let id = projectId
+      if (!id) {
+        const project = await api<Project>('/projects', json('POST', { title: brief.trim().slice(0, 80) }))
+        id = project.id; currentProject.current = id; switchProject(id)
+        setGuide(kind)
+        await loadProjects()
+      }
+      if (kind === 'edit' && sourceFile) source = await upload(sourceFile, id)
+      if (source && (source.mediaType ?? 'image') !== 'image') throw new Error('请选择有效的 PNG、JPEG 或 WebP 图片。')
+      if (source) setAttachments(previous => previous.some(asset => asset.id === source.id) ? previous : [...previous, source])
+      editDraft(`${nextDraft}${source ? `\n原图附件 ID：${source.id}` : ''}`)
+      setView('chat'); setGuide(null); setSourceFile(null)
+      await refresh(id)
+      requestAnimationFrame(() => draftInput.current?.focus())
+    })
+  }
   async function deleteProject() {
     if (!deleting || busy) return
     const target = deleting
@@ -415,6 +466,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </div>
   </>
   const sampleSection = <section className="reference-section"><div className="section-heading"><h3>参考起点</h3><span>摄影参考 · 非生成结果</span></div><div className="sample-grid">{references.map(sample => <button key={sample.name} className="sample" disabled={busy || attachments.length >= 10} onClick={() => void selectSample(sample)}><img src={sample.file} alt={sample.name} /><span>{sample.name}<Plus size={17} /></span></button>)}</div><small className="source">摄影来源：Unsplash</small></section>
+  const creationEntries = <nav className="creation-entries" aria-label="创作入口">{(Object.keys(creationGuides) as CreationGuide[]).map(kind => { const entry = creationGuides[kind]; const Icon = entry.icon; return <button type="button" key={kind} disabled={busy} onClick={() => openGuide(kind)}><Icon size={21} /><span>{entry.title}</span><ChevronRight size={15} /></button> })}</nav>
 
   return <div className="studio">
     <main className="workspace">
@@ -422,7 +474,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="关闭提示" onClick={() => setError('')}><X size={16} /></IconButton><IconButton label="重试连接" onClick={() => void perform(async () => { const result = await loadProjects(); if (projectId) await refresh(projectId); else if (result.length) switchProject(result[0].id) })}><RefreshCw size={16} /></IconButton></div>}
       {initializing ? <div className="empty"><LoaderCircle className="spin" /><h2>正在读取工作空间</h2></div> : <div className="workspace-body chat-layout">
           <section className="conversation"><div className="conversation-scroll">
-            {!snapshot?.messages.length ? <div className="welcome"><div className="workspace-symbol"><Aperture size={30} /></div><h2>今天，想创作什么？</h2><div className="welcome-status"><CirclePause size={15} />{health?.agent === 'configured' ? 'Codex · GPT-5.4' : 'Codex 尚未连接'}</div>{!projectId && <button className="primary" onClick={newProject}><Plus size={17} />创建项目</button>}{sampleSection}</div> : <div className="messages">{snapshot.messages.filter(message => message.role !== 'assistant').map(message => {
+            {!snapshot?.messages.length ? <div className="welcome"><div className="welcome-heading"><div><p className="welcome-brand">Codex Studio</p><h2>今天，想创作什么？</h2></div><Aperture size={25} aria-hidden="true" /></div><div className="welcome-status"><span className={`status-dot ${health?.agent === 'configured' ? '' : 'gray'}`} />{health?.agent === 'configured' ? 'Codex · GPT-5.4' : 'Codex 尚未连接'}</div>{creationEntries}{!projectId ? <button className="welcome-secondary" onClick={newProject}><Plus size={18} /><span>创建项目</span><ChevronRight size={16} /></button> : <button className="welcome-secondary" onClick={() => setAvatarOpen(true)}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button>}{sampleSection}</div> : <div className="messages">{snapshot.messages.filter(message => message.role !== 'assistant').map(message => {
               const job = jobs.find(item => item.messageId === message.id)
               const run = runs.find(item => item.messageId === message.id)
               const reply = run ? snapshot.messages.find(item => item.id === run.assistantId) : undefined
@@ -438,7 +490,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
                   <RunProgress run={run} />
                   {reply && <div className="message-content"><MarkdownReply text={reply.text} /></div>}
                   <ImagePending run={run} connected={connected} />
-                  {reply && reply.assetIds.length > 0 && <div className="message-images">{reply.assetIds.map(id => { const asset = assets.find(item => item.id === id); return asset && (asset.mediaType === 'video' ? <div className="video-result" key={id}><video className="generated-video" controls playsInline preload="metadata" poster={imageUrl(asset)} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="video-meta"><span>MiniMax H3 · {asset.duration?.toFixed(2)} 秒</span><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} aria-label="下载视频" title="下载视频"><ArrowDownToLine size={18} /></a></div></div> : <button key={id} onClick={() => setSelectedAsset(asset)}><img src={imageUrl(asset)} alt={asset.name} width={asset.width} height={asset.height} /></button>) })}</div>}
+                  {reply && reply.assetIds.length > 0 && <div className="message-images">{reply.assetIds.map(id => { const asset = assets.find(item => item.id === id); return asset && (asset.mediaType === 'video' ? <div className="video-result" key={id}><video className="generated-video" controls playsInline preload="metadata" poster={imageUrl(asset)} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="video-meta"><span>MiniMax H3 · {asset.duration?.toFixed(2)} 秒</span><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={18} /></a></div></div> : <button key={id} onClick={() => setSelectedAsset(asset)}><img src={imageUrl(asset)} alt={asset.name} width={asset.width} height={asset.height} /></button>) })}</div>}
                   {run.stage === 'video' && ['failed', 'cancelled', 'interrupted'].includes(run.status) && <p className="image-outcome" role="status">{run.status === 'failed' ? '视频生成失败' : '视频任务结果待核实'}</p>}
                   {run.stage === 'image' && ['failed', 'cancelled', 'interrupted'].includes(run.status) && <p className="image-outcome" role="status">{{ failed: '图片生成失败', cancelled: '图片生成已停止', interrupted: '图片生成结果待核实' }[run.status as 'failed' | 'cancelled' | 'interrupted']}</p>}
                   {run.error && <div className="run-status" role="status"><p>{run.error}</p></div>}
@@ -452,17 +504,29 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
           <form className="composer" onSubmit={event => void submit(event)}>
             {attachments.length > 0 && <div className="attachments">{attachments.map(asset => <div key={asset.id}><button type="button" className="attachment-preview" aria-label={`查看附件 ${asset.name}`} onClick={() => setSelectedAsset(asset)}><AssetPreview asset={asset} /><span>{asset.name}</span></button><IconButton label={`移除附件 ${asset.name}`} disabled={busy} onClick={() => { setAttachments(previous => previous.filter(item => item.id !== asset.id)); submitRequest.current = null }}><X size={13} /></IconButton></div>)}</div>}
             <div className="composer-input"><textarea ref={draftInput} aria-label="创作需求" placeholder={projectId ? '说说你的想法…' : '先创建一个项目'} value={draft} disabled={!projectId || busy} maxLength={6000} onChange={event => editDraft(event.target.value)} rows={2} /></div>
-            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={20} /></IconButton><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy} onClick={() => void stopRun(activeRuns[0])}><Square size={18} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={17} />}</button></div></div>
+            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={20} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={20} /></IconButton><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy} onClick={() => void stopRun(activeRuns[0])}><Square size={18} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={17} />}</button></div></div>
           </form></section>
         <Modal open={view !== 'chat'} onOpenChange={open => { if (!open) setView('chat') }} title={view === 'images' ? '素材库' : '任务记录'} className="project-panel">
-        {view === 'images' && <section className="collection"><div className="collection-toolbar"><h2>{assets.length} 个素材</h2><button className="primary" disabled={!projectId || busy} onClick={() => fileInput.current?.click()}><Plus size={17} />上传文件</button></div>{!assets.length ? <div className="empty"><Images size={32} /><h2>还没有项目资料</h2>{!projectId && <button className="primary" onClick={newProject}><Plus size={16} />创建项目</button>}</div> : <div className="asset-grid">{assets.slice().reverse().map(asset => <button className="asset" key={asset.id} onClick={() => { setView('chat'); setSelectedAsset(asset) }}><div className="asset-image"><AssetPreview asset={asset} /><span className="asset-kind">{asset.kind === 'generated' ? asset.mediaType === 'video' ? 'H3 视频' : `${asset.provider ?? 'Azure'} 生成` : asset.mediaType === 'file' ? '文件' : asset.mediaType === 'video' ? '视频' : '参考图'}</span></div><strong>{asset.name}</strong><small>{assetDetails(asset)}</small></button>)}</div>}</section>}
+        {view === 'images' && <section className="collection"><div className="collection-toolbar"><h2>{assets.length} 个素材</h2><button className="primary" disabled={!projectId || busy} onClick={() => fileInput.current?.click()}><Plus size={17} />上传文件</button></div>{!assets.length ? <div className="empty"><Images size={32} /><h2>还没有项目资料</h2>{!projectId && <button className="primary" onClick={newProject}><Plus size={16} />创建项目</button>}</div> : <div className="asset-grid">{assets.slice().reverse().map(asset => <button className="asset" key={asset.id} onClick={() => { setView('chat'); setSelectedAsset(asset) }}><div className="asset-image"><AssetPreview asset={asset} /><span className="asset-kind">{asset.kind === 'generated' ? asset.mediaType === 'video' ? asset.model === 'azure-avatar' ? '数字人口播' : 'H3 视频' : `${asset.provider ?? 'Azure'} 生成` : asset.mediaType === 'file' ? '文件' : asset.mediaType === 'video' ? '视频' : '参考图'}</span></div><strong>{asset.name}</strong><small>{assetDetails(asset)}</small></button>)}</div>}</section>}
         {view === 'tasks' && runs.length > 0 && <section className="collection"><div className="collection-toolbar"><h2>{runs.length} 条运行记录</h2></div><div className="task-list">{runs.slice().reverse().map(run => <article className="task agent-task" key={run.id}><div className="task-icon">{run.stage === 'image' ? <Images size={20} /> : run.stage === 'video' ? <Aperture size={20} /> : <MessageSquare size={20} />}</div><div className="task-content"><div><span className="badge">{runLabel(run)}</span><time>{time(run.createdAt)}</time></div><p>{run.input.text}</p><small>{runModel(run)}</small>{run.error && <p className="form-error">{run.error}</p>}</div>{['queued', 'running'].includes(run.status) && <IconButton label="停止运行" disabled={busy} onClick={() => void stopRun(run)}><Square size={18} /></IconButton>}</article>)}</div></section>}
         {view === 'tasks' && (jobs.length > 0 || !runs.length) && <section className="collection"><div className="collection-toolbar"><h2>{jobs.length} 条任务</h2><select aria-label="任务状态筛选" value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部状态</option><option value="waiting_service">等待服务</option><option value="cancelled">已取消</option></select></div>{!jobs.length ? <div className="empty"><ListTodo size={32} /><h2>暂无任务</h2></div> : <div className="task-list">{jobs.filter(job => filter === 'all' || job.status === filter).slice().reverse().map(job => <article className="task" key={job.id}><div className={`task-icon ${job.status === 'cancelled' ? 'cancelled' : ''}`}><CirclePause size={21} /></div><div className="task-content"><div><span className={`badge ${job.status === 'cancelled' ? 'neutral' : ''}`}>{job.status === 'cancelled' ? '已取消' : '等待服务'}</span><time>{time(job.createdAt)}</time></div><p>{job.prompt}</p><small>Qwen-Image-2.1 · {job.ratio} · {job.assetIds.length} 张参考图</small></div>{job.status === 'waiting_service' ? <IconButton label="取消任务" disabled={busy} onClick={() => void perform(async () => { await api(`/jobs/${job.id}/cancel`, { method: 'POST' }); await refresh(projectId) })}><X size={19} /></IconButton> : <IconButton label="重新编辑需求" disabled={busy} onClick={() => { editDraft(job.prompt); setRatio(health?.agentConfigured ? '1:1' : job.ratio); setAttachments(assets.filter(asset => job.assetIds.includes(asset.id))); setView('chat') }}><RefreshCw size={18} /></IconButton>}</article>)}{jobs.filter(job => filter === 'all' || job.status === filter).length === 0 && <div className="empty">没有符合条件的任务</div>}</div>}</section>}
         </Modal>
       </div>}
     </main>
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
-    <Modal open={sidebarOpen} onOpenChange={setSidebarOpen} title="项目列表" className="project-drawer">{projectList}<div className="project-shortcuts"><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setView('images') }}><Images size={19} />素材库</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setFilter('all'); setView('tasks') }}><ListTodo size={19} />任务记录{waiting > 0 && <small>{waiting}</small>}</button><button className="service-entry" type="button" onClick={() => { setSidebarOpen(false); setStorageStatus('checking'); setServicesOpen(true) }}><Cpu size={19} />{health?.agentConfigured ? '服务状态' : '服务未接入'}</button></div></Modal>
+    <AvatarStudio key={projectId} projectId={projectId} open={avatarOpen} onOpenChange={setAvatarOpen} />
+    <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={() => { setGuidesOpen(false); setAvatarOpen(true) }}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
+    <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'}>
+      {guide && <form className="creation-brief" onSubmit={event => void prepareCreation(event)}>
+        {guide === 'edit' && <><label>项目原图<select aria-label="项目原图" value={sourceId} disabled={busy} onChange={event => { setSourceId(event.target.value); setSourceFile(null) }}><option value="">选择原图</option>{assets.filter(asset => (asset.mediaType ?? 'image') === 'image').map(asset => <option key={asset.id} value={asset.id}>{asset.name} · {asset.id.slice(0, 8)}</option>)}</select></label><label>上传原图<input key={sourceId} aria-label="上传原图" type="file" accept="image/png,image/jpeg,image/webp" disabled={busy} onChange={event => { setSourceFile(event.target.files?.[0] ?? null); setSourceId('') }} /></label>{sourceFile && <span className="brief-source">{sourceFile.name}</span>}{sourceId && <img className="brief-source-preview" src={`/api/assets/${sourceId}/content?thumbnail=1`} alt="已选原图" />}</>}
+        <label>{creationGuides[guide].subject}<textarea required aria-label={creationGuides[guide].subject} maxLength={1600} rows={3} placeholder={creationGuides[guide].placeholder} value={brief} disabled={busy} onChange={event => setBrief(event.target.value)} /></label>
+        <label>{creationGuides[guide].detail}<textarea aria-label={creationGuides[guide].detail} maxLength={1200} rows={2} value={briefDetail} disabled={busy} onChange={event => setBriefDetail(event.target.value)} /></label>
+        {guide === 'video' && <><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy} onChange={event => { const value = event.target.value as VideoModel; setVideoModel(value); localStorage.setItem('studio-video-model', value); submitRequest.current = null }}><option value="none">不启用</option><option value="minimax-h3" disabled={!health?.models?.videos.includes('minimax-h3')}>MiniMax H3{health?.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label><p className="muted" role="status">MiniMax H3 · {videoModel === 'none' ? '未启用' : health?.models?.videos.includes('minimax-h3') ? '已启用' : '服务未就绪'}</p></>}
+        <button type="submit" className="primary" disabled={busy || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}带入草稿</button>
+        {error && <p role="alert" className="form-error">{error}</p>}
+      </form>}
+    </Modal>
+    <Modal open={sidebarOpen} onOpenChange={setSidebarOpen} title="项目列表" className="project-drawer">{projectList}<div className="project-shortcuts"><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setView('images') }}><Images size={19} />素材库</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setAvatarOpen(true) }}><Film size={19} />数字人口播</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setFilter('all'); setView('tasks') }}><ListTodo size={19} />任务记录{waiting > 0 && <small>{waiting}</small>}</button><button className="service-entry" type="button" onClick={() => { setSidebarOpen(false); setStorageStatus('checking'); setServicesOpen(true) }}><Cpu size={19} />{health?.agentConfigured ? '服务状态' : '服务未接入'}</button></div></Modal>
     <Modal open={optionsOpen} onOpenChange={setOptionsOpen} title="设置">
       {user && <div className="account-settings"><span>{user.name}</span><small>{user.provider === 'entra' ? 'Microsoft Entra ID' : '本地账号'}</small><button type="button" onClick={() => void perform(async () => { await onLogout?.() })}>退出登录</button></div>}
       {user?.admin && <LocalAccounts />}

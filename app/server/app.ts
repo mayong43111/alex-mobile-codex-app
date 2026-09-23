@@ -15,6 +15,9 @@ import type { AssetStorage } from './assets.ts'
 import type { VmControl } from './vm.ts'
 import { registerAuth } from './auth.ts'
 import type { AuthOptions } from './auth.ts'
+import { AvatarJobs } from './avatar.ts'
+import { avatarInputSchema } from './avatar-provider.ts'
+import type { AvatarProvider } from './avatar-provider.ts'
 
 const titleSchema = z.object({ title: z.string().trim().min(1).max(80) }).strict()
 const submissionSchema = z.object({
@@ -23,7 +26,7 @@ const submissionSchema = z.object({
   ratio: z.enum(['1:1', '4:3', '3:4', '16:9']),
 }).strict()
 
-export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; auth?: AuthOptions; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl }) {
+export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; auth?: AuthOptions; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl; avatar?: AvatarProvider }) {
   await mkdir(join(options.dataDir, 'images'), { recursive: true, mode: 0o700 })
   const store = new Store(join(options.dataDir, 'studio.sqlite'), options.journalMode)
   const assetStorage = options.assetStorage ?? new LocalAssetStorage(options.dataDir)
@@ -55,6 +58,8 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
   const origins = new Set(options.origins ?? ['http://localhost:5173', 'http://127.0.0.1:5173'])
   const streams = new Set<() => void>()
   const worker = options.agent ? new AgentWorker(store, options.dataDir, options.agent, assetStorage, () => !options.vm?.busy) : undefined
+  const avatars = options.avatar ? new AvatarJobs(store, assetStorage, options.avatar) : undefined
+  avatars?.start()
   worker?.start()
   let vmCheck: Promise<unknown> | undefined
   const vmTimer = options.vm ? setInterval(() => {
@@ -79,7 +84,7 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     reply.code(status).send({ error: status === 500 ? 'Internal error' : error instanceof z.ZodError ? 'Invalid input' : failure.message })
   })
   app.addHook('preClose', async () => { for (const close of streams) close() })
-  app.addHook('onClose', async () => { clearInterval(vmTimer); await vmCheck; await worker?.close(); store.db.close() })
+  app.addHook('onClose', async () => { clearInterval(vmTimer); await vmCheck; await worker?.close(); await avatars?.close(); store.db.close() })
 
   const authentication = options.auth ? await registerAuth(app, store.db, options.auth) : undefined
   if (!authentication) app.get('/api/auth/session', async () => ({ enabled: false, user: null }))
@@ -102,6 +107,17 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
   })
 
   app.get('/healthz', async () => ({ status: 'ok' }))
+  app.get('/api/avatar', async () => ({ configured: !!avatars, provider: 'Azure Speech', maxCharacters: 500 }))
+  app.get<{ Params: { id: string } }>('/api/projects/:id/avatar-jobs', async request => {
+    store.project(request.params.id)
+    return avatars ? avatars.list(request.params.id) : []
+  })
+  app.post<{ Params: { id: string } }>('/api/projects/:id/avatar-jobs', async (request, reply) => {
+    if (!avatars) throw new HttpError(503, '数字人服务未配置')
+    const input = avatarInputSchema.extend({ confirmed: z.literal(true) }).parse(request.body)
+    const { confirmed: _confirmed, ...narration } = input
+    return reply.code(202).send(avatars.submit(request.params.id, narration))
+  })
   app.get('/api/vm', async () => options.vm ? options.vm.status() : { configured: false })
   app.post('/api/vm/actions', async (request, reply) => {
     if (!options.vm) throw new HttpError(503, 'VM 管理未配置。')

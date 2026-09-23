@@ -34,6 +34,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS sessions (project_id TEXT PRIMARY KEY REFERENCES projects(id), thread_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS message_resends (project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL, input_hash TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(project_id, request_id));
       CREATE TABLE IF NOT EXISTS asset_cleanup (name TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS avatar_jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, request_id TEXT NOT NULL, input_hash TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(project_id, request_id));
     `)
   }
 
@@ -89,6 +90,7 @@ export class Store {
       const snapshot = this.snapshot(id)
       if (snapshot.project.updatedAt !== expectedUpdatedAt) throw new HttpError(409, '项目已更新，请重新确认删除。')
       if (snapshot.runs.some(run => ['queued', 'running'].includes(run.status))) throw new HttpError(409, '请先停止并等待项目任务结束。')
+      if (this.db.prepare("SELECT 1 FROM avatar_jobs WHERE project_id = ? AND json_extract(data, '$.status') IN ('submitting','running','unknown')").get(id)) throw new HttpError(409, '数字人任务尚未结束，请先等待或核查原任务。')
       for (const asset of snapshot.assets) {
         for (const extension of [assetExtension(asset), ...(assetHasThumbnail(asset) ? ['webp'] : [])]) this.db.prepare('INSERT OR IGNORE INTO asset_cleanup VALUES (?)').run(`${asset.id}.${extension}`)
       }

@@ -4,8 +4,11 @@ import { loadAgentTransport } from './agent.ts'
 import { BlobAssetStorage } from './assets.ts'
 import { loadVmController } from './vm.ts'
 import type { AuthOptions } from './auth.ts'
+import { AzureCliCredential, ManagedIdentityCredential } from '@azure/identity'
+import { createAvatarProvider } from './avatar-provider.ts'
 
 const cloud = process.env.HOSTING_MODE === 'appservice'
+const avatarCredential = process.env.SPEECH_AVATAR_ENDPOINT ? cloud ? new ManagedIdentityCredential() : new AzureCliCredential() : undefined
 const dataDir = resolve(process.env.DATA_DIR ?? '.data')
 if (cloud && (!process.env.AZURE_STORAGE_BLOB_ENDPOINT || !process.env.AZURE_STORAGE_CONTAINER)) throw new Error('Cloud Blob storage configuration missing')
 if (cloud && (!process.env.WEBSITE_HOSTNAME || !process.env.ENTRA_TENANT_ID || !process.env.ENTRA_ALLOWED_USER_IDS || !process.env.ENTRA_CLIENT_ID || !process.env.ENTRA_CLIENT_SECRET)) throw new Error('Cloud application authentication missing')
@@ -15,6 +18,11 @@ const auth: AuthOptions | undefined = cloud ? {
 } : process.env.AUTH_ORIGIN ? { origin: process.env.AUTH_ORIGIN } : undefined
 const app = await buildApp({
   dataDir,
+  avatar: process.env.SPEECH_AVATAR_ENDPOINT ? createAvatarProvider(process.env.SPEECH_AVATAR_ENDPOINT, async () => {
+    const token = await avatarCredential!.getToken('https://cognitiveservices.azure.com/.default')
+    if (!token) throw new Error('Speech authentication unavailable')
+    return { Authorization: `Bearer ${token.token}` }
+  }) : undefined,
   vm: process.env.DATA_DIR && !process.env.VM_CONFIG ? undefined : await loadVmController(resolve(process.env.VM_CONFIG ?? '../.local/vm.json'), resolve(dataDir, 'vm-operation.json')),
   origins: process.env.APP_ORIGINS?.split(','),
   auth,
