@@ -7,12 +7,14 @@ RUN npm run build
 
 FROM node:22.23.2-bookworm-slim AS runtime
 ARG OPENMONTAGE_REV=08e2151fa02de28a5d6a312b3d575692bf147ad7
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/calesthio/OpenMontage.git /opt/openmontage \
     && cd /opt/openmontage && git checkout "$OPENMONTAGE_REV" \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir pyyaml==6.0.3 pydantic==2.12.5 jsonschema==4.26.0 python-dotenv==1.2.2 Pillow==12.1.1 requests==2.32.5 av==18.1.0
+COPY runtime/configure-openmontage.py /tmp/configure-openmontage.py
+RUN /opt/venv/bin/python /tmp/configure-openmontage.py /opt/openmontage/tools/audio/azure_tts.py && rm /tmp/configure-openmontage.py
 WORKDIR /opt/studio
 COPY app/package.json app/package-lock.json ./
 RUN npm ci --omit=dev && npm install --global @openai/codex@0.155.1

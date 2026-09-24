@@ -2,7 +2,7 @@ import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { ManagedIdentityCredential } from '@azure/identity'
 import { z } from 'zod'
 import { HttpError } from './store.ts'
@@ -67,7 +67,9 @@ export class VmController implements VmControl {
 
   private async instanceView() {
     const response = await this.request(`${this.base}/instanceView?api-version=2024-07-01`)
-    if (!response.ok) throw new HttpError(503, '无法读取 VM 状态，请检查 Azure 权限或连接。')
+    if (response.status === 404) throw new HttpError(503, `VM ${this.config.name} 不存在，请检查订阅、资源组和实例名称。`)
+    if (response.status === 403) throw new HttpError(503, `没有读取 VM ${this.config.name} 的 Azure 权限。`)
+    if (!response.ok) throw new HttpError(503, `无法读取 VM ${this.config.name} 状态，请检查 Azure 连接。`)
     const data = await response.json() as { statuses?: { code?: string; time?: string; message?: string }[] }
     return { powerState: data.statuses?.find(entry => entry.code?.startsWith('PowerState/'))?.code?.slice(11) ?? 'unknown', provisioning: data.statuses?.find(entry => entry.code?.startsWith('ProvisioningState/')) }
   }
@@ -104,7 +106,7 @@ export class VmController implements VmControl {
     }
     let gpuReady = false
     if (powerState === 'running') {
-      try { gpuReady = (await this.gpuFetch(`${this.config.comfyUrl.replace(/\/$/, '')}/system_stats`, { signal: AbortSignal.timeout(3000) })).ok } catch { gpuReady = false }
+      try { gpuReady = (await this.gpuFetch(`${this.config.comfyUrl.replace(/\/$/, '')}/system_stats`, { signal: AbortSignal.timeout(3000), redirect: 'error' })).ok } catch { gpuReady = false }
     }
     const operation = this.operation ? { id: this.operation.id, action: this.operation.action, status: this.operation.status, createdAt: this.operation.createdAt, error: this.operation.error } : undefined
     return { configured: true, name: this.config.name, powerState, gpuReady, operation }
@@ -126,7 +128,7 @@ export class VmController implements VmControl {
       if (action !== 'start') {
         let queue: { queue_running?: unknown[]; queue_pending?: unknown[] } | undefined
         try {
-          const response = await this.gpuFetch(`${this.config.comfyUrl.replace(/\/$/, '')}/queue`, { signal: AbortSignal.timeout(5000) })
+          const response = await this.gpuFetch(`${this.config.comfyUrl.replace(/\/$/, '')}/queue`, { signal: AbortSignal.timeout(5000), redirect: 'error' })
           if (response.ok) queue = await response.json()
         } catch { queue = undefined }
         if (queue?.queue_running?.length || queue?.queue_pending?.length) throw new HttpError(409, 'GPU 有运行或排队任务，不能关闭或重启。')
@@ -169,6 +171,10 @@ export async function loadVmController(file: string, stateFile: string): Promise
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw new Error('Invalid VM configuration')
   }
+  return createVmController(config, stateFile)
+}
+
+async function createVmController(config: z.infer<typeof configSchema>, stateFile: string): Promise<VmController> {
   let cached: { token: string; expires: number } | undefined
   const credential = config.auth === 'managed-identity' ? new ManagedIdentityCredential() : undefined
   const controller = new VmController(config, stateFile, async (url, method = 'GET') => {
@@ -186,4 +192,120 @@ export async function loadVmController(file: string, stateFile: string): Promise
   })
   await controller.initialize()
   return controller
+}
+
+export const vmProfileInputSchema = configSchema.pick({ subscription: true, resourceGroup: true, name: true, comfyUrl: true }).extend({
+  label: z.string().trim().min(1).max(80),
+  comfyUrl: z.url().refine(value => {
+    let url: URL
+    try { url = new URL(value) } catch { return false }
+    const parts = url.hostname.split('.').map(Number)
+    const privateAddress = parts.length === 4 && parts.every(part => Number.isInteger(part) && part >= 0 && part <= 255) && (parts[0] === 10 || parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31 || parts[0] === 192 && parts[1] === 168)
+    return ['http:', 'https:'].includes(url.protocol) && privateAddress && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/'
+  }, 'ComfyUI 地址必须是私网 IPv4 HTTP(S) 地址，不含路径、凭据或查询参数。'),
+}).strict()
+export type VmProfileInput = z.infer<typeof vmProfileInputSchema>
+export type VmProfile = VmProfileInput & { id: string }
+const savedProfileSchema = configSchema.extend({ id: z.string().uuid(), label: z.string().trim().min(1).max(80) }).strict()
+const catalogSchema = z.object({ version: z.literal(1), revision: z.string().uuid(), profiles: z.array(savedProfileSchema).max(20) }).strict()
+type Catalog = z.infer<typeof catalogSchema>
+type ControllerFactory = (config: z.infer<typeof configSchema>, stateFile: string) => Promise<VmControl>
+export type VmProfiles = { revision: string; profiles: VmProfile[]; canManage: boolean }
+
+export class VmRegistry implements VmControl {
+  private catalog: Catalog = { version: 1, revision: randomUUID(), profiles: [] }
+  private controllers = new Map<string, VmControl>()
+  private mutating = false
+  private file: string
+  private stateFile: string
+  private auth: 'cli' | 'managed-identity'
+  private factory: ControllerFactory
+
+  constructor(file: string, stateFile: string, auth: 'cli' | 'managed-identity', factory: ControllerFactory = createVmController) {
+    this.file = file
+    this.stateFile = stateFile
+    this.auth = auth
+    this.factory = factory
+  }
+
+  private identity(profile: Pick<VmProfileInput, 'subscription' | 'resourceGroup' | 'name'>) {
+    return `${profile.subscription}/${profile.resourceGroup}/${profile.name}`.toLowerCase()
+  }
+
+  private operationFile(profile: z.infer<typeof configSchema>) {
+    return `${this.stateFile}.${createHash('sha256').update(this.identity(profile)).digest('hex')}.json`
+  }
+
+  async initialize() {
+    let source: unknown
+    try { source = JSON.parse(await readFile(this.file, 'utf8')) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw new Error('Invalid VM configuration') }
+    const legacy = configSchema.safeParse(source)
+    if (legacy.success) {
+      const profile = { ...legacy.data, id: randomUUID(), label: legacy.data.name }
+      this.catalog.profiles = [profile]
+      try {
+        const state = await readFile(this.stateFile, 'utf8')
+        await writeFile(this.operationFile(profile), state, { mode: 0o600, flag: 'wx' })
+      } catch (error) { if (!['ENOENT', 'EEXIST'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error }
+    } else this.catalog = catalogSchema.parse(source)
+    const identities = this.catalog.profiles.map(profile => this.identity(profile))
+    if (new Set(identities).size !== identities.length || new Set(this.catalog.profiles.map(profile => profile.id)).size !== identities.length) throw new Error('Duplicate VM configuration')
+    for (const profile of this.catalog.profiles) this.controllers.set(profile.id, await this.factory(configSchema.strip().parse(profile), this.operationFile(profile)))
+    if (legacy.success) await this.persist(this.catalog)
+  }
+
+  get busy() { return this.mutating || [...this.controllers.values()].some(controller => controller.busy) }
+
+  profiles(): Omit<VmProfiles, 'canManage'> {
+    return { revision: this.catalog.revision, profiles: this.catalog.profiles.map(({ id, label, subscription, resourceGroup, name, comfyUrl }) => ({ id, label, subscription, resourceGroup, name, comfyUrl })) }
+  }
+
+  private controller(id?: string) {
+    if (this.mutating) throw new HttpError(409, 'VM 配置正在保存，请稍后重试。')
+    const controller = this.controllers.get(id ?? this.catalog.profiles[0]?.id)
+    if (!controller) throw new HttpError(404, 'VM 配置不存在。')
+    return controller
+  }
+
+  async status(id?: string): Promise<VmStatus> {
+    if (!id && !this.catalog.profiles.length) return { configured: false }
+    return this.controller(id).status()
+  }
+
+  async refreshPending() {
+    await Promise.allSettled([...this.controllers.values()].filter(controller => controller.busy).map(controller => controller.status()))
+  }
+
+  async act(action: VmAction, id: string, confirmedName: string, force: boolean, profileId?: string, revision?: string) {
+    if (!profileId || revision !== this.catalog.revision) throw new HttpError(409, 'VM 配置已更新，请刷新后重新确认。')
+    return this.controller(profileId).act(action, id, confirmedName, force)
+  }
+
+  private async persist(catalog: Catalog) {
+    await mkdir(dirname(this.file), { recursive: true })
+    const temporary = `${this.file}.${randomUUID()}.tmp`
+    await writeFile(temporary, JSON.stringify(catalog, null, 2), { mode: 0o600, flag: 'wx' })
+    await rename(temporary, this.file)
+  }
+
+  async saveProfile(input: VmProfileInput, revision: string, id?: string) {
+    const parsed = vmProfileInputSchema.parse(input)
+    if (this.busy) throw new HttpError(409, 'VM 操作尚未结束，不能修改配置。')
+    if (revision !== this.catalog.revision) throw new HttpError(409, 'VM 配置已更新，请刷新后重试。')
+    const existing = id ? this.catalog.profiles.find(profile => profile.id === id) : undefined
+    if (id && !existing) throw new HttpError(404, 'VM 配置不存在。')
+    if (!existing && this.catalog.profiles.length >= 20) throw new HttpError(400, '最多保存 20 台 VM 配置。')
+    if (this.catalog.profiles.some(profile => profile.id !== id && this.identity(profile) === this.identity(parsed))) throw new HttpError(409, '此 VM 已有配置。')
+    this.mutating = true
+    try {
+      const profile = { ...parsed, id: id ?? randomUUID(), auth: existing?.auth ?? this.auth, ...(existing?.cliPath ? { cliPath: existing.cliPath } : {}) }
+      const controller = await this.factory(configSchema.strip().parse(profile), this.operationFile(profile))
+      const catalog: Catalog = { version: 1, revision: randomUUID(), profiles: existing ? this.catalog.profiles.map(item => item.id === id ? profile : item) : [...this.catalog.profiles, profile] }
+      await this.persist(catalog)
+      this.catalog = catalog
+      this.controllers.set(profile.id, controller)
+      return this.profiles()
+    } finally { this.mutating = false }
+  }
 }

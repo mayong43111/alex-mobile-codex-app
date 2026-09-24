@@ -3,6 +3,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+from fractions import Fraction
 from pathlib import Path
 import time
 from uuid import UUID
@@ -12,6 +14,7 @@ from PIL import Image
 from tools.base_tool import BaseTool, ToolResult, ToolTier, ToolRuntime
 from tools._comfyui.client import ComfyUIClient
 from lib.checkpoint import write_checkpoint
+from tools.video.video_stitch import VideoStitch
 
 MODELS = {
     'qwen-image-2.1': ['qwen_image_2.1_bf16.safetensors', 'qwen3vl_8b_bf16.safetensors', 'qwen_image_2.1_vae_bf16.safetensors'],
@@ -202,9 +205,53 @@ class ComfyMedia(BaseTool):
             return ToolResult(success=False, error=f'ComfyUI task unavailable or unverified; no automatic retry. Prompt: {prompt_id or "not confirmed"}; inspect persisted job before retrying.')
 
 
+def stitch_story(inputs):
+    run_id = str(UUID(inputs['runId']))
+    clip_ids = [str(UUID(value)) for value in inputs['clipIds']]
+    if not 2 <= len(clip_ids) <= 12 or len(set(clip_ids)) != len(clip_ids) or run_id in clip_ids:
+        raise ValueError('Invalid story clips')
+    run = json.loads((Path('/state/runs') / f'{run_id}.json').read_text())
+    if run['story']['clipIds'] != clip_ids or [clip['assetId'] for clip in run['processedVideos']] != clip_ids:
+        raise ValueError('Story clip ownership or order mismatch')
+    root = Path('/state/montage')
+    clips = []
+    for clip_id in clip_ids:
+        directory = root / clip_id
+        ledger = json.loads((directory / 'comfy-job.json').read_text())
+        clip = directory / 'video.mp4'
+        if ledger.get('run_id') != clip_id or ledger.get('model') != 'minimax-h3' or ledger.get('status') != 'completed' or clip.is_symlink() or not clip.is_file():
+            raise ValueError('Story clip is not a completed native output')
+        clips.append(str(clip))
+    project = root / run_id
+    project.mkdir(parents=True, exist_ok=True)
+    destination = project / 'video.mp4'
+    with (project / 'story-stitch.json').open('x') as ledger:
+        json.dump({'clip_ids': clip_ids, 'status': 'started'}, ledger)
+    native = VideoStitch()
+    assembled = project / 'assembled.mp4'
+    result = native.execute({'operation': 'stitch', 'clips': clips, 'output_path': str(assembled), 'transition': 'cut', 'auto_normalize': False, 'codec': 'libx264'})
+    if not result.success:
+        raise RuntimeError(f'OpenMontage story stitch failed: {result.error}')
+    native._normalize_clip(str(assembled), destination, inputs['width'], inputs['height'], 24, 'libx264', 'aac', 23, 'medium')
+    probe = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(destination)], check=True, capture_output=True, text=True, timeout=30).stdout)
+    videos = [stream for stream in probe['streams'] if stream['codec_type'] == 'video']
+    audios = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
+    duration = float(probe['format']['duration'])
+    expected = sum(clip['duration'] for clip in run['processedVideos'])
+    if len(videos) != 1 or len(audios) != 1 or videos[0]['codec_name'] != 'h264' or audios[0]['codec_name'] != 'aac' or audios[0]['channels'] != 2 or Fraction(videos[0]['avg_frame_rate']) != 24:
+        raise ValueError(f"Invalid story streams: {[(stream.get('codec_name'), stream.get('avg_frame_rate'), stream.get('r_frame_rate'), stream.get('channels')) for stream in probe['streams']]}")
+    if (videos[0]['width'], videos[0]['height']) != (inputs['width'], inputs['height']) or not 0 < duration <= 90 or abs(duration - expected) > 0.5 or destination.stat().st_size > 48 * 1024**2:
+        raise ValueError('Invalid story dimensions, duration or size')
+    write_checkpoint(root, run_id, 'assets', 'completed', {'asset_manifest': {'version': '1.0', 'assets': [{'id': run_id, 'type': 'video', 'path': 'video.mp4', 'source_tool': 'video_stitch', 'scene_id': 'story', 'model': 'minimax-h3', 'provider': 'comfyui', 'resolution': f"{inputs['width']}x{inputs['height']}", 'format': 'mp4', 'prompt': run['story']['title']}], 'metadata': {'clip_ids': clip_ids}}})
+    return {'success': True, 'mp4': base64.b64encode(destination.read_bytes()).decode(), 'thumbnail': run['processedVideos'][0]['thumbnail'], 'width': inputs['width'], 'height': inputs['height'], 'duration': duration, 'fps': 24, 'model': 'minimax-h3', 'provider': 'comfyui', 'checkpoint': f'{run_id}/checkpoint_assets.json'}
+
+
 def main():
     import sys
     request = json.load(sys.stdin)
+    if request.get('operation') == 'stitch-story':
+        print(json.dumps(stitch_story(request)))
+        return
     result = ComfyMedia().execute(request)
     print(json.dumps({'success': result.success, **(result.data or {}), 'model': result.model, **({'error': result.error} if not result.success else {})}))
 

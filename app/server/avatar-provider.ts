@@ -1,4 +1,10 @@
 import { z } from 'zod'
+import type { NarrationProgress } from '../src/domain.ts'
+
+export const narrationSegmentsSchema = z.array(z.object({ text: z.string().trim().min(1).max(100), continueFromPrevious: z.boolean() }).strict()).min(1).max(12)
+  .refine(segments => !segments[0].continueFromPrevious && segments.reduce((count, segment) => count + segment.text.length, 0) <= 500)
+export const narrationPlanSchema = z.object({ voice: z.enum(['zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural']), segments: narrationSegmentsSchema }).strict()
+export type NarrationPlan = z.infer<typeof narrationPlanSchema>
 
 export const avatarInputSchema = z.object({
   requestId: z.string().uuid(),
@@ -6,16 +12,22 @@ export const avatarInputSchema = z.object({
   voice: z.enum(['zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural']),
   character: z.literal('lisa'),
   style: z.enum(['casual-sitting', 'graceful-sitting']),
+  sourceAssetId: z.string().uuid().optional(),
+  segments: narrationSegmentsSchema.optional(),
 }).strict()
 export type AvatarInput = z.infer<typeof avatarInputSchema>
-export type AvatarStatus = { status: 'NotStarted' | 'Running' | 'Succeeded' | 'Failed'; result?: string; durationMs?: number }
+export type AvatarStatus = { status: 'NotStarted' | 'Running' | 'Succeeded' | 'Failed' | 'Cancelled'; result?: string; durationMs?: number; progress?: NarrationProgress }
 export type AvatarProvider = {
-  submit(id: string, input: AvatarInput): Promise<void>
+  submit(id: string, input: AvatarInput, source?: Buffer, onProgress?: (progress: NarrationProgress) => void): Promise<void>
+  stop?(id: string): Promise<void>
   status(id: string): Promise<AvatarStatus>
   download(url: string): Promise<Buffer>
+  artifacts?(id: string): Promise<AvatarArtifact[]>
 }
+export type AvatarArtifact = { id: string; hash: string; sourceAssetId: string; sourceHash: string; name: string; mediaType: 'image' | 'video'; bytes: Buffer; text?: string; seconds?: number }
 
 export class AvatarSubmissionRejected extends Error {}
+export class AvatarSubmissionStopped extends Error {}
 
 export function createAvatarProvider(endpoint: string, headers: () => Promise<Record<string, string>>, request: typeof fetch = fetch): AvatarProvider {
   const base = new URL(endpoint)
@@ -27,6 +39,7 @@ export function createAvatarProvider(endpoint: string, headers: () => Promise<Re
   return {
     async submit(id, input) {
       const checked = avatarInputSchema.parse(input)
+      if (checked.sourceAssetId || checked.segments) throw new AvatarSubmissionRejected('Preset avatar cannot use a source image or sequence')
       const authorization = await headers().catch(() => { throw new AvatarSubmissionRejected('Speech authentication unavailable') })
       const response = await request(jobUrl(id), { method: 'PUT', redirect: 'error', signal: AbortSignal.timeout(30000), headers: { ...authorization, 'Content-Type': 'application/json' }, body: JSON.stringify({
         inputKind: 'PlainText', synthesisConfig: { voice: checked.voice }, inputs: [{ content: checked.text }],

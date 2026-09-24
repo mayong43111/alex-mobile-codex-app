@@ -2,6 +2,8 @@ import { test, expect } from '@playwright/test'
 import type { Page } from '@playwright/test'
 import { resolve } from 'node:path'
 import sharp from 'sharp'
+import { randomUUID } from 'node:crypto'
+import type { VmProfiles } from '../server/vm.ts'
 
 async function mockFileSharing(page: Page) {
   await page.addInitScript(() => {
@@ -262,15 +264,11 @@ test('all modal layouts keep headers, fields and actions inside the mobile viewp
   await page.getByRole('button', { name: '服务未接入', exact: true }).click()
   await inspect('services')
   await close()
-  for (const [title, name] of [['做图片', 'image'], ['修改图片', 'edit'], ['做短镜头', 'video'], ['写脚本分镜', 'script'], ['数字人口播', 'avatar']]) {
+  for (const [title, name] of [['做图片', 'image'], ['修改图片', 'edit'], ['做短镜头', 'video'], ['写脚本分镜', 'script']]) {
     await page.getByRole('button', { name: '创作引导', exact: true }).click()
     await inspect('guides')
     await page.getByRole('dialog').getByRole('button', { name: title, exact: true }).click()
     await inspect(name)
-    if (name === 'avatar') {
-      const button = await page.getByRole('button', { name: '制作短片' }).boundingBox()
-      expect(button!.y + button!.height).toBeLessThanOrEqual(page.viewportSize()!.height)
-    }
     await close()
   }
 })
@@ -313,9 +311,7 @@ test('creation guide creates a project only on confirmation and stays accessible
   await trigger.click()
   await guideMenu.getByRole('button', { name: '数字人口播', exact: true }).click()
   await expect(guideMenu).toHaveCount(0)
-  await expect(page.getByRole('dialog')).toHaveCount(1)
-  await expect(page.getByRole('dialog', { name: '数字人口播', exact: true })).toBeVisible()
-  await page.getByRole('button', { name: '关闭', exact: true }).click()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
   await expect(page.getByLabel('创作需求')).toHaveValue('新草稿保持不变')
   await trigger.click()
   await guideMenu.getByRole('button', { name: '做图片', exact: true }).click()
@@ -403,66 +399,195 @@ test('image editing entry requires an explicit source and preserves existing att
   expect((await (await request.get(`/api/projects/${project.id}`)).json()).messages).toHaveLength(0)
 })
 
-test('avatar narration requires consent, preserves literal text and recovers tasks on reopen', async ({ page, request }, testInfo) => {
+test('conversational avatar submits literal narration through chat and restores final and intermediate assets', async ({ page, request }, testInfo) => {
+  await mockFileSharing(page)
   const project = await (await request.post('/api/projects', { data: { title: '数字人口播测试' } })).json()
+  const buffer = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#197d65' } }).png().toBuffer()
+  const source = await (await request.post(`/api/projects/${project.id}/uploads`, { multipart: { file: { name: 'host.png', mimeType: 'image/png', buffer } } })).json()
+  const snapshot = await (await request.get(`/api/projects/${project.id}`)).json()
+  const now = new Date().toISOString()
+  const finalId = crypto.randomUUID(), clipId = crypto.randomUUID(), tailId = crypto.randomUUID(), messageId = crypto.randomUUID(), assistantId = crypto.randomUUID()
+  const text = '使用所附主播图制作完整口播，逐字文案：大家好。<break/> 保留原文。使用晓晓，并保存分段和尾帧。'
   let submissions = 0
-  let result: Record<string, unknown> | undefined
+  let legacySubmissions = 0
   await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
-  await page.route('**/api/avatar', route => route.fulfill({ json: { configured: true } }))
-  await page.route(`**/api/projects/${project.id}/avatar-jobs`, route => {
-    if (route.request().method() === 'POST') {
-      const body = route.request().postDataJSON()
-      expect(body.confirmed).toBe(true)
-      expect(body.text).toBe('大家好，欢迎收看。<break/> 保留原文。')
-      expect(body.voice).toBe('zh-CN-YunxiNeural')
-      expect(body.style).toBe('graceful-sitting')
-      submissions++
-      result = { id: body.requestId, projectId: project.id, text: body.text, status: 'unknown', createdAt: new Date().toISOString(), error: '提交结果待核实，系统不会自动重新生成。' }
-      return route.fulfill({ status: 202, json: result })
-    }
-    return route.fulfill({ json: result ? [result] : [] })
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2' } }))
+  await page.route(`**/api/projects/${project.id}/avatar-jobs`, route => { legacySubmissions++; return route.abort() })
+  await page.route(`**/api/projects/${project.id}/chat`, route => {
+    const body = route.request().postDataJSON()
+    expect(body.text).toBe(text)
+    expect(body.assetIds).toEqual([source.id])
+    submissions++
+    return route.fulfill({ status: 202, json: { id: finalId } })
   })
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: submissions ? {
+    ...snapshot,
+    runs: [{ id: finalId, projectId: project.id, messageId, assistantId, avatarJobId: finalId, assetId: finalId, processedAssetIds: [clipId, tailId], status: 'completed', stage: 'video', createdAt: now, input: { text, mode: 'auto', ratio: '16:9' } }],
+    messages: [{ id: messageId, projectId: project.id, role: 'user', text, assetIds: [source.id], createdAt: now }, { id: assistantId, projectId: project.id, role: 'assistant', text: '完整口播已完成。', assetIds: [clipId, tailId, finalId], createdAt: now }],
+    assets: [...snapshot.assets, ...[{ id: finalId, name: '完整口播.mp4', mediaType: 'video' }, { id: clipId, name: '口播第01段.mp4', mediaType: 'video' }, { id: tailId, sourceAssetId: clipId, name: '第01段尾帧.png', mediaType: 'image' }].map(asset => ({ ...asset, projectId: project.id, kind: 'generated', model: 'sadtalker', provider: 'openmontage', width: 64, height: 64, duration: 3.52, bytes: 100, createdAt: now }))],
+  } : snapshot }))
+  for (const id of [finalId, clipId, tailId]) await page.route(`**/api/assets/${id}/content*`, route => route.fulfill(route.request().url().includes('thumbnail=1') || id === tailId ? { body: buffer, contentType: 'image/png' } : { body: Buffer.from('video-share-fixture'), contentType: 'video/mp4' }))
   await page.goto('/')
   await page.getByRole('button', { name: '数字人口播', exact: true }).click()
-  const panel = page.getByRole('dialog', { name: '数字人口播', exact: true })
-  const submit = panel.getByRole('button', { name: '制作短片' })
-  await panel.getByRole('textbox', { name: '播报文案' }).fill('大家好，欢迎收看。<break/> 保留原文。')
-  await panel.getByRole('combobox', { name: '播报声音' }).selectOption('zh-CN-YunxiNeural')
-  await panel.getByRole('combobox', { name: '数字人形象' }).selectOption('graceful-sitting')
-  await expect(submit).toBeDisabled()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect(page.getByRole('textbox', { name: '创作需求' })).toHaveValue(/先确认文案/)
   expect(submissions).toBe(0)
-  await panel.getByRole('checkbox').check()
-  await expect(submit).toBeEnabled()
-  await page.screenshot({ path: testInfo.outputPath('avatar-form.png') })
-  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
-  await submit.click()
-  await expect(panel.getByText('提交待核实', { exact: true })).toBeVisible()
-  await expect(submit).toBeDisabled()
-  await panel.getByRole('button', { name: '关闭', exact: true }).click()
-  await page.getByRole('button', { name: '项目列表', exact: true }).click()
-  await page.getByRole('button', { name: '数字人口播', exact: true }).click()
-  await expect(panel.getByText('提交待核实', { exact: true })).toBeVisible()
-  await expect(panel.getByRole('textbox', { name: '播报文案' })).toHaveValue('大家好，欢迎收看。<break/> 保留原文。')
-  expect(submissions).toBe(1)
+  await openProjectPanel(page, '素材库')
+  await page.locator('.asset').click()
+  await page.getByRole('button', { name: '用作参考', exact: true }).click()
+  await page.getByRole('textbox', { name: '创作需求' }).fill(text)
+  await page.getByRole('button', { name: '提交需求', exact: true }).click()
+  await expect(page.getByLabel('完整口播.mp4', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('口播第01段.mp4', { exact: true })).toBeVisible()
+  await expect(page.getByText('MiniMax H3', { exact: true })).toHaveCount(0)
+  await page.locator('.video-result').filter({ has: page.getByLabel('完整口播.mp4', { exact: true }) }).getByRole('button', { name: '转发', exact: true }).click()
+  await page.getByRole('button', { name: '选择转发应用', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toMatchObject({ files: [{ name: '完整口播.mp4', type: 'video/mp4' }], activated: true })
+  await page.getByText('第 1 段尾帧', { exact: true }).click()
+  await expect(page.getByLabel('口播第01段.mp4', { exact: true })).toBeVisible()
+  await expect(page.getByRole('img', { name: '第01段尾帧.png', exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('avatar-conversation.png') })
   await page.reload()
-  await page.getByRole('button', { name: '数字人口播', exact: true }).click()
-  await expect(panel.getByText('提交待核实', { exact: true })).toBeVisible()
-  await expect(submit).toBeDisabled()
-  await panel.locator('.avatar-job-id').scrollIntoViewIfNeeded()
-  await page.screenshot({ path: testInfo.outputPath('avatar-unknown.png') })
-  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+  await expect(page.getByLabel('完整口播.mp4', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('口播第01段.mp4', { exact: true })).toBeVisible()
   expect(submissions).toBe(1)
+  expect(legacySubmissions).toBe(0)
 })
 
-test('avatar entry stays disabled for generation when the service is not configured', async ({ page, request }) => {
+for (const outcome of ['cancelled', 'completed'] as const) test(`narration progressively updates the conversation and project through ${outcome}`, async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: `分段进度-${outcome}` } })).json()
+  const now = new Date().toISOString()
+  const runId = crypto.randomUUID(), messageId = crypto.randomUUID(), assistantId = crypto.randomUUID(), scriptId = crypto.randomUUID()
+  const clipIds = [crypto.randomUUID(), crypto.randomUUID()], tailIds = [crypto.randomUUID(), crypto.randomUUID()]
+  const segments = [{ text: '先看合同主体与岗位。', continueFromPrevious: false }, { text: '再看工资与工时。', continueFromPrevious: true }]
+  const image = await sharp({ create: { width: 160, height: 90, channels: 3, background: '#197d65' } }).png().toBuffer()
+  let phase = 'script', status = 'running', segment = 0, clipCount = 0, stopRequested = false, stopCalls = 0, revision = 0
+  const script = { id: scriptId, projectId: project.id, name: '口播分段剧本.md', mediaType: 'file', mimeType: 'text/markdown', hasThumbnail: false, kind: 'generated', bytes: 80, width: 0, height: 0, createdAt: now }
+  const media = clipIds.flatMap((id, index) => [{ id, name: `第${index + 1}段.mp4`, mediaType: 'video', narration: segments[index].text }, { id: tailIds[index], sourceAssetId: id, name: `第${index + 1}段尾帧.png`, mediaType: 'image' }]).map(asset => ({ ...asset, projectId: project.id, kind: 'generated', model: 'sadtalker', width: 160, height: 90, bytes: 100, duration: 3.5, createdAt: now }))
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured' } }))
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: {
+    project, threadId: null, jobs: [],
+    messages: [{ id: messageId, projectId: project.id, text: '按确认的两段剧本制作口播', role: 'user', assetIds: [], createdAt: now }, { id: assistantId, projectId: project.id, text: '剧本已保存。', role: 'assistant', assetIds: [scriptId, ...media.slice(0, clipCount * 2).map(asset => asset.id)], createdAt: now }],
+    runs: [{ id: runId, projectId: project.id, messageId, assistantId, avatarJobId: runId, status, stage: 'video', createdAt: now, input: { text: '制作口播', mode: 'auto', ratio: '16:9' }, processedAssetIds: media.slice(0, clipCount * 2).map(asset => asset.id), assetId: status === 'completed' ? runId : undefined, narration: { segments, scriptAssetId: scriptId, stopRequested, progress: { phase, segment, updatedAt: now } } }],
+    assets: [script, ...media.slice(0, clipCount * 2), ...(status === 'completed' ? [{ ...media[0], id: runId, name: '完整口播.mp4' }] : [])],
+  } }))
+  for (const id of [...clipIds, ...tailIds, runId]) await page.route(`**/api/assets/${id}/content*`, route => route.fulfill(route.request().url().includes('thumbnail=1') || tailIds.includes(id) ? { body: image, contentType: 'image/png' } : { body: Buffer.from('video-fixture'), contentType: 'video/mp4' }))
+  await page.route(`**/api/assets/${scriptId}/content*`, route => route.fulfill({ body: '# 分段剧本', contentType: 'text/markdown' }))
+  await page.route(`**/api/agent-runs/${runId}/stop`, route => { stopCalls++; stopRequested = true; return route.fulfill({ json: { status: 'running' } }) })
+  const sync = async () => { await request.patch(`/api/projects/${project.id}`, { data: { title: `进度-${outcome}-${++revision}` } }) }
+  await page.goto('/')
+  const progress = page.getByRole('status', { name: '口播制作进度' })
+  await expect(progress).toContainText('分段剧本已保存')
+  await expect(page.getByText(segments[0].text, { exact: true })).toBeVisible()
+  await expect(page.getByRole('link', { name: '下载分段剧本' })).toHaveAttribute('href', `/api/assets/${scriptId}/content?download=1`)
+  await expect(page.locator('.run-progress')).not.toHaveAttribute('open')
+  phase = 'speech'; segment = 1
+  await sync()
+  await expect(progress).toContainText('第 1 段配音中')
+  phase = 'rendering'; segment = 2; clipCount = 1
+  await sync()
+  await expect(progress).toContainText('第 2 段视频生成中')
+  await expect(page.getByLabel('第1段.mp4', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('完整口播.mp4', { exact: true })).toHaveCount(0)
+  await progress.scrollIntoViewIfNeeded()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && [...document.querySelectorAll('.narration-timeline video, .narration-heading')].every(element => element.getBoundingClientRect().right <= innerWidth))).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('narration-first-clip.png') })
+  if (outcome === 'cancelled') {
+    await page.getByRole('button', { name: '停止当前回复' }).click()
+    await expect(progress).toContainText('正在停止后续步骤')
+    await expect(page.getByRole('button', { name: '停止当前回复' })).toBeDisabled()
+    await page.reload()
+    await expect(progress).toContainText('正在停止后续步骤')
+    status = 'cancelled'; phase = 'stopped'
+    await sync()
+    await expect(progress).toContainText('后续步骤已停止')
+    await expect(page.getByRole('button', { name: '停止当前回复' })).toHaveCount(0)
+    expect(stopCalls).toBe(1)
+  } else {
+    clipCount = 2; phase = 'stitching'
+    await sync()
+    await expect(progress).toContainText('正在拼接整片')
+    await expect(page.getByLabel('第2段.mp4', { exact: true })).toBeVisible()
+    phase = 'completed'
+    await sync()
+    await expect(progress).toContainText('整片已生成，正在入库')
+    await expect(page.getByLabel('完整口播.mp4', { exact: true })).toHaveCount(0)
+    status = 'completed'
+    await sync()
+    await expect(progress).toContainText('整片已保存')
+    await expect(page.getByLabel('完整口播.mp4', { exact: true })).toBeVisible()
+    expect(stopCalls).toBe(0)
+  }
+  await page.reload()
+  await expect(progress).toContainText(`已保存 ${clipCount} / 2 段`)
+  await expect(page.getByLabel('第1段.mp4', { exact: true })).toBeVisible()
+  await openProjectPanel(page, '素材库')
+  await expect(page.locator('.asset')).toHaveCount(1 + clipCount * 2 + (outcome === 'completed' ? 1 : 0))
+  await expect(page.getByText('口播分段剧本.md', { exact: true })).toBeVisible()
+})
+
+for (const outcome of ['completed', 'cancelled']) test(`story text states update without reading media through ${outcome}`, async ({ page, request }) => {
+  await page.route('**/*', route => ['image', 'media'].includes(route.request().resourceType()) || route.request().url().includes('/api/assets/') ? route.abort() : route.fallback())
+  const project = await (await request.post('/api/projects', { data: { title: '故事文字验收' } })).json()
+  const runId = crypto.randomUUID(), messageId = crypto.randomUUID(), assistantId = crypto.randomUUID(), scriptId = crypto.randomUUID()
+  const clipIds = Array.from({ length: 8 }, () => crypto.randomUUID())
+  const now = new Date().toISOString()
+  let phase = 'script', status = 'running', count = 0, stopRequested = false, revision = 0
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured' } }))
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: {
+    project, jobs: [], threadId: null,
+    messages: [{ id: messageId, projectId: project.id, role: 'user', text: '制作40秒竖屏故事', assetIds: [], createdAt: now }, { id: assistantId, projectId: project.id, role: 'assistant', text: '分镜已确定', assetIds: [], createdAt: now }],
+    runs: [{ id: runId, projectId: project.id, messageId, assistantId, status, stage: 'video', createdAt: now, input: { mode: 'auto', videoModel: 'minimax-h3', ratio: '9:16' }, assetId: status === 'completed' ? runId : undefined, processedAssetIds: clipIds.slice(0, count), story: { title: '迟到的明信片', scriptAssetId: scriptId, segments: clipIds.map((_, index) => ({ text: `镜头${index + 1}剧情`, prompt: 'fixture' })), clipIds, phase, segment: count + 1, stopRequested } }],
+    assets: [...clipIds.slice(0, count), ...(status === 'completed' ? [runId] : [])].map((id, index) => ({ id, projectId: project.id, name: id === runId ? '完整故事.mp4' : `故事第${index + 1}段.mp4`, kind: 'generated', mediaType: 'video', model: 'minimax-h3', hasThumbnail: false, width: 576, height: 1024, duration: id === runId ? 41.4 : 5.17, bytes: 100, createdAt: now })),
+  } }))
+  await page.route(`**/api/agent-runs/${runId}/stop`, route => { stopRequested = true; return route.fulfill({ json: { status: 'running' } }) })
+  const sync = async () => { await request.patch(`/api/projects/${project.id}`, { data: { title: `故事-${++revision}` } }) }
+  await page.goto('/')
+  const progress = page.getByRole('status', { name: '故事制作进度' })
+  await expect(progress).toContainText('故事分镜已保存')
+  await expect(page.getByText('镜头8剧情', { exact: true })).toBeVisible()
+  await expect(page.getByRole('link', { name: '下载故事分镜' })).toHaveAttribute('href', `/api/assets/${scriptId}/content?download=1`)
+  count = 1; phase = 'rendering'; await sync()
+  await expect(progress).toContainText('第 2 段视频生成中')
+  await expect(page.locator('.narration-timeline .video-result')).toHaveCount(1)
+  if (outcome === 'cancelled') {
+    await page.getByRole('button', { name: '停止当前回复' }).click()
+    await expect(progress).toContainText('正在停止后续步骤')
+    await expect(page.getByRole('button', { name: '停止当前回复' })).toBeDisabled()
+    status = 'cancelled'; phase = 'stopped'; await sync()
+    await expect(progress).toContainText('后续步骤已停止')
+  } else {
+    count = 8; phase = 'stitching'; await sync()
+    await expect(progress).toContainText('正在拼接整片')
+    phase = 'completed'; await sync()
+    await expect(progress).toContainText('整片已生成，正在入库')
+    status = 'completed'; await sync()
+    await expect(progress).toContainText('整片已保存')
+  }
+  await page.reload()
+  await expect(progress).toContainText(`已保存 ${count} / 8 段`)
+  await expect(page.getByRole('button', { name: '停止当前回复' })).toHaveCount(0)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
+
+test('avatar entry only prepares conversation and never replaces an existing draft', async ({ page, request }) => {
   const project = await (await request.post('/api/projects', { data: { title: '未配置数字人' } })).json()
   await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
   await page.goto('/')
   await page.getByRole('button', { name: '数字人口播', exact: true }).click()
-  await expect(page.getByRole('status')).toContainText('数字人服务未配置')
-  await page.getByRole('textbox', { name: '播报文案' }).fill('测试文案')
-  await page.getByRole('checkbox').check()
-  await expect(page.getByRole('button', { name: '制作短片' })).toBeDisabled()
+  const draft = page.getByRole('textbox', { name: '创作需求' })
+  await expect(draft).toBeFocused()
+  await expect(draft).toHaveValue(/先确认文案/)
+  await draft.fill('先讨论法律口播，不生成。')
+  await page.getByRole('button', { name: '创作引导', exact: true }).click()
+  await page.getByRole('dialog').getByRole('button', { name: '数字人口播', exact: true }).click()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect(draft).toHaveValue('先讨论法律口播，不生成。')
+  const snapshot = await (await request.get(`/api/projects/${project.id}`)).json()
+  expect(snapshot.messages).toHaveLength(0)
 })
 
 test('composer follows the iPhone keyboard visual viewport and its scroll offset', async ({ page, request }, testInfo) => {
@@ -522,6 +647,89 @@ test('project deletion requires confirmation and removes the selected project', 
   expect((await request.get(`/api/projects/${project.id}`)).status()).toBe(404)
   await page.reload()
   await expect(page.getByRole('button', { name: `删除项目 ${title}`, exact: true })).toHaveCount(0)
+})
+
+test('VM configurations can be corrected, added and selected without stale confirmations', async ({ page }, testInfo) => {
+  let catalog: VmProfiles = { revision: randomUUID(), canManage: true, profiles: [{ id: randomUUID(), label: 'Old GPU', subscription: randomUUID(), resourceGroup: 'example-gpu', name: 'deleted-vm', comfyUrl: 'http://10.30.0.4:8188' }] }
+  const actions: string[] = []
+  await page.route('**/api/vm/profiles', async route => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON()
+      expect(body.revision).toBe(catalog.revision)
+      catalog = { ...catalog, revision: randomUUID(), profiles: [...catalog.profiles, { ...body.profile, id: randomUUID() }] }
+    }
+    await route.fulfill({ json: catalog })
+  })
+  await page.route('**/api/vm/profiles/*', async route => {
+    const body = route.request().postDataJSON()
+    expect(route.request().method()).toBe('PUT')
+    expect(body.revision).toBe(catalog.revision)
+    const id = route.request().url().split('/').at(-1)
+    catalog = { ...catalog, revision: randomUUID(), profiles: catalog.profiles.map(profile => profile.id === id ? { ...body.profile, id } : profile) }
+    await route.fulfill({ json: catalog })
+  })
+  await page.route('**/api/vm?*', async route => {
+    const profile = catalog.profiles.find(item => item.id === new URL(route.request().url()).searchParams.get('profileId'))!
+    await route.fulfill(profile.name === 'deleted-vm' ? { status: 503, json: { error: 'VM deleted-vm 不存在，请检查订阅、资源组和实例名称。' } } : { json: { configured: true, name: profile.name, powerState: 'deallocated', gpuReady: false } })
+  })
+  await page.route('**/api/vm/actions', async route => {
+    const body = route.request().postDataJSON()
+    expect(body.revision).toBe(catalog.revision)
+    const target = catalog.profiles.find(profile => profile.id === body.profileId)!
+    expect(body.confirmedName).toBe(target.name)
+    actions.push(target.id)
+    await route.fulfill({ status: 202, json: { configured: true, name: target.name, powerState: 'running', gpuReady: false } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'VM 管理', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'VM 管理' })
+  await expect(panel.getByRole('alert')).toContainText('不存在')
+  await expect(panel.locator('.vm-identity')).toContainText('deleted-vm')
+  await panel.getByRole('button', { name: '编辑 VM 配置', exact: true }).click()
+  await panel.getByLabel('配置名称', { exact: true }).fill('Corrected GPU')
+  await panel.getByLabel('VM 名称', { exact: true }).fill('corrected-vm')
+  await panel.getByRole('button', { name: '保存配置', exact: true }).click()
+  await expect(panel.locator('.vm-identity')).toContainText('corrected-vm')
+  await panel.getByRole('button', { name: '新增 VM 配置', exact: true }).click()
+  await panel.getByLabel('配置名称', { exact: true }).fill('Second GPU with a long configuration label for small screens')
+  await panel.getByLabel('订阅 ID', { exact: true }).fill(randomUUID())
+  await panel.getByLabel('资源组', { exact: true }).fill('example-second-gpu-resource-group')
+  await panel.getByLabel('VM 名称', { exact: true }).fill('second-gpu-with-a-long-instance-name')
+  await panel.getByLabel('ComfyUI 私网地址', { exact: true }).fill('http://10.31.0.4:8188')
+  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('vm-config-form.png') })
+  await panel.getByRole('button', { name: '保存配置', exact: true }).click()
+  await expect(panel.getByRole('combobox', { name: 'VM 配置' })).toHaveValue(catalog.profiles[1].id)
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  await panel.getByRole('combobox', { name: 'VM 配置' }).selectOption(catalog.profiles[0].id)
+  await expect(panel.getByRole('button', { name: '确认启动', exact: true })).toHaveCount(0)
+  await panel.getByRole('button', { name: '启动', exact: true }).click()
+  await panel.getByRole('button', { name: '确认启动', exact: true }).click()
+  await expect(panel.getByRole('status')).toContainText('运行中')
+  expect(actions).toEqual([catalog.profiles[0].id])
+  await panel.getByRole('combobox', { name: 'VM 配置' }).selectOption(catalog.profiles[1].id)
+  await page.reload()
+  await page.getByRole('button', { name: 'VM 管理', exact: true }).click()
+  await expect(panel.getByRole('combobox', { name: 'VM 配置' })).toHaveValue(catalog.profiles[1].id)
+  await expect(panel.locator('.vm-identity')).toContainText('second-gpu-with-a-long-instance-name')
+  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('vm-config-selected.png') })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('vm-config-wide.png') })
+})
+
+test('VM configuration editing is hidden for ordinary users', async ({ page }) => {
+  const profile = { id: randomUUID(), label: 'GPU', subscription: randomUUID(), resourceGroup: 'example-gpu', name: 'test-vm', comfyUrl: 'http://10.30.0.4:8188' }
+  await page.route('**/api/vm/profiles', route => route.fulfill({ json: { revision: randomUUID(), profiles: [profile], canManage: false } }))
+  await page.route('**/api/vm?*', route => route.fulfill({ json: { configured: true, name: profile.name, powerState: 'deallocated', gpuReady: false } }))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'VM 管理', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'VM 管理' })
+  await expect(panel.getByRole('combobox', { name: 'VM 配置' })).toBeVisible()
+  await expect(panel.getByRole('button', { name: '新增 VM 配置' })).toHaveCount(0)
+  await expect(panel.getByRole('button', { name: '编辑 VM 配置' })).toHaveCount(0)
+  await expect(panel.getByRole('button', { name: '启动', exact: true })).toBeEnabled()
 })
 
 test('VM controls require explicit confirmation and show operation state', async ({ page }, testInfo) => {
@@ -1018,14 +1226,6 @@ test('video results use playback and download controls instead of image zoom', a
   await page.getByRole('dialog').getByRole('button', { name: '转发', exact: true }).click()
   await expect(page.getByRole('dialog').getByRole('button', { name: '选择转发应用', exact: true })).toBeVisible()
   await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click()
-  await page.route('**/api/avatar', route => route.fulfill({ json: { configured: true } }))
-  await page.route(`**/api/projects/${project.id}/avatar-jobs`, route => route.fulfill({ json: [{ id: assetId, assetId, projectId: project.id, status: 'completed', text: '口播测试', createdAt: now }] }))
-  await page.getByRole('button', { name: '创作引导', exact: true }).click()
-  await page.getByRole('dialog').getByRole('button', { name: '数字人口播', exact: true }).click()
-  const avatar = page.getByRole('dialog', { name: '数字人口播', exact: true })
-  await avatar.getByRole('button', { name: '转发', exact: true }).click()
-  await avatar.getByRole('button', { name: '选择转发应用', exact: true }).click()
-  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'sharedFiles'))).toEqual({ files: [{ name: '数字人口播.mp4', type: 'video/mp4', bytes: Array.from(Buffer.from('video-share-fixture')) }], activated: true, keys: ['files'] })
 })
 
 test('application login switches private users and provides admin account controls', async ({ page }, testInfo) => {

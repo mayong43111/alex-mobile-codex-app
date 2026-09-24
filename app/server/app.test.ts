@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile, readdir } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile, readdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
@@ -10,7 +10,8 @@ import { Store } from './store.ts'
 import { AgentWorker, managedModelToken } from './agent.ts'
 import type { AgentTransport, ImageCandidate, RemoteRun, SourceImage } from './agent.ts'
 import type { AssetStorage } from './assets.ts'
-import { VmController } from './vm.ts'
+import { VmController, VmRegistry } from './vm.ts'
+import type { VmProfileInput } from './vm.ts'
 import { provisionLocalUser } from './auth.ts'
 
 async function loginHeaders(app: Awaited<ReturnType<typeof buildApp>>, dataDir: string, host = 'localhost') {
@@ -22,6 +23,61 @@ async function loginHeaders(app: Awaited<ReturnType<typeof buildApp>>, dataDir: 
   assert.equal(response.statusCode, 200)
   return { host, origin, cookie: `${response.cookies[0].name}=${response.cookies[0].value}`, 'x-csrf-token': response.json().csrf }
 }
+
+test('story clips update the project progressively and recover without resubmitting', async context => {
+  for (const outcome of ['completed', 'cancelled', 'completed-after-stop']) await context.test(outcome, async () => {
+    const store = new Store(':memory:')
+    const project = store.createProject('Story')
+    const objects = new Map<string, Buffer>()
+    const storage = { put: async (key: string, bytes: Buffer) => { objects.set(key, bytes) }, read: async (key: string) => objects.get(key)!, remove: async () => {} }
+    const thumbnail = (await sharp({ create: { width: 32, height: 32, channels: 3, background: '#fff' } }).webp().toBuffer()).toString('base64')
+    const video = { mp4: Buffer.from('0000ftypfixture-video-bytes').toString('base64'), thumbnail, width: 576, height: 1024, duration: 124 / 24, fps: 24 as const, model: 'minimax-h3' as const, provider: 'comfyui' as const, checkpoint: 'fixture' }
+    const run = store.queueAgent(project.id, { requestId: randomUUID(), text: '制作八段竖屏故事并拼接', assetIds: [], mode: 'auto', ratio: '9:16', videoModel: 'minimax-h3' })
+    const clipIds = Array.from({ length: 8 }, () => randomUUID())
+    const remote: RemoteRun = { id: run.id, threadId: randomUUID(), status: 'running', stage: 'video', reply: '开始制作故事', story: { title: '迟到的明信片', segments: clipIds.map((_, index) => ({ text: `第${index + 1}镜剧情`, prompt: `shot ${index + 1}` })), clipIds, phase: 'rendering', segment: 2, stopRequested: false }, processedVideos: [{ ...video, assetId: clipIds[0] }] }
+    let submissions = 0, stops = 0
+    const transport: AgentTransport = { health: async () => ({}), submit: async () => { submissions++ }, get: async () => structuredClone(remote), stop: async () => { if (++stops === 1) throw new Error('Control timeout'); remote.story!.stopRequested = true } }
+    let worker = new AgentWorker(store, '', transport, storage)
+    try {
+      await worker.tick(); await worker.tick()
+      assert.deepEqual(store.agentRun(run.id).processedAssetIds, [clipIds[0]])
+      const scriptId = store.agentRun(run.id).story!.scriptAssetId!
+      assert.match(objects.get(`${scriptId}.bin`)!.toString(), /第8镜剧情/)
+      if (outcome !== 'completed') {
+        await assert.rejects(worker.stop(run.id), /timeout/)
+        assert.equal(store.agentRun(run.id).status, 'running')
+        assert.equal(store.agentRun(run.id).story!.stopRequested, true)
+      }
+      await worker.close()
+      worker = new AgentWorker(store, '', transport, storage)
+      worker.start()
+      await worker.tick(); await worker.tick()
+      assert.equal(submissions, 1)
+      if (outcome !== 'completed') assert.equal(stops, 2)
+      if (outcome === 'cancelled') {
+        remote.story!.phase = 'stopped'; remote.status = 'cancelled'
+      } else {
+        remote.processedVideos = clipIds.map(assetId => ({ ...video, assetId }))
+        remote.story!.phase = 'stitching'; remote.story!.segment = 8
+        await worker.tick()
+        assert.equal(store.agentRun(run.id).status, 'running')
+        assert.equal(store.agentRun(run.id).processedAssetIds!.length, 8)
+        assert.equal(store.agentRun(run.id).assetId, undefined)
+        remote.video = { ...video, duration: 41.4 }; remote.status = 'completed'; remote.story!.phase = 'completed'
+      }
+      await worker.tick()
+      const saved = store.agentRun(run.id)
+      assert.equal(saved.status, outcome === 'cancelled' ? 'cancelled' : 'completed')
+      assert.equal(saved.story?.scriptAssetId, scriptId)
+      assert.equal(saved.processedAssetIds?.length, outcome === 'cancelled' ? 1 : 8)
+      assert.equal(saved.assetId, outcome === 'cancelled' ? undefined : run.id)
+      assert.equal(store.snapshot(project.id).assets.filter(asset => asset.model === 'story-script').length, 1)
+      assert.equal(store.snapshot(project.id).messages.find(message => message.id === run.assistantId)!.assetIds.length, outcome === 'cancelled' ? 2 : 10)
+      if (outcome !== 'cancelled') { assert.match(saved.reply, /41.40/); assert.equal(store.asset(run.id).height, 1024) }
+      assert.equal(worker.hasActiveProject(project.id), false)
+    } finally { await worker.close(); store.db.close() }
+  })
+})
 
 test('project ownership fails closed for foreign and legacy unowned projects', () => {
   const store = new Store(':memory:')
@@ -37,6 +93,145 @@ test('project ownership fails closed for foreign and legacy unowned projects', (
     store.deleteProject(first.id, first.updatedAt)
     assert.deepEqual(store.projects('user-a'), [])
   } finally { store.db.close() }
+})
+
+test('VM registry migrates legacy configuration, isolates ledgers and persists edits', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-vm-registry-'))
+  const file = join(directory, 'config.json'), state = join(directory, 'operation.json')
+  const first = { subscription: randomUUID(), resourceGroup: 'first', name: 'first-vm', comfyUrl: 'http://10.1.0.4:8188', auth: 'managed-identity' as const }
+  const ledgers: string[] = []
+  let busy = false
+  const factory = async (config: { name: string }, path: string) => {
+    ledgers.push(path)
+    return { get busy() { return busy }, async status() { return { configured: true, name: config.name } }, async act() { return { configured: true, name: config.name } } }
+  }
+  try {
+    await writeFile(file, JSON.stringify(first))
+    const registry = new VmRegistry(file, state, 'managed-identity', factory)
+    await registry.initialize()
+    const original = registry.profiles()
+    assert.equal(original.profiles.length, 1)
+    const second = { subscription: randomUUID(), resourceGroup: 'second', name: 'second-vm', comfyUrl: 'http://10.2.0.4:8188', label: 'Second' }
+    const added = await registry.saveProfile(second, original.revision)
+    assert.notEqual(ledgers[0], ledgers[1])
+    assert.equal((await registry.status(added.profiles[1].id)).name, 'second-vm')
+    await assert.rejects(registry.saveProfile({ ...second, name: 'other' }, original.revision), /已更新/)
+    await assert.rejects(registry.saveProfile(second, added.revision), /已有配置/)
+    await assert.rejects(registry.saveProfile({ ...second, comfyUrl: 'http://169.254.169.254' }, added.revision), /私网/)
+    busy = true
+    await assert.rejects(registry.saveProfile({ ...second, label: 'Changed' }, added.revision, added.profiles[1].id), /尚未结束/)
+    busy = false
+    const updated = await registry.saveProfile({ ...second, label: 'Changed' }, added.revision, added.profiles[1].id)
+    const reopened = new VmRegistry(file, state, 'managed-identity', factory)
+    await reopened.initialize()
+    assert.deepEqual(reopened.profiles(), updated)
+    await assert.rejects(reopened.act('start', randomUUID(), 'second-vm', false, updated.profiles[1].id, added.revision), /已更新/)
+    await assert.rejects(reopened.status(randomUUID()), /不存在/)
+    assert.equal((await reopened.status()).name, 'first-vm')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('VM registry real controllers retain uncertain legacy operations and recover every instance', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-vm-migration-'))
+  const file = join(directory, 'config.json'), state = join(directory, 'operation.json')
+  const config = { subscription: randomUUID(), resourceGroup: 'gpu', name: 'first', comfyUrl: 'http://10.1.0.4:8188', auth: 'managed-identity' as const }
+  let settled = false
+  const operationId = randomUUID()
+  try {
+    await writeFile(file, JSON.stringify(config))
+    await writeFile(state, JSON.stringify({ operation: { id: operationId, action: 'start', status: 'unknown', createdAt: new Date().toISOString() }, requests: { [operationId]: 'start' } }))
+    const production = new VmRegistry(file, state, 'managed-identity')
+    await production.initialize()
+    assert(production.busy)
+    const original = production.profiles()
+    const { id: _id, ...profile } = original.profiles[0]
+    await assert.rejects(production.saveProfile({ ...profile, name: 'bypass' }, original.revision, original.profiles[0].id), /尚未结束/)
+    const recovered = new VmRegistry(file, state, 'managed-identity', async (entry, path) => {
+      const controller = new VmController(entry, path, async (_url, method) => {
+        assert.notEqual(method, 'POST')
+        return Response.json({ statuses: [{ code: `PowerState/${settled ? 'running' : 'deallocated'}` }] })
+      }, async () => new Response(null, { status: 503 }))
+      await controller.initialize()
+      return controller
+    })
+    await recovered.initialize()
+    assert.equal((await recovered.status()).operation?.status, 'unknown')
+    settled = true
+    await recovered.refreshPending()
+    assert.equal(recovered.busy, false)
+    const updated = await recovered.saveProfile({ ...profile, label: 'Updated' }, recovered.profiles().revision, original.profiles[0].id)
+    assert.equal((await recovered.status()).operation?.id, operationId)
+    const reopened = new VmRegistry(file, state, 'managed-identity')
+    await reopened.initialize()
+    assert.equal(reopened.busy, false)
+    assert.deepEqual(reopened.profiles(), updated)
+    assert.equal(JSON.parse(await readFile(state, 'utf8')).operation.status, 'unknown')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('VM status distinguishes missing resources and denied Azure access', async () => {
+  for (const [status, message] of [[404, /不存在/], [403, /Azure 权限/]] as const) {
+    const vm = new VmController({ subscription: randomUUID(), resourceGroup: 'gpu', name: 'gone', comfyUrl: 'http://10.1.0.4:8188', auth: 'managed-identity' }, '/unused', async () => new Response(null, { status }))
+    await assert.rejects(vm.status(), message)
+  }
+})
+
+test('VM profile API supports create, edit and explicit target without granting Azure permissions', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-vm-profiles-'))
+  const acted: string[] = []
+  const vm = new VmRegistry(join(dataDir, 'vms.json'), join(dataDir, 'operations.json'), 'managed-identity', async config => ({ busy: false, async status() { return { configured: true, name: config.name } }, async act() { acted.push(config.name); return { configured: true, name: config.name } } }))
+  await vm.initialize()
+  const app = await buildApp({ dataDir, vm })
+  const profile: VmProfileInput = { subscription: randomUUID(), resourceGroup: 'gpu', name: 'first', comfyUrl: 'http://10.0.0.4:8188', label: 'First' }
+  try {
+    const initial = (await app.inject('/api/vm/profiles')).json()
+    assert.equal(initial.canManage, true)
+    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/profiles', payload: { revision: initial.revision, profile: { ...profile, cliPath: '/bin/evil' } } })).statusCode, 400)
+    const created = await app.inject({ method: 'POST', url: '/api/vm/profiles', payload: { revision: initial.revision, profile } })
+    assert.equal(created.statusCode, 201)
+    const catalog = created.json()
+    const id = catalog.profiles[0].id
+    const second = (await app.inject({ method: 'POST', url: '/api/vm/profiles', payload: { revision: catalog.revision, profile: { ...profile, name: 'second', label: 'Second' } } })).json()
+    const edited = (await app.inject({ method: 'PUT', url: `/api/vm/profiles/${id}`, payload: { revision: second.revision, profile: { ...profile, name: 'updated' } } })).json()
+    assert.equal((await app.inject(`/api/vm?profileId=${id}`)).json().name, 'updated')
+    const payload = { action: 'start', requestId: randomUUID(), confirmedName: 'updated', profileId: id, revision: catalog.revision }
+    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', payload })).statusCode, 409)
+    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/actions', payload: { ...payload, revision: edited.revision } })).statusCode, 202)
+    assert.deepEqual(acted, ['updated'])
+    assert.equal((await app.inject(`/api/vm?profileId=${randomUUID()}`)).statusCode, 404)
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('VM profile configuration requires an administrator and CSRF', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-vm-profile-auth-'))
+  const vm = new VmRegistry(join(dataDir, 'vms.json'), join(dataDir, 'operations.json'), 'managed-identity')
+  await vm.initialize()
+  const tenantId = randomUUID(), userId = randomUUID(), token = randomUUID(), csrf = randomUUID()
+  const app = await buildApp({ dataDir, vm, auth: { origin: 'https://localhost', entra: { tenantId, clientId: randomUUID(), clientSecret: 'offline-test-secret', userIds: [userId], adminUserIds: [userId] } }, origins: ['https://localhost'] })
+  try {
+    const headers = await loginHeaders(app, dataDir)
+    assert.equal((await app.inject({ url: '/api/vm/profiles' })).statusCode, 401)
+    const catalog = (await app.inject({ url: '/api/vm/profiles', headers })).json()
+    assert.equal(catalog.canManage, false)
+    const payload = { revision: catalog.revision, profile: { subscription: randomUUID(), resourceGroup: 'gpu', name: 'vm', comfyUrl: 'http://10.0.0.4:8188', label: 'GPU' } }
+    assert.equal((await app.inject({ method: 'POST', url: '/api/vm/profiles', headers, payload })).statusCode, 403)
+    assert.equal((await app.inject({ method: 'PUT', url: `/api/vm/profiles/${randomUUID()}`, headers, payload })).statusCode, 403)
+    assert.equal(vm.profiles().profiles.length, 0)
+    const store = new Store(join(dataDir, 'studio.sqlite'))
+    try {
+      store.db.prepare('INSERT INTO auth_sessions VALUES (?, ?, ?, ?)').run(createHash('sha256').update(token).digest('hex'), JSON.stringify({ id: `entra:${tenantId}:${userId}`, provider: 'entra', name: 'Administrator' }), csrf, Date.now() + 60000)
+      const admin = { host: 'localhost', origin: 'https://localhost', cookie: `__Host-studio-session=${token}`, 'x-csrf-token': csrf }
+      assert.equal((await app.inject({ url: '/api/vm/profiles', headers: admin })).json().canManage, true)
+      assert.equal((await app.inject({ method: 'POST', url: '/api/vm/profiles', headers: { ...admin, 'x-csrf-token': 'wrong' }, payload })).statusCode, 403)
+      const created = await app.inject({ method: 'POST', url: '/api/vm/profiles', headers: admin, payload })
+      assert.equal(created.statusCode, 201)
+      const saved = created.json()
+      assert.equal((await app.inject({ method: 'PUT', url: `/api/vm/profiles/${saved.profiles[0].id}`, headers: admin, payload: { revision: saved.revision, profile: { ...payload.profile, label: 'Changed' } } })).statusCode, 200)
+      const project = store.createProject('Busy')
+      store.queueAgent(project.id, { requestId: randomUUID(), text: 'test', ratio: '1:1', mode: 'auto' })
+      assert.equal((await app.inject({ method: 'POST', url: '/api/vm/profiles', headers: admin, payload: { revision: vm.profiles().revision, profile: { ...payload.profile, name: 'second' } } })).statusCode, 409)
+    } finally { store.db.close() }
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
 })
 
 test('VM controller pins the target, deduplicates operations and refuses busy GPU shutdown', async () => {

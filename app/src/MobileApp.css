@@ -107,6 +107,19 @@
 .project-row .project-link span { overflow-wrap: anywhere; }
 .danger { background: #a33939; }
 .vm-panel { display: grid; gap: 20px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.vm-manager { display: grid; gap: 18px; min-width: 0; }
+.vm-profile-toolbar { display: flex; gap: 6px; align-items: end; min-width: 0; }
+.vm-profile-toolbar > label { display: grid; gap: 6px; flex: 1; min-width: 0; font-size: 12px; }
+.vm-profile-toolbar select { width: 100%; min-width: 0; height: 44px; text-overflow: ellipsis; }
+.vm-profile-toolbar .icon-button { flex: 0 0 40px; width: 40px; height: 44px; }
+.vm-profile-form { display: grid; gap: 14px; min-width: 0; }
+.vm-profile-form h3 { margin: 0; font-size: 16px; }
+.vm-profile-form label { display: grid; gap: 6px; min-width: 0; font-size: 13px; }
+.vm-profile-form input { width: 100%; min-width: 0; height: 44px; }
+.vm-profile-details { display: grid; gap: 8px; margin: 0; font-size: 12px; }
+.vm-profile-details > div { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 10px; }
+.vm-profile-details dt { color: var(--muted); }
+.vm-profile-details dd { margin: 0; overflow-wrap: anywhere; }
 .vm-identity { display: flex; align-items: center; gap: 12px; }
 .vm-identity>svg { flex-shrink: 0; color: var(--accent); }
 .vm-identity>div { flex: 1; min-width: 0; }
@@ -341,6 +354,21 @@
 .progress-heading time { font-size: 10px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .run-progress li p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; margin-top: 6px; }
 .progress-empty { padding: 4px 0 12px 21px; font-size: 11px; }
+.narration-timeline { margin: 16px 0; min-width: 0; }
+.narration-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 32px; font-size: 13px; }
+.narration-heading > span { font-size: 11px; color: var(--muted); text-align: right; }
+.narration-heading > strong { min-width: 0; overflow-wrap: anywhere; }
+.narration-status { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0 12px; color: var(--accent); font-size: 12px; line-height: 1.6; }
+.narration-status svg { flex-shrink: 0; margin-top: 2px; }
+.narration-notice { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.narration-timeline > ol { list-style: none; margin: 8px 0 0; padding: 0 0 0 12px; border-left: 2px solid var(--line); }
+.narration-timeline > ol > li { min-width: 0; padding: 8px 0 16px; }
+.narration-timeline li > p { margin: 6px 0; font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
+.narration-timeline li > small { color: var(--muted); font-size: 11px; }
+.narration-timeline .message-images { grid-template-columns: minmax(0, 1fr); }
+.narration-tail summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; color: var(--muted); font-size: 12px; }
+.narration-tail summary::before { content: '+'; margin-right: 8px; }
+.narration-tail[open] summary::before { content: '-'; }
 .assistant-message { padding-right: 4px; }
 .composer-status button { display: flex; gap: 5px; align-items: center; min-height: 44px; color: var(--accent); }
 .spin { animation: spin 1s linear infinite; }

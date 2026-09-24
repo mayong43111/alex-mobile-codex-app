@@ -13,6 +13,7 @@ import type { AgentTransport } from './agent.ts'
 import { BlobAssetStorage, LocalAssetStorage, prepareUpload } from './assets.ts'
 import type { AssetStorage } from './assets.ts'
 import type { VmControl } from './vm.ts'
+import { VmRegistry, vmProfileInputSchema } from './vm.ts'
 import { registerAuth } from './auth.ts'
 import type { AuthOptions } from './auth.ts'
 import { AvatarJobs } from './avatar.ts'
@@ -26,7 +27,7 @@ const submissionSchema = z.object({
   ratio: z.enum(['1:1', '4:3', '3:4', '16:9']),
 }).strict()
 
-export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; auth?: AuthOptions; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl; avatar?: AvatarProvider }) {
+export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; auth?: AuthOptions; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl; avatar?: AvatarProvider; nativeAvatar?: AvatarProvider }) {
   await mkdir(join(options.dataDir, 'images'), { recursive: true, mode: 0o700 })
   const store = new Store(join(options.dataDir, 'studio.sqlite'), options.journalMode)
   const assetStorage = options.assetStorage ?? new LocalAssetStorage(options.dataDir)
@@ -57,13 +58,13 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
   await app.register(multipart, { limits: { fileSize: 64 * 1024 * 1024, files: 1, fields: 0 } })
   const origins = new Set(options.origins ?? ['http://localhost:5173', 'http://127.0.0.1:5173'])
   const streams = new Set<() => void>()
-  const worker = options.agent ? new AgentWorker(store, options.dataDir, options.agent, assetStorage, () => !options.vm?.busy) : undefined
-  const avatars = options.avatar ? new AvatarJobs(store, assetStorage, options.avatar) : undefined
+  const avatars = options.avatar ? new AvatarJobs(store, assetStorage, options.avatar, undefined, options.nativeAvatar) : undefined
+  const worker = options.agent ? new AgentWorker(store, options.dataDir, options.agent, assetStorage, () => !options.vm?.busy, options.nativeAvatar ? avatars : undefined) : undefined
   avatars?.start()
   worker?.start()
   let vmCheck: Promise<unknown> | undefined
   const vmTimer = options.vm ? setInterval(() => {
-    if (options.vm?.busy && !vmCheck) vmCheck = options.vm.status().catch(() => {}).finally(() => { vmCheck = undefined })
+    if (options.vm?.busy && !vmCheck) vmCheck = (options.vm instanceof VmRegistry ? options.vm.refreshPending() : options.vm.status()).catch(() => {}).finally(() => { vmCheck = undefined })
   }, 10000) : undefined
 
   app.addHook('onRequest', async (request, reply) => {
@@ -107,7 +108,7 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
   })
 
   app.get('/healthz', async () => ({ status: 'ok' }))
-  app.get('/api/avatar', async () => ({ configured: !!avatars, provider: 'Azure Speech', maxCharacters: 500 }))
+  app.get('/api/avatar', async () => ({ configured: !!avatars, nativeConfigured: !!avatars && !!options.nativeAvatar, provider: 'Azure Speech', maxCharacters: 500 }))
   app.get<{ Params: { id: string } }>('/api/projects/:id/avatar-jobs', async request => {
     store.project(request.params.id)
     return avatars ? avatars.list(request.params.id) : []
@@ -118,11 +119,28 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     const { confirmed: _confirmed, ...narration } = input
     return reply.code(202).send(avatars.submit(request.params.id, narration))
   })
-  app.get('/api/vm', async () => options.vm ? options.vm.status() : { configured: false })
+  const vmRegistry = options.vm instanceof VmRegistry ? options.vm : undefined
+  app.get('/api/vm/profiles', async request => ({ ...(vmRegistry?.profiles() ?? { revision: '', profiles: [] }), canManage: !!vmRegistry && (!authentication || !!request.studioSession?.user.admin) }))
+  async function saveVmProfile(request: import('fastify').FastifyRequest, id?: string) {
+    if (authentication && !request.studioSession?.user.admin) throw new HttpError(403, '只有管理员可以修改 VM 配置。')
+    if (!vmRegistry) throw new HttpError(503, 'VM 配置管理未启用。')
+    if (store.hasPendingRuns() || worker?.hasActiveProject()) throw new HttpError(409, '应用有运行或排队任务，不能修改 VM 配置。')
+    const input = z.object({ revision: z.string().uuid(), profile: vmProfileInputSchema }).strict().parse(request.body)
+    return { ...await vmRegistry.saveProfile(input.profile, input.revision, id), canManage: true }
+  }
+  app.post('/api/vm/profiles', async (request, reply) => reply.code(201).send(await saveVmProfile(request)))
+  app.put<{ Params: { profileId: string } }>('/api/vm/profiles/:profileId', async request => saveVmProfile(request, z.string().uuid().parse(request.params.profileId)))
+  app.get('/api/vm', async request => {
+    const { profileId } = z.object({ profileId: z.string().uuid().optional() }).strict().parse(request.query)
+    if (profileId && !vmRegistry) throw new HttpError(404, 'VM 配置不存在。')
+    return vmRegistry ? vmRegistry.status(profileId) : options.vm ? options.vm.status() : { configured: false }
+  })
   app.post('/api/vm/actions', async (request, reply) => {
     if (!options.vm) throw new HttpError(503, 'VM 管理未配置。')
-    const input = z.object({ action: z.enum(['start', 'deallocate', 'restart']), requestId: z.string().uuid(), confirmedName: z.string().min(1), force: z.boolean().default(false) }).strict().parse(request.body)
+    const input = z.object({ action: z.enum(['start', 'deallocate', 'restart']), requestId: z.string().uuid(), confirmedName: z.string().min(1), force: z.boolean().default(false), profileId: z.string().uuid().optional(), revision: z.string().uuid().optional() }).strict().parse(request.body)
     if (store.hasPendingRuns() || worker?.hasActiveProject()) throw new HttpError(409, '应用有运行或排队任务，请先等待任务结束。')
+    if (input.profileId && !vmRegistry) throw new HttpError(404, 'VM 配置不存在。')
+    if (vmRegistry) return reply.code(202).send(await vmRegistry.act(input.action, input.requestId, input.confirmedName, input.force, input.profileId, input.revision))
     return reply.code(202).send(await options.vm.act(input.action, input.requestId, input.confirmedName, input.force))
   })
   if (options.staticRoot) await app.register(staticFiles, { root: options.staticRoot, index: 'index.html', cacheControl: false })

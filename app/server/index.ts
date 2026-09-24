@@ -2,13 +2,19 @@ import { resolve } from 'node:path'
 import { buildApp } from './app.ts'
 import { loadAgentTransport } from './agent.ts'
 import { BlobAssetStorage } from './assets.ts'
-import { loadVmController } from './vm.ts'
+import { VmRegistry } from './vm.ts'
 import type { AuthOptions } from './auth.ts'
 import { AzureCliCredential, ManagedIdentityCredential } from '@azure/identity'
 import { createAvatarProvider } from './avatar-provider.ts'
+import { createOpenMontageAvatarProvider } from './openmontage-avatar.ts'
 
 const cloud = process.env.HOSTING_MODE === 'appservice'
 const avatarCredential = process.env.SPEECH_AVATAR_ENDPOINT ? cloud ? new ManagedIdentityCredential() : new AzureCliCredential() : undefined
+const speechHeaders = async () => {
+  const token = await avatarCredential!.getToken('https://cognitiveservices.azure.com/.default')
+  if (!token) throw new Error('Speech authentication unavailable')
+  return { Authorization: `Bearer ${token.token}` }
+}
 const dataDir = resolve(process.env.DATA_DIR ?? '.data')
 if (cloud && (!process.env.AZURE_STORAGE_BLOB_ENDPOINT || !process.env.AZURE_STORAGE_CONTAINER)) throw new Error('Cloud Blob storage configuration missing')
 if (cloud && (!process.env.WEBSITE_HOSTNAME || !process.env.ENTRA_TENANT_ID || !process.env.ENTRA_ALLOWED_USER_IDS || !process.env.ENTRA_CLIENT_ID || !process.env.ENTRA_CLIENT_SECRET)) throw new Error('Cloud application authentication missing')
@@ -16,14 +22,13 @@ const auth: AuthOptions | undefined = cloud ? {
   origin: `https://${process.env.WEBSITE_HOSTNAME}`,
   entra: { tenantId: process.env.ENTRA_TENANT_ID!, clientId: process.env.ENTRA_CLIENT_ID!, clientSecret: process.env.ENTRA_CLIENT_SECRET!, userIds: process.env.ENTRA_ALLOWED_USER_IDS!.split(','), adminUserIds: process.env.ENTRA_ADMIN_USER_IDS?.split(',') },
 } : process.env.AUTH_ORIGIN ? { origin: process.env.AUTH_ORIGIN } : undefined
+const vm = new VmRegistry(resolve(process.env.VM_CONFIG ?? (process.env.DATA_DIR ? `${dataDir}/vm-config.json` : '../.local/vm.json')), resolve(dataDir, 'vm-operation.json'), cloud ? 'managed-identity' : 'cli')
+await vm.initialize()
 const app = await buildApp({
   dataDir,
-  avatar: process.env.SPEECH_AVATAR_ENDPOINT ? createAvatarProvider(process.env.SPEECH_AVATAR_ENDPOINT, async () => {
-    const token = await avatarCredential!.getToken('https://cognitiveservices.azure.com/.default')
-    if (!token) throw new Error('Speech authentication unavailable')
-    return { Authorization: `Bearer ${token.token}` }
-  }) : undefined,
-  vm: process.env.DATA_DIR && !process.env.VM_CONFIG ? undefined : await loadVmController(resolve(process.env.VM_CONFIG ?? '../.local/vm.json'), resolve(dataDir, 'vm-operation.json')),
+  avatar: process.env.SPEECH_AVATAR_ENDPOINT ? createAvatarProvider(process.env.SPEECH_AVATAR_ENDPOINT, speechHeaders) : undefined,
+  nativeAvatar: process.env.OPENMONTAGE_AVATAR_ENABLED === '1' && process.env.SPEECH_AVATAR_ENDPOINT && process.env.COMFYUI_SERVER_URL ? createOpenMontageAvatarProvider({ directory: resolve(dataDir, 'native-avatar'), comfyUrl: process.env.COMFYUI_SERVER_URL, speechEndpoint: process.env.SPEECH_AVATAR_ENDPOINT, headers: speechHeaders }) : undefined,
+  vm,
   origins: process.env.APP_ORIGINS?.split(','),
   auth,
   ...(cloud ? {

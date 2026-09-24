@@ -4,14 +4,13 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film } from 'lucide-react'
+import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film, Pencil } from 'lucide-react'
 import type { AgentRun, Asset, ImageModel, VideoModel, Job, Message, Project, Ratio, Quality, Snapshot, Submission } from './domain'
 import { assetHasThumbnail } from './domain'
-import type { VmStatus, VmAction } from '../server/vm'
+import type { VmStatus, VmAction, VmProfile, VmProfileInput, VmProfiles } from '../server/vm'
 import './MobileApp.css'
 import { authenticatedFetch } from './auth-client'
 import type { SignedInUser } from './auth-client'
-import { AvatarStudio } from './AvatarStudio'
 import { ShareAssetButton } from './ShareAssetButton'
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
@@ -31,8 +30,8 @@ function AssetPreview({ asset }: { asset: Asset }) {
 }
 const time = (value: string) => new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 type Health = { storage: string; agentConfigured?: boolean; agent: string; renderer: string; openmontage?: string; models?: { images: ImageModel[]; videos: Exclude<VideoModel, 'none'>[] } }
-const runLabel = (run: AgentRun) => ({ queued: '等待处理', running: run.stage === 'video' ? '正在生成视频' : run.stage === 'image' ? run.imageOperation === 'edit' ? '正在修改图片' : '正在生成图片' : 'Codex 正在回复', completed: '已完成', failed: '失败', cancelled: '已停止', interrupted: '结果待核实' })[run.status]
-const runModel = (run: AgentRun) => run.stage === 'video' ? 'MiniMax H3 · 24fps' : run.stage === 'image' ? run.input.imageModel === 'qwen-image-2.1' ? 'Qwen Image 2.1 · BF16' : 'Azure image2 · 1 张' : 'Codex · GPT-5.4'
+const runLabel = (run: AgentRun) => ({ queued: '等待处理', running: run.story?.stopRequested ? '正在停止后续步骤' : run.story ? run.story.phase === 'stitching' ? '正在拼接故事' : `故事制作 · 已保存 ${run.processedAssetIds?.length ?? 0}/${run.story.segments.length} 段` : run.avatarJobId ? '正在制作口播' : run.stage === 'video' ? '正在生成视频' : run.stage === 'image' ? run.imageOperation === 'edit' ? '正在修改图片' : '正在生成图片' : 'Codex 正在回复', completed: '已完成', failed: '失败', cancelled: '已停止', interrupted: '结果待核实' })[run.status]
+const runModel = (run: AgentRun) => run.avatarJobId ? 'OpenMontage · SadTalker' : run.stage === 'video' ? 'MiniMax H3 · 24fps' : run.stage === 'image' ? run.input.imageModel === 'qwen-image-2.1' ? 'Qwen Image 2.1 · BF16' : 'Azure image2 · 1 张' : 'Codex · GPT-5.4'
 const qualityNames = { low: '低', medium: '中', high: '高' }
 const references = [
   { name: '午后空间', file: '/reference-interior.jpg', prompt: '保留空间结构，营造午后自然光下安静、通透的室内氛围。' },
@@ -114,8 +113,49 @@ function LocalAccounts() {
   return <details className="local-accounts"><summary>本地账号管理</summary><ul>{accounts.map(account => <li key={account.id}><span>{account.name} <small>{account.username}</small></span><IconButton label={`重置 ${account.username} 密码`} disabled={busy} onClick={() => { setUsername(account.username); setName(account.name); setPassword(''); setReset(true); setMessage('') }}><RotateCw size={17} /></IconButton></li>)}</ul><form onSubmit={event => void save(event)}><label>账号<input autoComplete="off" autoCapitalize="none" required pattern="[a-z0-9][a-z0-9._-]{2,63}" maxLength={64} disabled={reset || busy} value={username} onChange={event => setUsername(event.target.value)} /></label><label>显示名称<input required maxLength={80} value={name} disabled={busy} onChange={event => setName(event.target.value)} /></label><label>新密码<input type="password" autoComplete="new-password" required minLength={12} maxLength={256} disabled={busy} value={password} onChange={event => setPassword(event.target.value)} /></label><button className="primary" disabled={busy} type="submit"><Check size={17} />{reset ? '确认重置密码' : '创建账号'}</button>{reset && <button type="button" disabled={busy} onClick={() => { setReset(false); setUsername(''); setName(''); setPassword('') }}>取消重置</button>}<p role="status">{message}</p></form></details>
 }
 
+function ReplyAssets({ ids, assets, select }: { ids: string[]; assets: Asset[]; select: (asset: Asset) => void }) {
+  if (!ids.length) return null
+  return <div className="message-images">{ids.map(id => {
+    const asset = assets.find(item => item.id === id)
+    if (!asset) return null
+    return asset.mediaType === 'video' ? <div className="video-result" key={id}>
+      <video className="generated-video" controls playsInline preload="metadata" poster={assetHasThumbnail(asset) ? imageUrl(asset) : undefined} src={imageUrl(asset, false)} aria-label={asset.name} />
+      <div className="video-meta"><span>{asset.model === 'minimax-h3' ? 'MiniMax H3' : asset.name} · {asset.duration?.toFixed(2)} 秒</span><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={18} /></a><ShareAssetButton asset={asset} /></div>
+    </div> : asset.mediaType === 'file' ? <button className="message-file" key={id} onClick={() => select(asset)}><AssetPreview asset={asset} /><span>{asset.name}<small>{fileSize(asset.bytes)}</small></span></button> : <button key={id} onClick={() => select(asset)}><img src={imageUrl(asset)} alt={asset.name} width={asset.width} height={asset.height} /></button>
+  })}</div>
+}
+
+function NarrationTimeline({ run, assets, select, connected }: { run: AgentRun; assets: Asset[]; select: (asset: Asset) => void; connected: boolean }) {
+  const story = run.story
+  const clips = (run.processedAssetIds ?? []).flatMap(id => assets.filter(asset => asset.id === id && asset.mediaType === 'video'))
+  const segments = story ? story.segments.map(segment => ({ text: segment.text, continueFromPrevious: false })) : run.narration?.segments ?? clips.map(clip => ({ text: clip.narration ?? '', continueFromPrevious: false }))
+  const progress = story ? { phase: story.phase, segment: story.segment } : run.narration?.progress
+  const scriptAssetId = story?.scriptAssetId ?? run.narration?.scriptAssetId
+  const active = ['running', 'queued'].includes(run.status)
+  const stopping = active && (story?.stopRequested || run.narration?.stopRequested)
+  const labels = { script: story ? '故事分镜已保存' : '分段剧本已保存', speech: `第 ${progress?.segment} 段配音中`, queued: '等待 GPU 开始', rendering: `第 ${progress?.segment} 段视频生成中`, tail: `第 ${progress?.segment} 段尾帧提取中`, stitching: '正在拼接整片', completed: '整片已生成，正在入库', stopped: '后续步骤已停止' }
+  const status = active && !connected ? '连接已断开，正在同步项目状态' : stopping ? '正在停止后续步骤' : run.status === 'completed' ? '整片已保存' : run.status === 'cancelled' ? '后续步骤已停止' : run.status === 'failed' ? '制作失败，已完成素材保留' : run.status === 'interrupted' ? '执行结果待核实，已有素材保留' : progress ? labels[progress.phase] : '正在准备口播'
+  return <section className="narration-timeline" aria-label={story ? '故事制作' : '口播制作'}>
+    <div className="narration-heading"><strong>{story?.title ?? '分段剧本'}</strong>{scriptAssetId && <a className="icon-button" href={`/api/assets/${scriptAssetId}/content?download=1`} download target="_blank" rel="noopener noreferrer" aria-label={story ? '下载故事分镜' : '下载分段剧本'} title={story ? '下载故事分镜' : '下载分段剧本'}><ArrowDownToLine size={18} /></a>}</div>
+    <p className="narration-status" role="status" aria-label={story ? '故事制作进度' : '口播制作进度'}>{active ? <LoaderCircle size={16} className="spin" /> : run.status === 'completed' ? <Check size={16} /> : <Square size={16} />}<span>{status} · 已保存 {clips.length} / {segments.length} 段</span></p>
+    {stopping && <p className="narration-notice">当前已提交的步骤可能继续完成并计费，完成的素材会保留。</p>}
+    <ol>{segments.map((segment, index) => {
+      const clip = clips[index]
+      const tail = clip && assets.find(asset => run.processedAssetIds?.includes(asset.id) && asset.sourceAssetId === clip.id && (asset.mediaType ?? 'image') === 'image')
+      const current = active && progress?.segment === index + 1 && ['speech', 'rendering', 'tail'].includes(progress.phase)
+      return <li key={index}>
+        <div className="narration-heading"><strong>第 {index + 1} 段</strong><span>{clip ? '已入库' : current ? labels[progress!.phase] : active ? stopping ? '等待停止确认' : '待生成' : '未完成'}</span></div>
+        {segment.text && <p>{segment.text}</p>}
+        {run.narration && <small>{segment.continueFromPrevious ? '沿用上一段实际尾帧' : '使用指定原图'}</small>}
+        {clip && <ReplyAssets ids={[clip.id]} assets={assets} select={select} />}
+        {tail && <details className="narration-tail"><summary>第 {index + 1} 段尾帧</summary><ReplyAssets ids={[tail.id]} assets={assets} select={select} /></details>}
+      </li>
+    })}</ol>
+  </section>
+}
+
 function ImagePending({ run, connected }: { run: AgentRun; connected: boolean }) {
-  if (run.status !== 'running' || !['image', 'video'].includes(run.stage)) return null
+  if (run.avatarJobId || run.story || run.status !== 'running' || !['image', 'video'].includes(run.stage)) return null
   return <div className="image-pending" role="status" aria-label={run.stage === 'video' ? '视频生成中' : '图片生成中'} aria-live="polite" aria-busy="true"><LoaderCircle size={24} className="spin" aria-hidden="true" /><span>{connected ? runLabel(run) : '连接已断开，正在同步生成状态'}</span></div>
 }
 
@@ -136,6 +176,54 @@ function Viewer({ asset, close, reference }: { asset: Asset | null; close: () =>
 }
 
 function VmPanel() {
+  const [catalog, setCatalog] = useState<VmProfiles | null>(null)
+  const [selectedId, setSelectedId] = useState(() => localStorage.getItem('studio-vm-profile') ?? '')
+  const [editing, setEditing] = useState<{ id?: string; profile: VmProfileInput } | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const [revisionKey, setRevisionKey] = useState(0)
+  useEffect(() => {
+    let active = true
+    void api<VmProfiles>('/vm/profiles').then(result => {
+      if (!active) return
+      setCatalog(result); setError('')
+      setSelectedId(current => result.profiles.some(profile => profile.id === current) ? current : result.profiles[0]?.id ?? '')
+    }).catch(failure => { if (active) setError(failure instanceof Error ? failure.message : 'VM 配置读取失败') })
+    return () => { active = false }
+  }, [revisionKey])
+  const profile = catalog?.profiles.find(item => item.id === selectedId)
+  function select(id: string) { setSelectedId(id); localStorage.setItem('studio-vm-profile', id); setEditing(null); setError('') }
+  async function save(event: FormEvent) {
+    event.preventDefault()
+    if (!editing || !catalog || saving) return
+    setSaving(true); setError('')
+    try {
+      const result = await api<VmProfiles>(`/vm/profiles${editing.id ? `/${editing.id}` : ''}`, json(editing.id ? 'PUT' : 'POST', { profile: editing.profile, revision: catalog.revision }))
+      setCatalog(result)
+      select(editing.id ?? result.profiles.at(-1)!.id)
+    } catch (failure) { setError(failure instanceof Error ? failure.message : '配置保存失败') }
+    finally { setSaving(false) }
+  }
+  return <div className="vm-manager">
+    {catalog && <div className="vm-profile-toolbar">
+      <label>VM 配置<select aria-label="VM 配置" value={selectedId} disabled={saving || submitting || !catalog.profiles.length} onChange={event => select(event.target.value)}>{!catalog.profiles.length && <option value="">暂无配置</option>}{catalog.profiles.map(item => <option key={item.id} value={item.id}>{item.label} · {item.name}</option>)}</select></label>
+      {catalog.canManage && <><IconButton label="新增 VM 配置" disabled={saving || submitting} onClick={() => { setEditing({ profile: { label: '', subscription: '', resourceGroup: '', name: '', comfyUrl: '' } }); setError('') }}><Plus size={18} /></IconButton><IconButton label="编辑 VM 配置" disabled={!profile || saving || submitting} onClick={() => { if (profile) { const { id, ...input } = profile; setEditing({ id, profile: input }); setError('') } }}><Pencil size={18} /></IconButton></>}
+      <IconButton label="刷新 VM 配置" disabled={saving || submitting} onClick={() => { setEditing(null); setRevisionKey(value => value + 1) }}><RefreshCw size={18} /></IconButton>
+    </div>}
+    {editing && <form className="vm-profile-form" onSubmit={event => void save(event)}>
+      <h3>{editing.id ? '编辑 VM 配置' : '新增 VM 配置'}</h3>
+      {([{ key: 'label', label: '配置名称', max: 80 }, { key: 'subscription', label: '订阅 ID', max: 36 }, { key: 'resourceGroup', label: '资源组', max: 90 }, { key: 'name', label: 'VM 名称', max: 64 }, { key: 'comfyUrl', label: 'ComfyUI 私网地址', max: 2048 }] as const).map(field => <label key={field.key}>{field.label}<input required type={field.key === 'comfyUrl' ? 'url' : 'text'} autoComplete="off" autoCapitalize="none" spellCheck={false} maxLength={field.max} disabled={saving} value={editing.profile[field.key]} onChange={event => setEditing({ ...editing, profile: { ...editing.profile, [field.key]: event.target.value } })} /></label>)}
+      <div className="vm-confirm-actions"><button type="button" disabled={saving} onClick={() => { setEditing(null); setError('') }}>取消</button><button className="primary" type="submit" disabled={saving}>{saving ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}保存配置</button></div>
+    </form>}
+    {error && <p role="alert" className="form-error">{error}</p>}
+    {!catalog && !error && <p role="status">正在读取 VM 配置</p>}
+    {!catalog && error && <button type="button" onClick={() => setRevisionKey(value => value + 1)}><RefreshCw size={17} />重试读取配置</button>}
+    {catalog && !editing && <VmInstancePanel key={`${selectedId}:${catalog.revision}`} profile={profile} revision={catalog.revision} onSubmitting={setSubmitting} />}
+  </div>
+}
+
+function VmInstancePanel({ profile, revision, onSubmitting }: { profile?: VmProfile; revision: string; onSubmitting: (busy: boolean) => void }) {
   const [status, setStatus] = useState<VmStatus | null>(null)
   const [error, setError] = useState('')
   const [statusError, setStatusError] = useState('')
@@ -152,14 +240,14 @@ function VmPanel() {
       if (checking) return
       checking = true
       if (active) setRefreshing(true)
-      try { const result = await api<VmStatus>('/vm', { signal: AbortSignal.timeout(15000) }); if (active) { setStatus(result); setStatusError(''); setCheckedAt(new Date().toISOString()) } }
+      try { const result = await api<VmStatus>(`/vm${profile ? `?profileId=${profile.id}` : ''}`, { signal: AbortSignal.timeout(15000) }); if (active) { setStatus(result); setStatusError(''); setCheckedAt(new Date().toISOString()) } }
       catch (failure) { if (active) setStatusError(failure instanceof Error ? failure.message : 'VM 状态读取失败') }
       finally { checking = false; if (active) setRefreshing(false) }
     }
     void refresh()
     const timer = setInterval(() => void refresh(), 10000)
     return () => { active = false; clearInterval(timer) }
-  }, [refreshKey])
+  }, [refreshKey, profile])
   const labels = { start: '启动', deallocate: '关闭并解除分配', restart: '重启' }
   const pending = busy || !!status?.operation && ['pending', 'unknown'].includes(status.operation.status)
   const canStart = ['deallocated', 'stopped'].includes(status?.powerState ?? '')
@@ -170,9 +258,9 @@ function VmPanel() {
   }
   async function submit() {
     if (!confirmation || !status?.name || busy) return
-    setBusy(true); setError('')
+    setBusy(true); onSubmitting(true); setError('')
     try {
-      setStatus(await api<VmStatus>('/vm/actions', { ...json('POST', { ...confirmation, confirmedName: status.name, force }), signal: AbortSignal.timeout(30000) }))
+      setStatus(await api<VmStatus>('/vm/actions', { ...json('POST', { ...confirmation, confirmedName: status.name, force, ...(profile ? { profileId: profile.id, revision } : {}) }), signal: AbortSignal.timeout(30000) }))
       setConfirmation(null); setForce(false)
     } catch (failure) {
       setError(failure instanceof Error && failure.name === 'TimeoutError' ? '请求超时，正在核实原操作；未自动重试。' : failure instanceof Error ? failure.message : 'VM 操作失败')
@@ -180,10 +268,11 @@ function VmPanel() {
       setStatusError('正在核实 VM 操作结果')
       setRefreshKey(value => value + 1)
     }
-    finally { setBusy(false) }
+    finally { setBusy(false); onSubmitting(false) }
   }
   return <div className="vm-panel">
-    <div className="vm-identity"><Cpu size={24} aria-hidden="true" /><div><span>GPU 实例</span><strong>{status?.name ?? 'VM'}</strong></div><IconButton label="刷新 VM 状态" disabled={refreshing || busy} onClick={() => setRefreshKey(value => value + 1)}><RefreshCw size={18} className={refreshing ? 'spin' : ''} /></IconButton></div>
+    <div className="vm-identity"><Cpu size={24} aria-hidden="true" /><div><span>GPU 实例</span><strong>{profile?.name ?? status?.name ?? 'VM'}</strong></div><IconButton label="刷新 VM 状态" disabled={refreshing || busy} onClick={() => setRefreshKey(value => value + 1)}><RefreshCw size={18} className={refreshing ? 'spin' : ''} /></IconButton></div>
+    {profile && <dl className="vm-profile-details"><div><dt>订阅</dt><dd>{profile.subscription}</dd></div><div><dt>资源组</dt><dd>{profile.resourceGroup}</dd></div><div><dt>ComfyUI</dt><dd>{profile.comfyUrl}</dd></div></dl>}
     {!status ? <p className="vm-empty">{statusError ? '暂时无法获取状态' : '正在读取 VM 状态'}</p> : !status.configured ? <p className="vm-empty">VM 管理未配置</p> : <>
       <div role="status" aria-live="polite" className="vm-state">
         <dl className="vm-facts"><div><dt>电源</dt><dd><span className={`status-dot ${status.powerState === 'running' ? '' : canStart ? 'gray' : 'amber'}`} />{powerLabel}</dd></div><div><dt>ComfyUI</dt><dd>{status.gpuReady ? <Check size={15} /> : <CirclePause size={15} />}{status.gpuReady ? '已就绪' : status.powerState === 'running' ? '等待服务' : '未就绪'}</dd></div><div><dt>计算计费</dt><dd>{status.powerState === 'deallocated' ? '已停止' : status.powerState === 'unknown' ? '待核实' : '可能持续计费'}</dd></div></dl>
@@ -230,7 +319,6 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [servicesOpen, setServicesOpen] = useState(false)
   const [optionsOpen, setOptionsOpen] = useState(false)
   const [vmOpen, setVmOpen] = useState(false)
-  const [avatarOpen, setAvatarOpen] = useState(false)
   const [guide, setGuide] = useState<CreationGuide | null>(null)
   const [guidesOpen, setGuidesOpen] = useState(false)
   const [brief, setBrief] = useState('')
@@ -283,7 +371,6 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   function switchProject(id: string) {
     uploadController.current?.abort()
     currentProject.current = id
-    setAvatarOpen(false)
     setGuide(null)
     setGuidesOpen(false)
     setProjectId(id); setSnapshot(null); setAttachments([]); setDraft(''); setSidebarOpen(false); setView('chat'); setConnected(false)
@@ -381,6 +468,11 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     })
   }
   function editDraft(text: string) { setDraft(text); submitRequest.current = null }
+  function openAvatarConversation() {
+    setGuidesOpen(false); setSidebarOpen(false); setView('chat')
+    if (!draft.trim()) editDraft('我想制作完整的数字人口播。请先确认文案、主播图片和分段续接安排，再开始生成。')
+    requestAnimationFrame(() => draftInput.current?.focus())
+  }
   function openGuide(kind: CreationGuide) {
     setGuidesOpen(false)
     setSidebarOpen(false); setGuide(kind); setBrief(''); setBriefDetail(''); setSourceId(''); setSourceFile(null); setError('')
@@ -534,7 +626,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="关闭提示" onClick={() => setError('')}><X size={16} /></IconButton><IconButton label="重试连接" onClick={() => void perform(async () => { const result = await loadProjects(); if (projectId) await refresh(projectId); else if (result.length) switchProject(result[0].id) })}><RefreshCw size={16} /></IconButton></div>}
       {initializing ? <div className="empty"><LoaderCircle className="spin" /><h2>正在读取工作空间</h2></div> : <div className="workspace-body chat-layout">
           <section className="conversation"><div className="conversation-scroll" ref={conversationScroll}><div className="conversation-content">
-            {!snapshot?.messages.length ? <div className="welcome"><div className="welcome-heading"><div><p className="welcome-brand">Codex Studio</p><h2>今天，想创作什么？</h2></div><Aperture size={25} aria-hidden="true" /></div><div className="welcome-status"><span className={`status-dot ${health?.agent === 'configured' ? '' : 'gray'}`} />{health?.agent === 'configured' ? 'Codex · GPT-5.4' : 'Codex 尚未连接'}</div>{creationEntries}{!projectId ? <button className="welcome-secondary" onClick={newProject}><Plus size={18} /><span>创建项目</span><ChevronRight size={16} /></button> : <button className="welcome-secondary" onClick={() => setAvatarOpen(true)}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button>}{sampleSection}</div> : <div className="messages">{snapshot.messages.filter(message => message.role !== 'assistant').map(message => {
+            {!snapshot?.messages.length ? <div className="welcome"><div className="welcome-heading"><div><p className="welcome-brand">Codex Studio</p><h2>今天，想创作什么？</h2></div><Aperture size={25} aria-hidden="true" /></div><div className="welcome-status"><span className={`status-dot ${health?.agent === 'configured' ? '' : 'gray'}`} />{health?.agent === 'configured' ? 'Codex · GPT-5.4' : 'Codex 尚未连接'}</div>{creationEntries}{!projectId ? <button className="welcome-secondary" onClick={newProject}><Plus size={18} /><span>创建项目</span><ChevronRight size={16} /></button> : <button className="welcome-secondary" onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button>}{sampleSection}</div> : <div className="messages">{snapshot.messages.filter(message => message.role !== 'assistant').map(message => {
               const job = jobs.find(item => item.messageId === message.id)
               const run = runs.find(item => item.messageId === message.id)
               const reply = run ? snapshot.messages.find(item => item.id === run.assistantId) : undefined
@@ -550,12 +642,12 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
                   <RunProgress run={run} />
                   {reply && <div className="message-content"><MarkdownReply text={reply.text} /></div>}
                   <ImagePending run={run} connected={connected} />
-                  {reply && reply.assetIds.length > 0 && <div className="message-images">{reply.assetIds.map(id => { const asset = assets.find(item => item.id === id); return asset && (asset.mediaType === 'video' ? <div className="video-result" key={id}><video className="generated-video" controls playsInline preload="metadata" poster={imageUrl(asset)} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="video-meta"><span>MiniMax H3 · {asset.duration?.toFixed(2)} 秒</span><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={18} /></a></div></div> : <button key={id} onClick={() => setSelectedAsset(asset)}><img src={imageUrl(asset)} alt={asset.name} width={asset.width} height={asset.height} /></button>) })}</div>}
-                  {run.stage === 'video' && ['failed', 'cancelled', 'interrupted'].includes(run.status) && <p className="image-outcome" role="status">{run.status === 'failed' ? '视频生成失败' : '视频任务结果待核实'}</p>}
+                  {reply && <ReplyAssets ids={run.avatarJobId || run.story ? run.assetId ? [run.assetId] : [] : reply.assetIds} assets={assets} select={setSelectedAsset} />}
+                  {(!!run.avatarJobId || !!run.story) && <NarrationTimeline run={run} assets={assets} select={setSelectedAsset} connected={connected} />}
+                  {!run.avatarJobId && !run.story && run.stage === 'video' && ['failed', 'cancelled', 'interrupted'].includes(run.status) && <p className="image-outcome" role="status">{run.status === 'failed' ? '视频生成失败' : '视频任务结果待核实'}</p>}
                   {run.stage === 'image' && ['failed', 'cancelled', 'interrupted'].includes(run.status) && <p className="image-outcome" role="status">{{ failed: '图片生成失败', cancelled: '图片生成已停止', interrupted: '图片生成结果待核实' }[run.status as 'failed' | 'cancelled' | 'interrupted']}</p>}
                   {run.error && <div className="run-status" role="status"><p>{run.error}</p></div>}
                   {reply?.text && <CopyReply key={reply.id} text={reply.text} createdAt={reply.createdAt} />}
-                  {reply?.assetIds.map(id => { const asset = assets.find(item => item.id === id); return asset?.mediaType === 'video' ? <ShareAssetButton key={asset.id} asset={asset} /> : null })}
                 </article>}
                 {job && <div className="job-inline"><CirclePause size={16} /><span>{job.status === 'cancelled' ? '已取消' : '已保存 · 等待服务接入'}</span><span className="mono">{job.ratio}</span><button onClick={() => setView('tasks')}>查看任务<ChevronRight size={14} /></button></div>}
               </section>
@@ -566,19 +658,18 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
           <form className="composer" onSubmit={event => void submit(event)}>
             {attachments.length > 0 && <div className="attachments">{attachments.map(asset => <div key={asset.id}><button type="button" className="attachment-preview" aria-label={`查看附件 ${asset.name}`} onClick={() => setSelectedAsset(asset)}><AssetPreview asset={asset} /><span>{asset.name}</span></button><IconButton label={`移除附件 ${asset.name}`} disabled={busy} onClick={() => { setAttachments(previous => previous.filter(item => item.id !== asset.id)); submitRequest.current = null }}><X size={13} /></IconButton></div>)}</div>}
             <div className="composer-input"><textarea ref={draftInput} aria-label="创作需求" placeholder={projectId ? '说说你的想法…' : '先创建一个项目'} value={draft} disabled={!projectId || busy} maxLength={6000} onChange={event => editDraft(event.target.value)} rows={2} /></div>
-            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={20} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={20} /></IconButton><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy} onClick={() => void stopRun(activeRuns[0])}><Square size={18} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={17} />}</button></div></div>
+            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={20} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={20} /></IconButton><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={18} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={17} />}</button></div></div>
           </form></section>
         <Modal open={view !== 'chat'} onOpenChange={open => { if (!open) setView('chat') }} title={view === 'images' ? '素材库' : '任务记录'} className="project-panel">
         {uploadStatus}
-        {view === 'images' && <section className="collection"><div className="collection-toolbar"><h2>{assets.length} 个素材</h2><button className="primary" disabled={!projectId || busy} onClick={() => fileInput.current?.click()}><Plus size={17} />上传文件</button></div>{!assets.length ? <div className="empty"><Images size={32} /><h2>还没有项目资料</h2>{!projectId && <button className="primary" onClick={newProject}><Plus size={16} />创建项目</button>}</div> : <div className="asset-grid">{assets.slice().reverse().map(asset => <button className="asset" key={asset.id} onClick={() => { setView('chat'); setSelectedAsset(asset) }}><div className="asset-image"><AssetPreview asset={asset} /><span className="asset-kind">{asset.kind === 'generated' ? asset.mediaType === 'video' ? asset.model === 'azure-avatar' ? '数字人口播' : 'H3 视频' : `${asset.provider ?? 'Azure'} 生成` : asset.mediaType === 'file' ? '文件' : asset.mediaType === 'video' ? '视频' : '参考图'}</span></div><strong>{asset.name}</strong><small>{assetDetails(asset)}</small></button>)}</div>}</section>}
+        {view === 'images' && <section className="collection"><div className="collection-toolbar"><h2>{assets.length} 个素材</h2><button className="primary" disabled={!projectId || busy} onClick={() => fileInput.current?.click()}><Plus size={17} />上传文件</button></div>{!assets.length ? <div className="empty"><Images size={32} /><h2>还没有项目资料</h2>{!projectId && <button className="primary" onClick={newProject}><Plus size={16} />创建项目</button>}</div> : <div className="asset-grid">{assets.slice().reverse().map(asset => <button className="asset" key={asset.id} onClick={() => { setView('chat'); setSelectedAsset(asset) }}><div className="asset-image"><AssetPreview asset={asset} /><span className="asset-kind">{asset.kind === 'generated' ? asset.mediaType === 'video' ? ['azure-avatar', 'sadtalker'].includes(asset.model ?? '') ? '数字人口播' : 'H3 视频' : asset.model === 'frame_sampler' ? '视频尾帧' : `${asset.provider ?? 'Azure'} 生成` : asset.mediaType === 'file' ? '文件' : asset.mediaType === 'video' ? '视频' : '参考图'}</span></div><strong>{asset.name}</strong><small>{assetDetails(asset)}</small></button>)}</div>}</section>}
         {view === 'tasks' && runs.length > 0 && <section className="collection"><div className="collection-toolbar"><h2>{runs.length} 条运行记录</h2></div><div className="task-list">{runs.slice().reverse().map(run => <article className="task agent-task" key={run.id}><div className="task-icon">{run.stage === 'image' ? <Images size={20} /> : run.stage === 'video' ? <Aperture size={20} /> : <MessageSquare size={20} />}</div><div className="task-content"><div><span className="badge">{runLabel(run)}</span><time>{time(run.createdAt)}</time></div><p>{run.input.text}</p><small>{runModel(run)}</small>{run.error && <p className="form-error">{run.error}</p>}</div>{['queued', 'running'].includes(run.status) && <IconButton label="停止运行" disabled={busy} onClick={() => void stopRun(run)}><Square size={18} /></IconButton>}</article>)}</div></section>}
         {view === 'tasks' && (jobs.length > 0 || !runs.length) && <section className="collection"><div className="collection-toolbar"><h2>{jobs.length} 条任务</h2><select aria-label="任务状态筛选" value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部状态</option><option value="waiting_service">等待服务</option><option value="cancelled">已取消</option></select></div>{!jobs.length ? <div className="empty"><ListTodo size={32} /><h2>暂无任务</h2></div> : <div className="task-list">{jobs.filter(job => filter === 'all' || job.status === filter).slice().reverse().map(job => <article className="task" key={job.id}><div className={`task-icon ${job.status === 'cancelled' ? 'cancelled' : ''}`}><CirclePause size={21} /></div><div className="task-content"><div><span className={`badge ${job.status === 'cancelled' ? 'neutral' : ''}`}>{job.status === 'cancelled' ? '已取消' : '等待服务'}</span><time>{time(job.createdAt)}</time></div><p>{job.prompt}</p><small>Qwen-Image-2.1 · {job.ratio} · {job.assetIds.length} 张参考图</small></div>{job.status === 'waiting_service' ? <IconButton label="取消任务" disabled={busy} onClick={() => void perform(async () => { await api(`/jobs/${job.id}/cancel`, { method: 'POST' }); await refresh(projectId) })}><X size={19} /></IconButton> : <IconButton label="重新编辑需求" disabled={busy} onClick={() => { editDraft(job.prompt); setRatio(health?.agentConfigured ? '1:1' : job.ratio); setAttachments(assets.filter(asset => job.assetIds.includes(asset.id))); setView('chat') }}><RefreshCw size={18} /></IconButton>}</article>)}{jobs.filter(job => filter === 'all' || job.status === filter).length === 0 && <div className="empty">没有符合条件的任务</div>}</div>}</section>}
         </Modal>
       </div>}
     </main>
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
-    <AvatarStudio key={projectId} projectId={projectId} open={avatarOpen} onOpenChange={setAvatarOpen} />
-    <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={() => { setGuidesOpen(false); setAvatarOpen(true) }}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
+    <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
     <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'}>
       {guide && <form className="creation-brief" onSubmit={event => void prepareCreation(event)}>
         {uploadStatus}
@@ -590,7 +681,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
         {error && <p role="alert" className="form-error">{error}</p>}
       </form>}
     </Modal>
-    <Modal open={sidebarOpen} onOpenChange={setSidebarOpen} title="项目列表" className="project-drawer">{projectList}<div className="project-shortcuts"><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setView('images') }}><Images size={19} />素材库</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setAvatarOpen(true) }}><Film size={19} />数字人口播</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setFilter('all'); setView('tasks') }}><ListTodo size={19} />任务记录{waiting > 0 && <small>{waiting}</small>}</button><button className="service-entry" type="button" onClick={() => { setSidebarOpen(false); setStorageStatus('checking'); setServicesOpen(true) }}><Cpu size={19} />{health?.agentConfigured ? '服务状态' : '服务未接入'}</button></div></Modal>
+    <Modal open={sidebarOpen} onOpenChange={setSidebarOpen} title="项目列表" className="project-drawer">{projectList}<div className="project-shortcuts"><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setView('images') }}><Images size={19} />素材库</button><button className="service-entry" type="button" disabled={!projectId} onClick={openAvatarConversation}><Film size={19} />数字人口播</button><button className="service-entry" type="button" disabled={!projectId} onClick={() => { setSidebarOpen(false); setFilter('all'); setView('tasks') }}><ListTodo size={19} />任务记录{waiting > 0 && <small>{waiting}</small>}</button><button className="service-entry" type="button" onClick={() => { setSidebarOpen(false); setStorageStatus('checking'); setServicesOpen(true) }}><Cpu size={19} />{health?.agentConfigured ? '服务状态' : '服务未接入'}</button></div></Modal>
     <Modal open={optionsOpen} onOpenChange={setOptionsOpen} title="设置">
       {user && <div className="account-settings"><span>{user.name}</span><small>{user.provider === 'entra' ? 'Microsoft Entra ID' : '本地账号'}</small><button type="button" onClick={() => void perform(async () => { await onLogout?.() })}>退出登录</button></div>}
       {user?.admin && <LocalAccounts />}

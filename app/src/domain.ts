@@ -8,6 +8,7 @@ export type Asset = {
   createdAt: string; hash: string; bytes: number; kind: 'reference' | 'generated'
   model?: string; provider?: string; runId?: string
   sourceAssetId?: string; sourceHash?: string
+  narration?: string; frameSeconds?: number
   mediaType?: 'image' | 'video' | 'file'; duration?: number; fps?: number
   mimeType?: string; storageExtension?: 'png' | 'mp4' | 'bin'; hasThumbnail?: boolean
 }
@@ -24,12 +25,18 @@ export type Job = {
 }
 export type AgentInput = { requestId: string; text: string; assetIds?: string[]; mode: 'auto' | 'chat' | 'image'; ratio: Ratio; quality?: Quality; imageModel?: ImageModel; videoModel?: VideoModel }
 export type AgentProgress = { id: string; label: string; detail?: string; createdAt: string }
+export type NarrationProgress = { phase: 'script' | 'speech' | 'queued' | 'rendering' | 'tail' | 'stitching' | 'completed' | 'stopped'; segment: number; updatedAt: string }
+export type NarrationState = { segments: { text: string; continueFromPrevious: boolean }[]; progress?: NarrationProgress; stopRequested?: boolean; scriptAssetId?: string }
+export type StoryState = { title: string; segments: { text: string; prompt: string }[]; clipIds: string[]; phase: 'script' | 'rendering' | 'stitching' | 'completed' | 'stopped'; segment: number; stopRequested?: boolean; scriptAssetId?: string }
 export type AgentRun = {
   id: string; projectId: string; messageId: string; assistantId: string; input: AgentInput
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
   stage: 'codex' | 'image' | 'video'; reply: string; threadId: string | null; error?: string
   imageOperation?: 'generate' | 'edit'; sourceAssetId?: string
   assetId?: string; processedAssetIds?: string[]; progress?: AgentProgress[]; createdAt: string; updatedAt: string
+  avatarJobId?: string
+  narration?: NarrationState
+  story?: StoryState
 }
 export type Snapshot = { project: Project; messages: Message[]; assets: Asset[]; jobs: Job[]; runs: AgentRun[]; threadId: string | null }
 export type Submission = { requestId: string; text: string; assetIds: string[]; ratio: Ratio }

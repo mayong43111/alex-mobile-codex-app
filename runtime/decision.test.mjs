@@ -1,9 +1,80 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseDecision, renderSettings, editOutputSize, imageOutputSize } from './decision.mjs'
+import { parseDecision, renderSettings, editOutputSize, imageOutputSize, narrationEditingSkill } from './decision.mjs'
 import { ImageSourceRequest, sourceBodyLimit } from './image-source.mjs'
 import Fastify from 'fastify'
 import { createHash, randomUUID } from 'node:crypto'
+import { executeStory } from './story.mjs'
+
+test('story execution persists each clip, stops at boundaries and never retries a started plan', async context => {
+  for (const stopAt of [0, 1, 2, null]) await context.test(`stop ${stopAt}`, async () => {
+    const run = { id: randomUUID(), status: 'running' }
+    const plan = { title: '故事', segments: [{ text: '开头', prompt: 'first' }, { text: '结尾', prompt: 'last' }] }
+    const events = [], calls = []
+    const operations = {
+      save: async state => { events.push({ phase: state.story.phase, clips: state.processedVideos.length }); if (stopAt === state.processedVideos.length) state.story.stopRequested = true },
+      render: async input => { calls.push(input); return { success: true, mp4: Buffer.from('clip').toString('base64'), width: 576, height: 1024 } },
+      stitch: async input => { assert.equal(input.clipIds.length, 2); assert.equal(run.processedVideos.length, 2); return { success: true, duration: 10.334 } },
+    }
+    await executeStory(run, { ratio: '9:16', quality: 'low' }, plan, operations)
+    assert.equal(calls.length, stopAt ?? 2)
+    assert.equal(run.story.phase, stopAt === null ? 'completed' : 'stopped')
+    assert.equal(!!run.video, stopAt === null)
+    assert.equal(new Set(calls.map(call => call.runId)).size, calls.length)
+    assert(calls.every(call => call.ratio === '9:16' && call.model === 'minimax-h3'))
+    if (stopAt === null) assert(events.some(event => event.clips === 1 && event.phase === 'rendering'))
+    await assert.rejects(executeStory(run, {}, plan, operations), /already started/)
+  })
+})
+
+test('uncertain story clip failure preserves earlier clips without submitting later ones', async () => {
+  const run = { id: randomUUID() }
+  let calls = 0
+  await assert.rejects(executeStory(run, {}, { title: '故事', segments: Array(3).fill({ text: '镜头', prompt: 'scene' }) }, {
+    save: async () => {}, stitch: async () => assert.fail('Must not stitch incomplete clips'),
+    render: async () => { if (++calls === 2) return { success: false, error: 'Uncertain submission' }; return { success: true, mp4: 'YQ==' } },
+  }), /Uncertain/)
+  assert.equal(calls, 2)
+  assert.equal(run.processedVideos.length, 1)
+})
+
+test('multi-clip story is explicit, bounded, and cannot execute in chat or without the video model', () => {
+  const decision = { action: 'video', reply: '开始制作', imagePrompt: null, videoPrompt: null, ratio: '9:16', storyPlan: { title: '迟到的明信片', segments: Array.from({ length: 8 }, (_, index) => ({ text: `第${index + 1}镜`, prompt: `Shot ${index + 1}, portrait, natural ambient audio` })) } }
+  const parse = (value = decision, mode = 'auto', enabled = true) => parseDecision(JSON.stringify(value), mode, [], enabled)
+  assert.equal(parse().storyPlan.segments.length, 8)
+  assert.equal(parse().ratio, '9:16')
+  assert.equal(parse(decision, 'chat').storyPlan, null)
+  assert.equal(parse(decision, 'auto', false).storyPlan, undefined)
+  const redundant = parse({ ...decision, videoPrompt: 'redundant summary, never execute an extra clip' })
+  assert.equal(redundant.videoPrompt, null)
+  assert.equal(redundant.storyPlan.segments.length, 8)
+  assert.throws(() => parse({ ...decision, storyPlan: null }), /requires/)
+  assert.throws(() => parse({ ...decision, action: 'image', imagePrompt: 'wrong media' }), /video action/)
+  assert.throws(() => parse({ ...decision, storyPlan: { ...decision.storyPlan, segments: Array(13).fill(decision.storyPlan.segments[0]) } }))
+})
+
+test('narration editing skill loads as advice rather than a continuation limit', () => {
+  assert.match(narrationEditingSkill, /name: narration-editing/)
+  assert.match(narrationEditingSkill, /at most two consecutive generated clips/)
+  assert.match(narrationEditingSkill, /preference, not a hard limit/)
+  assert.match(narrationEditingSkill, /Resetting to the same source is NOT/)
+})
+
+test('conversational avatar requires an enabled service, selected image and bounded narration plan', () => {
+  const source = randomUUID()
+  const decision = { action: 'avatar', reply: '准备分段口播', imagePrompt: null, sourceAssetId: source, avatarPlan: { voice: 'zh-CN-XiaoxiaoNeural', segments: [{ text: '第一段。', continueFromPrevious: false }, { text: '第二段。', continueFromPrevious: true }] } }
+  const parse = (value = decision, mode = 'auto', candidates = [source], enabled = true) => parseDecision(JSON.stringify(value), mode, candidates, false, enabled)
+  assert.equal(parse().action, 'avatar')
+  assert.equal(parse().avatarPlan.segments[1].continueFromPrevious, true)
+  assert.equal(parse({ ...decision, avatarPlan: { ...decision.avatarPlan, segments: [...decision.avatarPlan.segments, { text: '第三段。', continueFromPrevious: true }] } }).avatarPlan.segments.length, 3)
+  assert.equal(parse({ ...decision, avatarPlan: { ...decision.avatarPlan, segments: [...decision.avatarPlan.segments, { text: '第三段。', continueFromPrevious: false }, { text: '第四段。', continueFromPrevious: true }] } }).avatarPlan.segments.length, 4)
+  assert.equal(parse(decision, 'chat').avatarPlan, null)
+  assert.equal(parse(decision, 'auto', [source], false).action, 'chat')
+  assert.throws(() => parse(decision, 'auto', []), /allowed sourceAssetId/)
+  assert.throws(() => parse({ ...decision, avatarPlan: null }), /narration plan/)
+  assert.throws(() => parse({ ...decision, avatarPlan: { ...decision.avatarPlan, segments: [{ text: '第一段。', continueFromPrevious: true }] } }))
+  assert.throws(() => parse({ ...decision, avatarPlan: { ...decision.avatarPlan, segments: Array(13).fill(decision.avatarPlan.segments[0]) } }))
+})
 
 test('Azure edits accept phone photos without changing the source or GPU dimensions', () => {
   const source = { width: 3024, height: 4032 }

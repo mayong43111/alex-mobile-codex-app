@@ -10,10 +10,33 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from PIL import Image
-from comfy_media import workflow, checked_source, validate_media, MODELS, ComfyMedia
+from comfy_media import workflow, checked_source, validate_media, MODELS, ComfyMedia, stitch_story
 
 
 class ComfyMediaTest(unittest.TestCase):
+    def test_story_stitch_uses_native_tool_and_validates_project_clip_order(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = str(uuid4())
+            clip_ids = [str(uuid4()), str(uuid4())]
+            for clip_id in clip_ids:
+                (root / clip_id).mkdir()
+                (root / clip_id / 'comfy-job.json').write_text(json.dumps({'run_id': clip_id, 'model': 'minimax-h3', 'status': 'completed'}))
+                subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:r=24', '-f', 'lavfi', '-i', 'anullsrc=r=32000:cl=stereo', '-t', '0.5', '-c:v', 'libx264', '-c:a', 'aac', str(root / clip_id / 'video.mp4')], check=True, capture_output=True)
+            (root / f'{run_id}.json').write_text(json.dumps({'story': {'title': 'Story fixture', 'clipIds': clip_ids}, 'processedVideos': [{'assetId': clip_id, 'duration': 0.5, 'thumbnail': ''} for clip_id in clip_ids]}))
+            request = {'runId': run_id, 'clipIds': clip_ids, 'width': 64, 'height': 64}
+            with patch('comfy_media.Path', side_effect=lambda value: root if value in ['/state/montage', '/state/runs'] else Path(value)):
+                with self.assertRaisesRegex(ValueError, 'ownership or order'):
+                    stitch_story({**request, 'clipIds': list(reversed(clip_ids))})
+                result = stitch_story(request)
+                self.assertTrue(result['success'])
+                self.assertAlmostEqual(result['duration'], 1, delta=0.15)
+                self.assertEqual(result['fps'], 24)
+                self.assertTrue((root / run_id / 'checkpoint_assets.json').is_file())
+                with self.assertRaises(FileExistsError):
+                    stitch_story(request)
+
     def test_explicit_edit_dimensions_use_target_latent_and_unchanged_reference(self):
         source = {'filename': 'original.png', 'width': 1024, 'height': 1024}
         graph, width, height, _ = workflow('qwen-image-2.1', 'reframe wide', '1:1', 1, source, size='2048x1152')
