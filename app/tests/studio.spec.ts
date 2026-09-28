@@ -5,6 +5,256 @@ import sharp from 'sharp'
 import { randomUUID } from 'node:crypto'
 import type { VmProfiles } from '../server/vm.ts'
 
+test('pose studio renders the final mannequin, changes poses and fits mobile and desktop', async ({ page, request }, testInfo) => {
+  test.setTimeout(60000)
+  const project = await (await request.post('/api/projects', { data: { title: '姿势调整验收' } })).json()
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  await page.goto('/')
+  await page.getByRole('button', { name: '姿势生图', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '姿势生图', exact: true })
+  await expect(dialog.locator('.pose-viewport')).toHaveAttribute('data-ready', 'true', { timeout: 30000 })
+  const canvas = dialog.locator('canvas')
+  const pixels = () => canvas.evaluate((element: HTMLCanvasElement) => {
+    const copy = document.createElement('canvas'); copy.width = element.width; copy.height = element.height
+    const context = copy.getContext('2d')!; context.drawImage(element, 0, 0)
+    const rgba = context.getImageData(0, 0, copy.width, copy.height).data
+    let count = 0; let left = copy.width; let right = 0; let top = copy.height; let bottom = 0
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      if (Math.max(rgba[offset], rgba[offset + 1], rgba[offset + 2]) - Math.min(rgba[offset], rgba[offset + 1], rgba[offset + 2]) < 25) continue
+      const horizontal = (offset / 4) % copy.width; const vertical = Math.floor(offset / 4 / copy.width)
+      count++; left = Math.min(left, horizontal); right = Math.max(right, horizontal); top = Math.min(top, vertical); bottom = Math.max(bottom, vertical)
+    }
+    return { count, left, right, top, bottom, width: copy.width, height: copy.height, image: copy.toDataURL() }
+  })
+  const standing = await pixels()
+  expect(standing.count).toBeGreaterThan(500)
+  await expect(dialog.getByRole('button', { name: '带入生成草稿' })).toBeDisabled()
+  const preset = dialog.getByLabel('内置姿势')
+  const library = await (await request.get('/pose/presets.json')).json()
+  expect(library.poses).toHaveLength(43)
+  expect(new Set(library.poses.map((pose: { source: { license: string; pack: string; sha256: string } }) => `${pose.source.license}:${pose.source.pack}:${pose.source.sha256}`))).toEqual(new Set(['CC0-1.0:Universal Animation Library Standard:69591853d817488edaa8fd9bf8fc1d821eaeaf789f8627b3cd23b41c4ed67997']))
+  await expect(preset.locator('option')).toHaveCount(44)
+  await expect(dialog.getByRole('slider')).toHaveCount(0)
+  await expect(dialog.getByLabel('关节', { exact: true })).toHaveCount(0)
+  for (const { id } of library.poses) {
+    await preset.selectOption(id)
+    const sample = await pixels()
+    expect(sample.count).toBeGreaterThan(500)
+    expect(sample.left).toBeGreaterThan(1); expect(sample.right).toBeLessThan(sample.width - 1)
+    expect(sample.top).toBeGreaterThan(1); expect(sample.bottom).toBeLessThan(sample.height - 1)
+    if (id !== 'ual1Idle') expect(sample.image).not.toBe(standing.image)
+  }
+  await preset.selectOption('ual1-A_TPose')
+  const coloredPoint = (color: 'green' | 'blue') => canvas.evaluate((element: HTMLCanvasElement, color) => {
+    const copy = document.createElement('canvas'); copy.width = element.width; copy.height = element.height
+    const context = copy.getContext('2d')!; context.drawImage(element, 0, 0)
+    const rgba = context.getImageData(0, 0, copy.width, copy.height).data
+    const points: { x: number; y: number }[] = []
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      const [red, green, blue] = rgba.subarray(offset, offset + 3)
+      if (color === 'green' ? red < 40 && green > 85 && green < 160 && blue > 60 && blue < 140 : blue > 190 && blue - red > 60 && blue - green > 60 && Math.abs(red - green) < 25) points.push({ x: (offset / 4) % copy.width, y: Math.floor(offset / 4 / copy.width) })
+    }
+    if (!points.length) throw new Error(`Missing ${color} control pixels`)
+    const right = Math.max(...points.map(point => point.x))
+    const edge = points.filter(point => point.x > right - 3)
+    const target = edge[Math.floor(edge.length / 2)]
+    const bounds = element.getBoundingClientRect()
+    return { x: bounds.x + target.x / copy.width * bounds.width, y: bounds.y + target.y / copy.height * bounds.height }
+  }, color)
+  const marker = await coloredPoint('green')
+  await page.touchscreen.tap(marker.x, marker.y)
+  await expect(dialog.locator('.pose-viewport')).toHaveAttribute('data-selected-joint', 'leftHand')
+  await expect(dialog.getByRole('status')).toContainText('左手')
+  const before = await pixels()
+  await page.screenshot({ path: testInfo.outputPath('pose-selected.png') })
+  const ring = await coloredPoint('blue')
+  if (testInfo.project.name === 'mobile') {
+    const touch = await page.context().newCDPSession(page)
+    await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: ring.x, y: ring.y, id: 1 }] })
+    for (let step = 1; step <= 10; step++) await touch.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: ring.x - step * 2, y: ring.y - step * 3, id: 1 }] })
+    await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+    await touch.detach()
+  } else {
+    await page.mouse.move(ring.x, ring.y)
+    await page.mouse.down()
+    await page.mouse.move(ring.x - 20, ring.y - 30, { steps: 10 })
+    await page.mouse.up()
+  }
+  await expect(preset).toHaveValue('')
+  expect((await pixels()).image).not.toBe(before.image)
+  await dialog.getByRole('button', { name: '撤销姿势' }).click()
+  await expect(preset).toHaveValue('ual1-A_TPose')
+  await dialog.getByRole('button', { name: '重做姿势' }).click()
+  await expect(preset).toHaveValue('')
+  await dialog.getByRole('button', { name: '镜像姿势' }).click()
+  await canvas.press('Escape')
+  const adjusted = (await pixels()).image
+  await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+  await page.getByRole('button', { name: '姿势生图', exact: true }).click()
+  await expect(dialog.locator('.pose-viewport')).toHaveAttribute('data-ready', 'true', { timeout: 30000 })
+  expect((await pixels()).image).toBe(adjusted)
+  await dialog.getByRole('button', { name: '恢复站立' }).click()
+  await dialog.locator('.pose-viewport').scrollIntoViewIfNeeded()
+  const bounds = (await canvas.boundingBox())!
+  const front = (await pixels()).image
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(bounds.x + bounds.width / 2 + 65, bounds.y + bounds.height / 2 + 10, { steps: 8 })
+  await page.mouse.up()
+  expect((await pixels()).image).not.toBe(front)
+  await dialog.getByRole('button', { name: '正面全身' }).click()
+  for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 844 }, { width: 1280, height: 800 }]) {
+    await page.setViewportSize(viewport)
+    await dialog.locator('.pose-viewport').scrollIntoViewIfNeeded()
+    await expect.poll(async () => (await canvas.boundingBox())!.width).toBeGreaterThan(viewport.width - 5)
+    const sample = await pixels()
+    expect(sample.count).toBeGreaterThan(500)
+    expect(sample.left).toBeGreaterThan(2); expect(sample.right).toBeLessThan(sample.width - 2)
+    expect(sample.top).toBeGreaterThan(2); expect(sample.bottom).toBeLessThan(sample.height - 2)
+    expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+    await page.screenshot({ path: testInfo.outputPath(`pose-${viewport.width}.png`) })
+  }
+  expect(errors).toEqual([])
+})
+
+test('pose fullscreen keeps the same editor, fits orientation changes and preserves the form', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '全屏姿势编辑' } })).json()
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  await page.getByRole('button', { name: '姿势生图', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '姿势生图', exact: true })
+  await expect(dialog.locator('.pose-viewport')).toHaveAttribute('data-ready', 'true', { timeout: 30000 })
+  const canvas = dialog.locator('canvas')
+  await canvas.evaluate(element => element.setAttribute('data-retained-canvas', 'true'))
+  await dialog.getByLabel('场景与风格').fill('保留这段场景要求')
+  await dialog.getByLabel('人物图片文件').setInputFiles({ name: 'person.png', mimeType: 'image/png', buffer: await sharp({ create: { width: 16, height: 32, channels: 3, background: '#178853' } }).png().toBuffer() })
+  await dialog.getByLabel('内置姿势', { exact: true }).selectOption('ual1Talking')
+  await dialog.getByRole('button', { name: '全屏编辑', exact: true }).click()
+  await expect(dialog.locator('.pose-studio')).toHaveAttribute('data-fullscreen', 'true')
+  await expect(dialog.locator('.pose-fields')).toBeHidden()
+  await expect(dialog.getByRole('heading', { name: '姿势生图' })).toBeHidden()
+  await dialog.getByLabel('内置姿势', { exact: true }).selectOption('ual1-A_TPose')
+  for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 844 }, { width: 844, height: 390 }, { width: 1280, height: 800 }]) {
+    await page.setViewportSize(viewport)
+    await expect(canvas).toHaveCSS('height', `${viewport.height}px`)
+    await expect(canvas).toHaveAttribute('data-retained-canvas', 'true')
+    const frame = await canvas.evaluate((element: HTMLCanvasElement) => {
+      const copy = document.createElement('canvas'); copy.width = element.width; copy.height = element.height
+      const context = copy.getContext('2d')!; context.drawImage(element, 0, 0)
+      const pixels = context.getImageData(0, 0, copy.width, copy.height).data
+      let count = 0; let left = copy.width; let right = 0; let top = copy.height; let bottom = 0
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        if (Math.max(...pixels.subarray(offset, offset + 3)) - Math.min(...pixels.subarray(offset, offset + 3)) < 25) continue
+        const horizontal = (offset / 4) % copy.width; const vertical = Math.floor(offset / 4 / copy.width)
+        count++; left = Math.min(left, horizontal); right = Math.max(right, horizontal); top = Math.min(top, vertical); bottom = Math.max(bottom, vertical)
+      }
+      const bounds = element.getBoundingClientRect()
+      return { count, left: left / copy.width * bounds.width, right: right / copy.width * bounds.width, top: top / copy.height * bounds.height, bottom: bottom / copy.height * bounds.height }
+    })
+    expect(frame.count).toBeGreaterThan(500)
+    expect(frame.left).toBeGreaterThan(2); expect(frame.right).toBeLessThan(viewport.width - 2)
+    const bar = (await dialog.locator('.pose-viewbar').boundingBox())!
+    const tools = (await dialog.getByRole('toolbar', { name: '姿势工具' }).boundingBox())!
+    expect(frame.top).toBeGreaterThan(bar.y + bar.height)
+    expect(frame.bottom).toBeLessThan(tools.y)
+    expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+    await page.screenshot({ path: testInfo.outputPath(`pose-fullscreen-${viewport.width}.png`) })
+  }
+  const beforeOrbit = await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())
+  await page.mouse.move(80, 110)
+  await page.mouse.down()
+  await page.mouse.move(135, 135, { steps: 8 })
+  await page.mouse.up()
+  expect(await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())).not.toBe(beforeOrbit)
+  await dialog.getByRole('button', { name: '退出全屏编辑' }).focus()
+  await page.keyboard.press('Escape')
+  await expect(dialog.locator('.pose-studio')).toHaveAttribute('data-fullscreen', 'false')
+  await expect(dialog).toBeVisible()
+  await expect(canvas).toHaveAttribute('data-retained-canvas', 'true')
+  await expect(dialog.getByLabel('场景与风格')).toHaveValue('保留这段场景要求')
+  await expect(dialog.getByRole('img', { name: '已选人物参考图' })).toBeVisible()
+  await dialog.getByRole('button', { name: '撤销姿势' }).click()
+  await expect(dialog.getByLabel('内置姿势', { exact: true })).toHaveValue('ual1Talking')
+  await dialog.getByRole('button', { name: '全屏编辑', exact: true }).click()
+  await dialog.getByRole('button', { name: '退出全屏编辑', exact: true }).click()
+  await expect(dialog.locator('.pose-fields')).toBeVisible()
+})
+
+test('pose reference board preserves both inputs and prepares an explicit edit without generating', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: `姿势参考板-${testInfo.project.name}` } })).json()
+  const original = await sharp({ create: { width: 400, height: 600, channels: 3, background: '#178853' } }).png().toBuffer()
+  const source = await (await request.post(`/api/projects/${project.id}/uploads`, { multipart: { file: { name: 'person.png', mimeType: 'image/png', buffer: original } } })).json()
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  let submissions = 0
+  page.on('request', entry => { if (entry.method() === 'POST' && /\/(chat|messages)$/.test(new URL(entry.url()).pathname)) submissions++ })
+  await page.goto('/')
+  await page.getByLabel('创作需求').fill('保留已有需求')
+  await page.getByRole('button', { name: '姿势生图', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '姿势生图', exact: true })
+  await expect(dialog.locator('.pose-viewport')).toHaveAttribute('data-ready', 'true', { timeout: 30000 })
+  const canvas = dialog.locator('canvas')
+  const bounds = (await canvas.boundingBox())!
+  await canvas.click({ position: { x: bounds.width / 2, y: bounds.height / 2 } })
+  await expect(dialog.locator('.pose-selected')).toBeVisible()
+  await dialog.getByLabel('人物参考图', { exact: true }).selectOption(source.id)
+  await dialog.getByLabel('场景与风格').fill('自然光，全身照片')
+  await dialog.getByRole('button', { name: '带入生成草稿' }).click()
+  await expect(dialog).toHaveCount(0)
+  const snapshot = await (await request.get(`/api/projects/${project.id}`)).json()
+  expect(snapshot.assets).toHaveLength(2)
+  expect(snapshot.messages).toHaveLength(0)
+  expect(snapshot.runs).toHaveLength(0)
+  expect(submissions).toBe(0)
+  const board = snapshot.assets.find((asset: { id: string }) => asset.id !== source.id)
+  expect([board.width, board.height]).toEqual([1536, 1024])
+  const content = await (await request.get(`/api/assets/${board.id}/content`)).body()
+  const right = await sharp(content).extract({ left: 1100, top: 400, width: 30, height: 30 }).raw().toBuffer()
+  expect(Array.from(right.subarray(0, 3))).toEqual([23, 136, 83])
+  const left = await sharp(content).extract({ left: 0, top: 60, width: 768, height: 952 }).stats()
+  expect(left.channels[0].stdev).toBeGreaterThan(10)
+  const posePixels = await sharp(content).extract({ left: 0, top: 60, width: 768, height: 952 }).removeAlpha().raw().toBuffer()
+  let helpers = 0
+  for (let offset = 0; offset < posePixels.length; offset += 3) {
+    const [red, green, blue] = posePixels.subarray(offset, offset + 3)
+    if (red < 40 && green > 85 && green < 160 && blue > 60 && blue < 140) helpers++
+    if (blue > 190 && blue - red > 60 && blue - green > 60 && Math.abs(red - green) < 25) helpers++
+  }
+  expect(helpers).toBe(0)
+  expect(await (await request.get(`/api/assets/${source.id}/content`)).body()).toEqual(await sharp(original).png().toBuffer())
+  await expect(page.getByLabel('创作需求')).toHaveValue(new RegExp(`保留已有需求[\\s\\S]*左侧 A[\\s\\S]*右侧 B[\\s\\S]*自然光，全身照片[\\s\\S]*原图附件 ID：${board.id}`))
+  await page.getByRole('button', { name: '提交需求', exact: true }).click()
+  await expect(page.getByRole('article', { name: '你的消息' })).toContainText(`原图附件 ID：${board.id}`)
+  expect(submissions).toBe(1)
+})
+
+test('pose studio handles model failure and local image upload without creating a project early', async ({ page, request }) => {
+  let hideProjects = true
+  await page.route('**/api/projects', route => hideProjects && route.request().method() === 'GET' ? route.fulfill({ json: [] }) : route.continue())
+  let failModel = true
+  await page.route('**/pose/quaternius-original.glb', route => failModel ? route.fulfill({ status: 503 }) : route.continue())
+  await page.goto('/')
+  await page.getByRole('button', { name: '姿势生图', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '姿势生图', exact: true })
+  await expect(dialog.getByRole('button', { name: '重试加载人偶' })).toBeVisible()
+  await expect(dialog.getByRole('button', { name: '带入生成草稿' })).toBeDisabled()
+  failModel = false
+  await dialog.getByRole('button', { name: '重试加载人偶' }).click()
+  await expect(dialog.locator('.pose-viewport')).toHaveAttribute('data-ready', 'true', { timeout: 30000 })
+  const image = await sharp({ create: { width: 16, height: 32, channels: 3, background: '#1658bb' } }).png().toBuffer()
+  await dialog.getByLabel('人物图片文件').setInputFiles({ name: 'person.png', mimeType: 'image/png', buffer: image })
+  expect(await page.evaluate(() => localStorage.getItem('qwen-project'))).toBeNull()
+  hideProjects = false
+  await dialog.getByRole('button', { name: '带入生成草稿' }).click()
+  await expect(dialog).toHaveCount(0)
+  const id = await page.evaluate(() => localStorage.getItem('qwen-project'))
+  const snapshot = await (await request.get(`/api/projects/${id}`)).json()
+  expect(snapshot.assets).toHaveLength(1)
+  expect(snapshot.messages).toHaveLength(0)
+  expect(snapshot.project.title).toBe('姿势生图')
+})
+
 async function mockFileSharing(page: Page) {
   await page.addInitScript(() => {
     Object.defineProperty(navigator, 'canShare', { configurable: true, value: (data: ShareData) => Reflect.get(window, 'rejectFileShare') !== true && data.files?.every(file => file instanceof File) })

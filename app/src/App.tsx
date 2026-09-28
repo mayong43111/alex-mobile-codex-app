@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import type { ButtonHTMLAttributes, FormEvent, ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch'
@@ -12,6 +12,9 @@ import './MobileApp.css'
 import { authenticatedFetch } from './auth-client'
 import type { SignedInUser } from './auth-client'
 import { ShareAssetButton } from './ShareAssetButton'
+import type { PoseDraft } from './PoseStudio'
+
+const PoseStudio = lazy(() => import('./PoseStudio'))
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await authenticatedFetch(`/api${path}`, options)
@@ -52,7 +55,9 @@ function IconButton({ label, children, ...props }: ButtonHTMLAttributes<HTMLButt
 function Modal({ open, onOpenChange, title, children, className = '' }: { open: boolean; onOpenChange: (open: boolean) => void; title: string; children: ReactNode; className?: string }) {
   return <Dialog.Root open={open} onOpenChange={onOpenChange}><Dialog.Portal>
     <Dialog.Overlay className="overlay" />
-    <Dialog.Content className={`modal ${className}`} aria-describedby={undefined}>
+    <Dialog.Content className={`modal ${className}`} aria-describedby={undefined} onEscapeKeyDown={event => {
+      if (event.target instanceof HTMLElement && (event.target.closest('.pose-viewport')?.getAttribute('data-selected-joint') || event.target.closest('.pose-studio[data-fullscreen=true]'))) event.preventDefault()
+    }}>
       <div className="modal-heading"><Dialog.Title>{title}</Dialog.Title><Dialog.Close asChild><IconButton label="关闭"><X size={20} /></IconButton></Dialog.Close></div>
       {children}
     </Dialog.Content>
@@ -321,6 +326,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [vmOpen, setVmOpen] = useState(false)
   const [guide, setGuide] = useState<CreationGuide | null>(null)
   const [guidesOpen, setGuidesOpen] = useState(false)
+  const [poseOpen, setPoseOpen] = useState(false)
+  const [poseDraft, setPoseDraft] = useState<PoseDraft>({ angles: null, presetId: 'ual1Idle' })
   const [brief, setBrief] = useState('')
   const [briefDetail, setBriefDetail] = useState('')
   const [sourceId, setSourceId] = useState('')
@@ -373,6 +380,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     currentProject.current = id
     setGuide(null)
     setGuidesOpen(false)
+    setPoseOpen(false)
+    setPoseDraft({ angles: null, presetId: 'ual1Idle' })
     setProjectId(id); setSnapshot(null); setAttachments([]); setDraft(''); setSidebarOpen(false); setView('chat'); setConnected(false)
     setResending(null)
     submitRequest.current = null
@@ -517,6 +526,33 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       if (result.pendingCleanup) setError('项目已删除，部分素材文件等待后台清理。')
     })
   }
+  async function preparePose(board: File, detail: string, signal: AbortSignal) {
+    if (busy) throw new Error('请等待当前操作完成')
+    if (attachments.length >= 10) throw new Error('最多选择 10 个附件，请先移除一个附件')
+    const requirement = `请根据姿势与人物参考板生成一张新的人物照片。使用这张参考板作为图片编辑输入：左侧 A 只提供身体姿势、关节位置和相机视角；右侧 B 提供人物身份、面容、发型和服装。把 B 中人物摆成 A 的姿势。不要复制人偶的橙紫材质，不要输出人偶、左右拼图、标签或参考板，只输出一张完整成片。另存结果，不覆盖参考图。${detail ? `\n场景与风格：${detail}` : ''}`
+    const nextDraft = [draft.trim(), requirement].filter(Boolean).join('\n\n')
+    if (nextDraft.length + 70 > 6000) throw new Error('现有草稿与新需求合计超过 6000 字，请先精简草稿')
+    setBusy(true)
+    let id = projectId
+    try {
+      signal.throwIfAborted()
+      if (!id) {
+        const project = await api<Project>('/projects', json('POST', { title: '姿势生图' }))
+        id = project.id
+        currentProject.current = id
+        setProjectId(id)
+        await loadProjects()
+      }
+      signal.throwIfAborted()
+      const asset = await upload(board, id, signal)
+      signal.throwIfAborted()
+      if (currentProject.current !== id) throw new Error('项目已切换，请重新准备参考板')
+      setAttachments(previous => [...previous, asset])
+      editDraft(`${nextDraft}\n原图附件 ID：${asset.id}`)
+      setView('chat'); setPoseOpen(false)
+      await refresh(id)
+    } finally { setBusy(false) }
+  }
   async function submit(event: FormEvent) {
     event.preventDefault()
     if ((!draft.trim() && !attachments.length) || !projectId || busy) return
@@ -616,7 +652,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </div>
   </>
   const sampleSection = <section className="reference-section"><div className="section-heading"><h3>参考起点</h3><span>摄影参考 · 非生成结果</span></div><div className="sample-grid">{references.map(sample => <button key={sample.name} className="sample" disabled={busy || attachments.length >= 10} onClick={() => void selectSample(sample)}><img src={sample.file} alt={sample.name} /><span>{sample.name}<Plus size={17} /></span></button>)}</div><small className="source">摄影来源：Unsplash</small></section>
-  const creationEntries = <nav className="creation-entries" aria-label="创作入口">{(Object.keys(creationGuides) as CreationGuide[]).map(kind => { const entry = creationGuides[kind]; const Icon = entry.icon; return <button type="button" key={kind} disabled={busy} onClick={() => openGuide(kind)}><Icon size={21} /><span>{entry.title}</span><ChevronRight size={15} /></button> })}</nav>
+  const poseEntry = <button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setPoseOpen(true) }}><Aperture size={18} /><span>姿势生图</span><ChevronRight size={16} /></button>
+  const creationEntries = <><nav className="creation-entries" aria-label="创作入口">{(Object.keys(creationGuides) as CreationGuide[]).map(kind => { const entry = creationGuides[kind]; const Icon = entry.icon; return <button type="button" key={kind} disabled={busy} onClick={() => openGuide(kind)}><Icon size={21} /><span>{entry.title}</span><ChevronRight size={15} /></button> })}</nav>{poseEntry}</>
 
   const uploadStatus = uploading && <div className="upload-status" role="status"><LoaderCircle size={16} className="spin" /><span>正在上传 {uploading}</span><IconButton label="取消上传" onClick={() => uploadController.current?.abort()}><X size={18} /></IconButton></div>
 
@@ -670,6 +707,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </main>
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
     <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
+    <Modal open={poseOpen} onOpenChange={setPoseOpen} title="姿势生图" className="pose-modal"><Suspense fallback={<p role="status">加载姿势工作台</p>}><PoseStudio assets={assets} value={poseDraft} onChange={setPoseDraft} onPrepare={preparePose} /></Suspense></Modal>
     <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'}>
       {guide && <form className="creation-brief" onSubmit={event => void prepareCreation(event)}>
         {uploadStatus}

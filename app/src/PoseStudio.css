@@ -1,0 +1,33 @@
+.pose-modal { display: flex; flex-direction: column; height: calc(var(--app-height, 100dvh) - 12px); overflow: hidden; }
+.pose-modal .modal-heading { margin-bottom: 0; }
+.pose-studio { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.pose-editor { position: relative; display: flex; flex-direction: column; flex-shrink: 0; min-height: 0; margin-inline: calc(-1 * var(--sheet-gutter)); }
+.pose-viewbar { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: #fff; border-bottom: 1px solid var(--line); }
+.pose-preset { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; font-size: 12px; color: var(--muted); }
+.pose-preset > span { flex-shrink: 0; }
+.pose-preset select { flex: 1; width: 0; }
+.pose-fullscreen { background: #edf3f0; color: #087f6b; }
+.pose-viewport { position: relative; flex-shrink: 0; height: min(38dvh, 360px); min-height: 160px; overflow: hidden; background: #edf0ef; }
+.pose-viewport canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.pose-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 20px; font-size: 14px; background: #edf0ef; }
+.pose-toolbar { display: flex; flex-shrink: 0; justify-content: space-between; gap: 4px; border-bottom: 1px solid var(--line); padding: 4px 8px; background: #fff; }
+.pose-toolgroup { display: flex; }
+.pose-camera-tools { border-left: 1px solid var(--line); padding-left: 4px; }
+.pose-toolbar .icon-button { width: 40px; min-height: 44px; }
+.pose-fields { display: grid; align-content: start; flex: 1; min-height: 0; gap: 12px; overflow: auto; overscroll-behavior: contain; padding-block: 12px 4px; font-size: 13px; }
+.pose-fields[hidden] { display: none; }
+.pose-fields h3 { font-size: 13px; font-weight: 600; color: #52665b; }
+.pose-fields label { display: grid; min-width: 0; gap: 6px; }
+.pose-fields :is(select, textarea) { width: 100%; }
+.pose-selected { position: absolute; z-index: 1; top: 10px; left: 12px; padding: 4px 8px; border-radius: 4px; font-size: 12px; color: #263b30; background: #ffffffdf; pointer-events: none; }
+.pose-source { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: end; gap: 8px; }
+.pose-person { width: 100%; height: 112px; object-fit: contain; background: #f0f5f2; }
+.pose-submit { display: flex; gap: 8px; }
+.pose-submit .primary { flex: 1; }
+.pose-modal:has(.pose-studio[data-fullscreen=true]) { top: var(--app-top, 0px); bottom: auto; height: var(--app-height, 100dvh); max-height: none; padding: 0; border: 0; border-radius: 0; }
+.pose-modal:has(.pose-studio[data-fullscreen=true]) > .modal-heading { display: none; }
+.pose-studio[data-fullscreen=true] .pose-editor { flex: 1; margin: 0; }
+.pose-studio[data-fullscreen=true] .pose-viewport { --pose-frame-inset: 84px; flex: 1; height: 100%; min-height: 0; }
+.pose-studio[data-fullscreen=true] .pose-viewbar { position: absolute; z-index: 2; top: 0; left: 0; right: 0; padding-top: max(8px, env(safe-area-inset-top)); background: #fffffff0; }
+.pose-studio[data-fullscreen=true] .pose-toolbar { position: absolute; z-index: 2; bottom: max(12px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); width: min(calc(100% - 16px), 420px); border: 1px solid #d2dfd7; border-radius: 6px; box-shadow: 0 3px 12px #17372b14; background: #fffffff0; }
+.pose-studio[data-fullscreen=true] .pose-selected { top: calc(72px + env(safe-area-inset-top)); }

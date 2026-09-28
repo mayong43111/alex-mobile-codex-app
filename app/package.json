@@ -24,6 +24,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@openai/codex-sdk": "0.155.1",
     "@radix-ui/react-dialog": "^1.1.23",
+    "@pixiv/three-vrm": "^3.4.2",
     "argon2": "^0.45.1",
     "fastify": "^5.12.5",
     "ffprobe-static": "^3.1.0",
@@ -35,6 +36,7 @@
     "react-zoom-pan-pinch": "^4.2.0",
     "remark-gfm": "^4.0.1",
     "sharp": "^0.35.4",
+    "three": "^0.180.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
@@ -42,6 +44,7 @@
     "@types/node": "^22.20.4",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
+    "@types/three": "^0.180.0",
     "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "^10.0.5",
     "oxlint": "^1.81.0",
