@@ -69,8 +69,8 @@ for (const operation of ['generate', 'edit', 'missing-source', 'chat']) {
     }, { context }))
     await module.evaluate()
     const bytes = Buffer.from('explicit-source-test-bytes')
-    const source = { assetId: crypto.randomUUID(), name: 'selected.png', hash: crypto.createHash('sha256').update(bytes).digest('hex'), width: 1536, height: 1024, kind: 'reference', messageId: crypto.randomUUID(), context: '' }
-    const input = { id: crypto.randomUUID(), projectId: crypto.randomUUID(), threadId: null, text: 'literal image prompt', mode: operation === 'chat' ? 'chat' : 'image', imageModel: 'gpt-image-2.5-flare', videoModel: 'none', ratio: '1:1', quality: 'medium', imageToken: 'image-only-token',
+    const source = { assetId: crypto.randomUUID(), name: 'selected.png', hash: crypto.createHash('sha256').update(bytes).digest('hex'), width: 1024, height: 1024, kind: 'reference', messageId: crypto.randomUUID(), context: '' }
+    const input = { id: crypto.randomUUID(), projectId: crypto.randomUUID(), threadId: null, text: 'literal image prompt', mode: operation === 'chat' ? 'chat' : 'image', imageModel: 'gpt-image-2.5-flare', videoModel: 'none', ratio: operation === 'edit' ? '3:4' : '1:1', quality: 'medium', imageToken: 'image-only-token',
       imageCandidates: operation === 'edit' ? [source] : [],
       ...(operation === 'chat' ? { codexToken: 'chat-token' } : { directImage: operation === 'generate' ? { operation } : { operation: 'edit', sourceAssetId: source.assetId } }) }
     const headers = { authorization: `Bearer ${config.token}` }
@@ -89,8 +89,13 @@ for (const operation of ['generate', 'edit', 'missing-source', 'chat']) {
         assert.equal(rendered[0].prompt, input.text)
         assert.equal(rendered[0].operation, operation)
         assert.equal(rendered[0].imageModel, input.imageModel)
-        assert.equal(rendered[0].size, operation === 'edit' ? '1536x1024' : '1024x1024')
+        assert.equal(rendered[0].size, operation === 'edit' ? '960x1280' : '1024x1024')
         assert.equal(rendered[0].sourceImage?.assetId, operation === 'edit' ? source.assetId : undefined)
+        if (operation === 'edit') {
+          assert.equal(rendered[0].sourceImage.png, bytes.toString('base64'))
+          assert.equal(rendered[0].sourceImage.width, source.width)
+          assert.equal(rendered[0].sourceImage.height, source.height)
+        }
         assert.equal((await app.inject({ method: 'POST', url: '/runs', headers, payload: input })).statusCode, 202)
         assert.equal(rendered.length, 1)
       }

@@ -85,6 +85,38 @@ function Modal({ open, onOpenChange, title, children, className = '' }: { open: 
   </Dialog.Portal></Dialog.Root>
 }
 
+function ReferenceLibrary({ projects, select, remove, revision }: { projects: Project[]; select: (asset: Asset) => Promise<void>; remove: (asset: Asset) => void; revision: number }) {
+  const [images, setImages] = useState<Asset[]>([])
+  const [loadedRequest, setLoadedRequest] = useState('')
+  const [error, setError] = useState('')
+  const [query, setQuery] = useState('')
+  const [project, setProject] = useState('')
+  const [limit, setLimit] = useState(48)
+  const [retry, setRetry] = useState(0)
+  const [selecting, setSelecting] = useState('')
+  const loading = loadedRequest !== `${revision}:${retry}`
+  useEffect(() => {
+    const controller = new AbortController()
+    void api<Asset[]>('/references', { signal: controller.signal }).then(result => { if (!controller.signal.aborted) { setImages(result); setError('') } }).catch(failure => {
+      if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : '参考图加载失败')
+    }).finally(() => { if (!controller.signal.aborted) setLoadedRequest(`${revision}:${retry}`) })
+    return () => controller.abort()
+  }, [retry, revision])
+  const matching = images.filter(asset => (!project || asset.projectId === project) && asset.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
+  async function choose(asset: Asset) {
+    if (selecting) return
+    setSelecting(asset.id); setError('')
+    try { await select(asset) }
+    catch (failure) { setError(failure instanceof Error ? failure.message : '参考图选用失败') }
+    finally { setSelecting('') }
+  }
+  return <section className="reference-library" aria-busy={loading || !!selecting}>
+    <div className="reference-toolbar"><label className="search"><Search size={16} /><input aria-label="搜索参考图" placeholder="搜索图片名称" value={query} onChange={event => { setQuery(event.target.value); setLimit(48) }} /></label><select aria-label="参考图来源项目" value={project} onChange={event => { setProject(event.target.value); setLimit(48) }}><option value="">全部项目</option>{projects.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select><IconButton label="刷新参考图库" disabled={loading || !!selecting} onClick={() => setRetry(value => value + 1)}><RefreshCw size={18} /></IconButton></div>
+    {error && <p className="form-error" role="alert">{error}</p>}
+    {loading ? <div className="empty" role="status"><LoaderCircle className="spin" />正在读取参考图</div> : <><p className="reference-count" role="status">{matching.length} 张参考图{selecting ? ' · 正在选用' : ''}</p>{!matching.length ? <div className="empty"><Images size={28} /><h2>{images.length ? '没有匹配的参考图' : '暂无已上传的参考图'}</h2></div> : <div className="asset-grid reference-grid">{matching.slice(0, limit).map(asset => <div className="image-collection-item" key={asset.id}><button type="button" className="asset" aria-label={`选用参考图 ${asset.name}`} disabled={!!selecting} onClick={() => void choose(asset)}><div className="asset-image"><AssetImage asset={asset} /><span className="asset-kind">{selecting === asset.id ? <LoaderCircle size={15} className="spin" /> : <ImagePlus size={15} />}</span></div><strong title={asset.name}>{asset.name}</strong><small>{projects.find(item => item.id === asset.projectId)?.title ?? '历史上传'}</small><small>{assetDetails(asset)}</small></button><IconButton label={`删除参考图 ${asset.name}`} disabled={!!selecting} onClick={() => remove(asset)}><Trash2 size={17} /></IconButton></div>)}</div>}{matching.length > limit && <button type="button" className="reference-more" onClick={() => setLimit(value => value + 48)}>加载更多</button>}</>}
+  </section>
+}
+
 function RunProgress({ run }: { run: AgentRun }) {
   const [open, setOpen] = useState(false)
   const [fetchedEntries, setEntries] = useState<NonNullable<AgentRun['progress']>>([])
@@ -195,7 +227,7 @@ function ImagePending({ run, connected }: { run: AgentRun; connected: boolean })
   return <div className="image-pending" role="status" aria-label={run.stage === 'video' ? '视频生成中' : '图片生成中'} aria-live="polite" aria-busy="true"><LoaderCircle size={24} className="spin" aria-hidden="true" /><span>{connected ? runLabel(run) : '连接已断开，正在同步生成状态'}</span></div>
 }
 
-function Viewer({ asset, close, reference }: { asset: Asset | null; close: () => void; reference: (asset: Asset) => void }) {
+function Viewer({ asset, close, reference, remove, deletingDisabled }: { asset: Asset | null; close: () => void; reference: (asset: Asset) => void; remove: (asset: Asset) => void; deletingDisabled: boolean }) {
   return <Modal open={!!asset} onOpenChange={open => { if (!open) close() }} title={asset?.name ?? '图片'} className="viewer">
     {asset?.mediaType === 'file' ? <div className="file-viewer"><AssetPreview asset={asset} /><p>{asset.mimeType ?? '文件'} · {fileSize(asset.bytes)}</p><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载文件" title="下载文件"><ArrowDownToLine size={19} /></a><ShareAssetButton key={asset.id} asset={asset} /><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div> : asset?.mediaType === 'video' ? <><video className="generated-video" controls playsInline preload="metadata" poster={assetHasThumbnail(asset) ? imageUrl(asset) : undefined} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="viewer-footer"><span>{assetDetails(asset)}</span><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={19} /></a><ShareAssetButton key={asset.id} asset={asset} /><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div></> : asset && <TransformWrapper initialScale={1} minScale={0.5} maxScale={8}>
       {({ zoomIn, zoomOut, resetTransform }) => <>
@@ -204,6 +236,7 @@ function Viewer({ asset, close, reference }: { asset: Asset | null; close: () =>
           <IconButton label="放大" onClick={() => zoomIn()}><ZoomIn size={19} /></IconButton><IconButton label="缩小" onClick={() => zoomOut()}><ZoomOut size={19} /></IconButton><IconButton label="重置缩放" onClick={() => resetTransform()}><Maximize size={19} /></IconButton>
           <a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载图片" title="下载图片"><ArrowDownToLine size={19} /></a>
           <ShareAssetButton key={asset.id} asset={asset} />
+          <IconButton label="删除当前图片" disabled={deletingDisabled} onClick={() => remove(asset)}><Trash2 size={19} /></IconButton>
           <button className="primary" onClick={() => reference(asset)}><ImagePlus size={17} />用作参考</button>
         </div></div>
       </>}
@@ -332,7 +365,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [projects, setProjects] = useState<Project[]>([])
   const [projectId, setProjectId] = useState('')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
-  const [view, setView] = useState<'chat' | 'images' | 'tasks'>('chat')
+  const [view, setView] = useState<'chat' | 'images' | 'works' | 'tasks'>('chat')
   const [draft, setDraft] = useState('')
   const [ratio, setRatio] = useState<Ratio>(defaultUserSettings.ratio)
   const [quality, setQuality] = useState<Quality>(defaultUserSettings.quality)
@@ -369,8 +402,12 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [briefDetail, setBriefDetail] = useState('')
   const [sourceId, setSourceId] = useState('')
   const [sourceFile, setSourceFile] = useState<File | null>(null)
+  const [referenceTarget, setReferenceTarget] = useState<'chat' | 'creation' | null>(null)
   const creationRequest = useRef<{ signature: string; projectId: string; body: AgentInput } | null>(null)
   const [deleting, setDeleting] = useState<Project | null>(null)
+  const [deletingAsset, setDeletingAsset] = useState<Asset | null>(null)
+  const [clearingConversation, setClearingConversation] = useState<Project | null>(null)
+  const [referenceRevision, setReferenceRevision] = useState(0)
   const [resending, setResending] = useState<{ message: Message; text: string; requestId: string; expectedTailId: string } | null>(null)
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [historyError, setHistoryError] = useState('')
@@ -432,6 +469,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     uploadController.current?.abort()
     currentProject.current = id
     setGuide(null)
+    setReferenceTarget(null)
+    setDeletingAsset(null); setClearingConversation(null)
     setGuidesOpen(false)
     setPoseOpen(false)
     setPoseDraft({ angles: null, presetId: 'ual1Idle' })
@@ -628,7 +667,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     const kind = guide
     const direct = (kind === 'image' || kind === 'edit') && (event.nativeEvent as SubmitEvent).submitter?.getAttribute('name') !== 'draft'
     const selected = creationGuides[kind]
-    const requirement = `${selected.prefix}\n${selected.subject}：${brief.trim()}${selected.detail && briefDetail.trim() ? `\n${selected.detail}：${briefDetail.trim()}` : ''}`
+    const prefix = kind === 'image' && sourceId ? '请参考我明确选择的图片生成新图片，另存结果，不覆盖参考图。' : selected.prefix
+    const requirement = `${prefix}\n${selected.subject}：${brief.trim()}${selected.detail && briefDetail.trim() ? `\n${selected.detail}：${briefDetail.trim()}` : ''}`
     const nextDraft = [draft.trim(), requirement].filter(Boolean).join('\n\n')
     await perform(async () => {
       if (direct && (!settingsReady || savingSettings || !health?.agentConfigured || !health.models?.images.includes(imageModel))) throw new Error('所选图片模型尚未就绪，未提交生成。')
@@ -640,10 +680,11 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
         await refresh(request.projectId)
       }
       if (direct && creationRequest.current?.signature === signature) { await finishDirect(creationRequest.current); return }
-      if ((direct ? requirement : nextDraft).length + (!direct && kind === 'edit' ? 60 : 0) > 6000) throw new Error('需求超过 6000 字，请先精简。')
-      let source = kind === 'edit' ? assets.find(asset => asset.id === sourceId && (asset.mediaType ?? 'image') === 'image') : undefined
+      if ((direct ? requirement : nextDraft).length + (!direct && (kind === 'edit' || (kind === 'image' && sourceId)) ? 60 : 0) > 6000) throw new Error('需求超过 6000 字，请先精简。')
+      let source = kind === 'edit' || kind === 'image' ? assets.find(asset => asset.id === sourceId && (asset.mediaType ?? 'image') === 'image') : undefined
+      if ((kind === 'edit' || kind === 'image') && sourceId && !source) throw new Error('所选参考图已不可用，请重新选择。')
       if (kind === 'edit' && !source && !sourceFile) throw new Error('请明确选择或上传一张原图。')
-      if (!direct && kind === 'edit' && attachments.length >= 10 && !attachments.some(asset => asset.id === source?.id)) throw new Error('最多选择 10 个附件，请先移除一个附件。')
+      if (!direct && (source || kind === 'edit') && attachments.length >= 10 && !attachments.some(asset => asset.id === source?.id)) throw new Error('最多选择 10 个附件，请先移除一个附件。')
       if (sourceFile && (!sourceFile.size || sourceFile.size > 64 * 1024 * 1024)) throw new Error('原图必须为非空文件且不超过 64 MB。')
       let id = projectId
       if (!id) {
@@ -665,6 +706,45 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       setView('chat'); setGuide(null); setSourceFile(null)
       await refresh(id)
       requestAnimationFrame(() => draftInput.current?.focus())
+    })
+  }
+  function requestDeleteImage(asset: Asset) {
+    setError(''); setDeletingAsset(asset)
+  }
+  async function deleteSelectedImage() {
+    if (!deletingAsset || busy) return
+    const asset = deletingAsset
+    await perform(async () => {
+      const result = await api<{ pendingCleanup: number }>(`/assets/${asset.id}`, json('DELETE', { expectedHash: asset.hash }))
+      setDeletingAsset(null)
+      setSelectedAsset(previous => previous?.id === asset.id ? null : previous)
+      setAttachments(previous => previous.filter(item => item.id !== asset.id))
+      if (sourceId === asset.id) setSourceId('')
+      submitRequest.current = null; creationRequest.current = null
+      setReferenceRevision(value => value + 1)
+      if (projectId) await refresh(projectId)
+      await loadProjects()
+      if (result.pendingCleanup) setError('图片记录已删除，部分文件待后续清理重试。')
+    })
+  }
+  async function confirmClearConversation() {
+    if (!projectId || busy) return
+    await perform(async () => {
+      const latest = await api<Snapshot>(`/projects/${projectId}`)
+      setClearingConversation(latest.project)
+    })
+  }
+  async function clearConversation() {
+    if (!clearingConversation || busy) return
+    const id = clearingConversation.id
+    await perform(async () => {
+      await api(`/projects/${id}/conversation`, json('DELETE', { expectedUpdatedAt: clearingConversation.updatedAt }))
+      setClearingConversation(null); setResending(null)
+      latestRequest.current++; historyRequest.current = null; historyAnchor.current = null
+      submitRequest.current = null; creationRequest.current = null
+      setLoadingHistory(false); setHistoryError(''); setTaskRecords(null); setSnapshot(null)
+      await refresh(id)
+      await loadProjects()
     })
   }
   async function deleteProject() {
@@ -771,6 +851,25 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       await refresh(selected.message.projectId)
     })
   }
+  async function chooseHistoricalReference(asset: Asset) {
+    if (busy) throw new Error('请等待当前操作完成')
+    const target = referenceTarget
+    if (target === 'chat' && attachments.length >= 10) throw new Error('最多选择 10 个附件，请先移除一个附件。')
+    setBusy(true)
+    try {
+      let id = projectId
+      if (!id) {
+        const project = await api<Project>('/projects', json('POST', { title: '参考图创作' }))
+        id = project.id; currentProject.current = id; setProjectId(id)
+        await loadProjects()
+      }
+      const copy = await api<Asset>(`/projects/${id}/references`, json('POST', { assetId: asset.id }))
+      await refresh(id)
+      if (target === 'creation') { setSourceId(copy.id); setSourceFile(null) }
+      else { attachReference(copy) }
+      setReferenceTarget(null)
+    } finally { setBusy(false) }
+  }
   function attachReference(asset: Asset) {
     if (attachments.length >= 10 && !attachments.some(item => item.id === asset.id)) { setError('最多选择 10 个附件'); return }
     setAttachments(previous => previous.some(item => item.id === asset.id) ? previous : [...previous, asset])
@@ -790,6 +889,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     await refresh(id)
   })
   const assets = snapshot?.assets ?? []
+  const works = assets.filter(asset => asset.kind === 'generated' && (asset.mediaType ?? 'image') === 'image')
   const jobs = (view === 'tasks' ? taskRecords?.jobs : undefined) ?? snapshot?.jobs ?? []
   const runs = (view === 'tasks' ? taskRecords?.runs : undefined) ?? snapshot?.runs ?? []
   const activeRuns = runs.filter(run => run.status === 'queued' || run.status === 'running')
@@ -800,6 +900,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const projectList = <>
     <div className="sidebar-section"><span>工作空间</span><span className="mono">LOCAL / 01</span></div>
     <button className="new-project" onClick={newProject} disabled={busy}><Plus size={18} />新建项目</button>
+    <button className="service-entry" type="button" disabled={busy} onClick={() => { setSidebarOpen(false); setReferenceTarget('chat') }}><ImagePlus size={19} />参考图库</button>
     <label className="search"><Search size={16} /><input aria-label="搜索项目" placeholder="搜索项目" value={search} onChange={event => setSearch(event.target.value)} /></label>
     <div className="project-list">{projects.filter(project => project.title.toLowerCase().includes(search.toLowerCase())).map(project => <div className="project-row" key={project.id}><button className={`project-link ${projectId === project.id ? 'active' : ''}`} onClick={() => switchProject(project.id)} disabled={busy}><Folder size={17} /><span>{project.title}</span><ChevronRight size={14} /></button><IconButton label={`删除项目 ${project.title}`} disabled={busy} onClick={() => void perform(async () => { const latest = await api<Snapshot>(`/projects/${project.id}`); setDeleting(latest.project); setSidebarOpen(false) })}><Trash2 size={17} /></IconButton></div>)}
       {!projects.length && <p className="muted small">暂无项目</p>}
@@ -807,7 +908,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </div>
   </>
   const sampleSection = <section className="reference-section"><div className="section-heading"><h3>参考起点</h3><span>摄影参考 · 非生成结果</span></div><div className="sample-grid">{references.map(sample => <button key={sample.name} className="sample" disabled={busy || attachments.length >= 10} onClick={() => void selectSample(sample)}><img src={sample.file} alt={sample.name} /><span>{sample.name}<Plus size={17} /></span></button>)}</div><small className="source">摄影来源：Unsplash</small></section>
-  const poseEntry = <button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setPoseOpen(true) }}><Aperture size={18} /><span>姿势生图</span><ChevronRight size={16} /></button>
+  const poseEntry = <><button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setPoseOpen(true) }}><Aperture size={18} /><span>姿势生图</span><ChevronRight size={16} /></button><button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setReferenceTarget('chat') }}><ImagePlus size={18} /><span>参考图库</span><ChevronRight size={16} /></button></>
   const creationEntries = <><nav className="creation-entries" aria-label="创作入口">{(Object.keys(creationGuides) as CreationGuide[]).map(kind => { const entry = creationGuides[kind]; const Icon = entry.icon; return <button type="button" key={kind} disabled={busy} onClick={() => openGuide(kind)}><Icon size={21} /><span>{entry.title}</span><ChevronRight size={15} /></button> })}</nav>{poseEntry}</>
 
   const uploadStatus = uploading && <div className="upload-status" role="status"><LoaderCircle size={16} className="spin" /><span>正在上传 {uploading}</span><IconButton label="取消上传" onClick={() => uploadController.current?.abort()}><X size={18} /></IconButton></div>
@@ -848,14 +949,16 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
           </div></div>
           {activeRuns.some(run => run.stage !== 'codex' && run.status === 'running') && <div className="generation-status" role="status" aria-label={activeRuns.some(run => run.stage === 'video') ? '当前视频任务' : '当前图片任务'}><LoaderCircle size={16} className="spin" aria-hidden="true" /><span>{connected ? runLabel(activeRuns.find(run => run.stage !== 'codex' && run.status === 'running')!) : '连接已断开，正在同步生成状态'}</span></div>}
           {view === 'chat' && !guide && uploadStatus}
+          {projectId && <nav className="conversation-tools" aria-label="当前会话操作"><button type="button" disabled={busy} onClick={() => setView('works')}><Images size={17} />作品集合<span>{works.length}</span></button><IconButton label="清空会话" disabled={busy || !snapshot?.messages.length || activeRuns.length > 0} onClick={() => void confirmClearConversation()}><Trash2 size={17} /></IconButton></nav>}
           <form className={`composer${draftExpanded ? ' is-expanded' : ''}`} onSubmit={event => void submit(event)}>
             {settingsError && <p role="alert" className="form-error">{settingsError}</p>}
             {attachments.length > 0 && <div className="attachments">{attachments.map(asset => <div key={asset.id}><button type="button" className="attachment-preview" aria-label={`查看附件 ${asset.name}`} onClick={() => setSelectedAsset(asset)}><AssetPreview asset={asset} /><span>{asset.name}</span></button><IconButton label={`移除附件 ${asset.name}`} disabled={busy} onClick={() => { setAttachments(previous => previous.filter(item => item.id !== asset.id)); submitRequest.current = null }}><X size={13} /></IconButton></div>)}</div>}
             <div className="composer-input"><textarea ref={draftInput} aria-label="创作需求" placeholder={projectId ? '说说你的想法…' : '先创建一个项目'} value={draft} disabled={!projectId || busy} maxLength={6000} onFocus={() => setExpandedDraftProject(projectId)} onChange={event => editDraft(event.target.value)} onKeyDown={handleDraftKeyDown} rows={2} /></div>
-            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={16} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={16} /></IconButton><div className="composer-model" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><span>{qualityNames[quality]}质量</span></div><select className="composer-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={16} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={16} />}</button></div></div>
+            <div className="composer-row"><IconButton label="历史参考图" disabled={busy || attachments.length >= 10} onClick={() => setReferenceTarget('chat')}><Images size={16} /></IconButton><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={16} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={16} /></IconButton><div className="composer-model" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><span>{qualityNames[quality]}质量</span></div><select className="composer-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={16} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={16} />}</button></div></div>
           </form></section>
-        <Modal open={view !== 'chat'} onOpenChange={open => { if (!open) setView('chat') }} title={view === 'images' ? '素材库' : '任务记录'} className="project-panel">
+        <Modal open={view !== 'chat'} onOpenChange={open => { if (!open) setView('chat') }} title={view === 'images' ? '素材库' : view === 'works' ? '作品集合' : '任务记录'} className={`project-panel${view === 'works' ? ' reference-panel' : ''}`}>
         {uploadStatus}
+        {view === 'works' && <section className="collection"><div className="collection-toolbar"><h2>{works.length} 张作品</h2><span className="muted small">{title}</span></div>{!works.length ? <div className="empty"><Images size={32} /><h2>暂无已生成的图片</h2></div> : <div className="asset-grid reference-grid">{works.slice().reverse().map(asset => <div className="image-collection-item" key={asset.id}><button type="button" className="asset" aria-label={`查看作品 ${asset.name}`} onClick={() => { setView('chat'); setSelectedAsset(asset) }}><div className="asset-image"><AssetImage asset={asset} /></div><strong>{asset.name}</strong><small>{assetDetails(asset)}</small></button><IconButton label={`删除作品 ${asset.name}`} disabled={busy || activeRuns.length > 0} onClick={() => requestDeleteImage(asset)}><Trash2 size={17} /></IconButton></div>)}</div>}</section>}
         {view === 'images' && <section className="collection"><div className="collection-toolbar"><h2>{assets.length} 个素材</h2><button className="primary" disabled={!projectId || busy} onClick={() => fileInput.current?.click()}><Plus size={17} />上传文件</button></div>{!assets.length ? <div className="empty"><Images size={32} /><h2>还没有项目资料</h2>{!projectId && <button className="primary" onClick={newProject}><Plus size={16} />创建项目</button>}</div> : <div className="asset-grid">{assets.slice().reverse().map(asset => <button className="asset" key={asset.id} onClick={() => { setView('chat'); setSelectedAsset(asset) }}><div className="asset-image"><AssetPreview asset={asset} /><span className="asset-kind">{asset.kind === 'generated' ? asset.mediaType === 'video' ? ['azure-avatar', 'sadtalker'].includes(asset.model ?? '') ? '数字人口播' : 'H3 视频' : asset.model === 'frame_sampler' ? '视频尾帧' : `${asset.provider ?? 'Azure'} 生成` : asset.mediaType === 'file' ? '文件' : asset.mediaType === 'video' ? '视频' : '参考图'}</span></div><strong>{asset.name}</strong><small>{assetDetails(asset)}</small></button>)}</div>}</section>}
         {view === 'tasks' && runs.length > 0 && <section className="collection"><div className="collection-toolbar"><h2>{runs.length} 条运行记录</h2></div><div className="task-list">{runs.slice().reverse().map(run => <article className="task agent-task" key={run.id}><div className="task-icon">{run.stage === 'image' ? <Images size={20} /> : run.stage === 'video' ? <Aperture size={20} /> : <MessageSquare size={20} />}</div><div className="task-content"><div><span className="badge">{runLabel(run)}</span><time>{time(run.createdAt)}</time></div><p>{run.input.text}</p><small>{runModel(run)}</small>{run.error && <p className="form-error">{run.error}</p>}</div>{['queued', 'running'].includes(run.status) && <IconButton label="停止运行" disabled={busy} onClick={() => void stopRun(run)}><Square size={18} /></IconButton>}</article>)}</div></section>}
         {view === 'tasks' && (jobs.length > 0 || !runs.length) && <section className="collection"><div className="collection-toolbar"><h2>{jobs.length} 条任务</h2><select aria-label="任务状态筛选" value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部状态</option><option value="waiting_service">等待服务</option><option value="cancelled">已取消</option></select></div>{!jobs.length ? <div className="empty"><ListTodo size={32} /><h2>暂无任务</h2></div> : <div className="task-list">{jobs.filter(job => filter === 'all' || job.status === filter).slice().reverse().map(job => <article className="task" key={job.id}><div className={`task-icon ${job.status === 'cancelled' ? 'cancelled' : ''}`}><CirclePause size={21} /></div><div className="task-content"><div><span className={`badge ${job.status === 'cancelled' ? 'neutral' : ''}`}>{job.status === 'cancelled' ? '已取消' : '等待服务'}</span><time>{time(job.createdAt)}</time></div><p>{job.prompt}</p><small>Qwen-Image-2.1 · {job.ratio} · {job.assetIds.length} 张参考图</small></div>{job.status === 'waiting_service' ? <IconButton label="取消任务" disabled={busy} onClick={() => void perform(async () => { await api(`/jobs/${job.id}/cancel`, { method: 'POST' }); await refresh(projectId) })}><X size={19} /></IconButton> : <IconButton label="重新编辑需求" disabled={busy} onClick={() => { editDraft(job.prompt); setRatio(health?.agentConfigured ? '1:1' : job.ratio); setAttachments(assets.filter(asset => job.assetIds.includes(asset.id))); setView('chat') }}><RefreshCw size={18} /></IconButton>}</article>)}{jobs.filter(job => filter === 'all' || job.status === filter).length === 0 && <div className="empty">没有符合条件的任务</div>}</div>}</section>}
@@ -872,10 +975,11 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
           {guide === 'image' && <select className="creation-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select>}
           <div className="creation-model-info" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><small>{qualityNames[quality]}质量</small></div>
         </div>}
-        {guide === 'edit' && <><label>项目原图<select aria-label="项目原图" value={sourceId} disabled={busy} onChange={event => { setSourceId(event.target.value); setSourceFile(null) }}><option value="">选择原图</option>{assets.filter(asset => (asset.mediaType ?? 'image') === 'image').map(asset => <option key={asset.id} value={asset.id}>{asset.name} · {asset.id.slice(0, 8)}</option>)}</select></label><label>上传原图<input key={sourceId} aria-label="上传原图" type="file" accept="image/png,image/jpeg,image/webp" disabled={busy} onChange={event => { setSourceFile(event.target.files?.[0] ?? null); setSourceId('') }} /></label>{sourceFile && <span className="brief-source">{sourceFile.name}</span>}{sourceId && <img className="brief-source-preview" src={`/api/assets/${sourceId}/content?thumbnail=1`} alt="已选原图" />}</>}
+        {guide === 'edit' && <><label>项目原图<select aria-label="项目原图" value={sourceId} disabled={busy} onChange={event => { setSourceId(event.target.value); setSourceFile(null) }}><option value="">选择原图</option>{assets.filter(asset => (asset.mediaType ?? 'image') === 'image').map(asset => <option key={asset.id} value={asset.id}>{asset.name} · {asset.id.slice(0, 8)}</option>)}</select></label><label>上传原图<input key={sourceId} aria-label="上传原图" type="file" accept="image/png,image/jpeg,image/webp" disabled={busy} onChange={event => { setSourceFile(event.target.files?.[0] ?? null); setSourceId('') }} /></label>{sourceFile && <span className="brief-source">{sourceFile.name}</span>}</>}
         <label className="creation-subject">{creationGuides[guide].subject}<textarea className={guide === 'image' || guide === 'edit' ? `image-brief-input${briefExpanded ? ' is-expanded' : ''}` : undefined} onFocus={() => setBriefExpanded(true)} required aria-label={creationGuides[guide].subject} maxLength={1600} rows={3} placeholder={creationGuides[guide].placeholder} value={brief} disabled={busy} onChange={event => setBrief(event.target.value)} /></label>
         {creationGuides[guide].detail && <label>{creationGuides[guide].detail}<textarea aria-label={creationGuides[guide].detail ?? undefined} maxLength={1200} rows={2} value={briefDetail} disabled={busy} onChange={event => setBriefDetail(event.target.value)} /></label>}
         {guide === 'video' && <><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ videoModel: event.target.value as VideoModel })}><option value="none">不启用</option><option value="minimax-h3" disabled={!health?.models?.videos.includes('minimax-h3')}>MiniMax H3{health?.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label><p className="muted" role="status">MiniMax H3 · {videoModel === 'none' ? '未启用' : health?.models?.videos.includes('minimax-h3') ? '已启用' : '服务未就绪'}</p>{settingsError && <p role="alert" className="form-error">{settingsError}</p>}</>}
+        {(guide === 'image' || guide === 'edit') && <div className="creation-reference"><button type="button" disabled={busy} onClick={() => setReferenceTarget('creation')}><Images size={17} />历史参考图</button>{sourceId && <div className="selected-reference"><img src={`/api/assets/${sourceId}/content?thumbnail=1`} alt="已选参考图" /><span>{assets.find(asset => asset.id === sourceId)?.name}</span><IconButton label="移除参考图" disabled={busy} onClick={() => setSourceId('')}><X size={16} /></IconButton></div>}</div>}
         <div className="creation-actions">
           {(guide === 'image' || guide === 'edit') && <button type="submit" name="direct" className="primary" disabled={busy || !settingsReady || savingSettings || !health?.models?.images.includes(imageModel) || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Images size={17} />}{guide === 'edit' ? '修改图片' : '生成图片'}</button>}
           <button type="submit" name="draft" className={guide === 'image' || guide === 'edit' ? '' : 'primary'} disabled={busy || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}带入草稿</button>
@@ -898,8 +1002,11 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </Modal>
     <Modal open={!!projectDialog} onOpenChange={open => { if (!open && !busy) setProjectDialog(null) }} title={projectDialog === 'rename' ? '重命名项目' : '新建项目'}><form className="project-form" onSubmit={event => void saveProject(event)}><label htmlFor="project-title">项目名称</label><input id="project-title" autoFocus required maxLength={80} value={projectName} placeholder="为这次创作命名" onChange={event => setProjectName(event.target.value)} /><button className="primary" disabled={busy || !projectName.trim()} type="submit">{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}保存项目</button>{error && <p role="alert" className="form-error">{error}</p>}</form></Modal>
     <Modal open={servicesOpen} onOpenChange={setServicesOpen} title="服务状态"><div className="service-list"><p>{storageStatus === 'ready' ? <Check size={18} /> : <CirclePause size={18} />}<strong>本地数据</strong><span>{storageStatus === 'ready' ? 'SQLite 已连接' : storageStatus === 'checking' ? '检查中' : '连接失败'}</span></p><p><CirclePause size={18} /><strong>Codex / GPT-5.4</strong><span>{storageStatus === 'ready' && health?.agent === 'configured' ? '容器已配置' : '未连接'}</span></p><p><Cpu size={18} /><strong>OpenMontage</strong><span>{storageStatus === 'ready' && health?.openmontage === 'installed' ? '已安装' : '未连接'}</span></p><p><Images size={18} /><strong>Azure 图片</strong><span>{storageStatus === 'ready' && health?.renderer === 'azure_image2' ? '已配置 · 按量计费' : '未连接'}</span></p><p><Cpu size={18} /><strong>ComfyUI / GPU</strong><span>{storageStatus === 'ready' && (health?.models?.images.some(model => model.startsWith('qwen-image-')) || health?.models?.videos.includes('minimax-h3')) ? '已连接 · GPU 计费' : '未就绪'}</span></p></div></Modal>
-    <Viewer asset={selectedAsset} close={() => setSelectedAsset(null)} reference={attachReference} />
+    <Modal open={referenceTarget !== null} onOpenChange={open => { if (!open && !busy) setReferenceTarget(null) }} title="参考图库" className="project-panel reference-panel"><ReferenceLibrary projects={projects} select={chooseHistoricalReference} remove={requestDeleteImage} revision={referenceRevision} /></Modal>
+    <Viewer asset={selectedAsset} close={() => setSelectedAsset(null)} reference={attachReference} remove={requestDeleteImage} deletingDisabled={busy || activeRuns.length > 0} />
     <Modal open={vmOpen} onOpenChange={setVmOpen} title="VM 管理"><VmPanel /></Modal>
+    <Modal open={!!clearingConversation} onOpenChange={open => { if (!open && !busy) setClearingConversation(null) }} title="清空会话？"><div className="resend-confirmation"><strong>{clearingConversation?.title}</strong><p>将清空当前项目的全部历史消息及任务文字记录，无法撤销。已生成的图片、参考图和其他素材保留，作品集合不受影响。</p><div className="actions"><button type="button" disabled={busy} onClick={() => setClearingConversation(null)}>取消</button><button type="button" className="primary danger" disabled={busy} onClick={() => void clearConversation()}><Trash2 size={18} />确认清空</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div></Modal>
+    <Modal open={!!deletingAsset} onOpenChange={open => { if (!open && !busy) setDeletingAsset(null) }} title="删除图片？"><div className="resend-confirmation"><strong>{deletingAsset?.name}</strong><p>{deletingAsset?.kind === 'reference' ? '将删除这张参考图并从参考图库移除。其他项目已保存的独立副本、已生成的作品不受影响。' : '将永久删除这张作品及其文件，历史消息中的图片链接也会移除。其他作品不受影响。'}</p><p>此操作无法撤销。</p><div className="actions"><button type="button" disabled={busy} onClick={() => setDeletingAsset(null)}>取消</button><button type="button" className="primary danger" disabled={busy} onClick={() => void deleteSelectedImage()}><Trash2 size={18} />确认删除图片</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div></Modal>
     <Modal open={!!deleting} onOpenChange={open => { if (!open && !busy) setDeleting(null) }} title="删除项目？"><div className="resend-confirmation"><strong>{deleting?.title}</strong><p>将删除项目、对话、任务及素材，无法撤销。运行时检查点、模型会话及备份不在此次清理范围内。</p><div className="actions"><button disabled={busy} onClick={() => setDeleting(null)}>取消</button><button className="primary danger" disabled={busy} onClick={() => void deleteProject()}><Trash2 size={18} />确认删除</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div></Modal>
   </div>
 }

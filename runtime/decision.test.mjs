@@ -1,6 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseDecision, renderSettings, editOutputSize, imageOutputSize, narrationEditingSkill, availableT4Models, t4Models } from './decision.mjs'
+import { parseDecision, renderSettings, editOutputSize, imageOutputSize, narrationEditingSkill, availableT4Models, t4Models, directImageDecision } from './decision.mjs'
+
+test('direct image edits use the selected ratio instead of the source aspect ratio', () => {
+  const source = { assetId: '00000000-0000-4000-8000-000000000001', width: 1024, height: 1024 }
+  const input = { text: '换成沙滩背景，保留主体', mode: 'image', videoModel: 'none', imageModel: 'gpt-image-2.5-flare', ratio: '3:4', quality: 'medium', imageCandidates: [source], directImage: { operation: 'edit', sourceAssetId: source.assetId } }
+  const decision = directImageDecision(input)
+  assert.equal(decision.ratio, '3:4')
+  assert.equal(imageOutputSize(decision, input, source), '960x1280')
+  const explicit = directImageDecision({ ...input, text: '换成沙滩背景，比例 16:9' })
+  assert.equal(imageOutputSize(explicit, input, source), '1536x864')
+})
 import { ImageSourceRequest, sourceBodyLimit } from './image-source.mjs'
 import Fastify from 'fastify'
 import { createHash, randomUUID } from 'node:crypto'

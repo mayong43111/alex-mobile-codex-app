@@ -35,6 +35,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS sessions (project_id TEXT PRIMARY KEY REFERENCES projects(id), thread_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS message_resends (project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL, input_hash TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(project_id, request_id));
       CREATE TABLE IF NOT EXISTS asset_cleanup (name TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS hidden_references (source_id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS avatar_jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, request_id TEXT NOT NULL, input_hash TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(project_id, request_id));
     `)
@@ -111,6 +112,48 @@ export class Store {
       }
       for (const table of ['messages', 'assets', 'jobs', 'agent_runs', 'sessions', 'events', 'message_resends']) this.db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(id)
       this.db.prepare('DELETE FROM projects WHERE id = ?').run(id)
+    })
+  }
+
+  requireIdleProject(projectId: string) {
+    this.project(projectId)
+    if (this.db.prepare("SELECT 1 FROM agent_runs WHERE project_id = ? AND json_extract(data, '$.status') IN ('queued','running')").get(projectId)) throw new HttpError(409, '请先停止并等待项目任务结束。')
+    if (this.db.prepare("SELECT 1 FROM avatar_jobs WHERE project_id = ? AND json_extract(data, '$.status') IN ('submitting','running','unknown')").get(projectId)) throw new HttpError(409, '数字人任务尚未结束，请先等待或核查原任务。')
+  }
+
+  clearConversation(projectId: string, expectedUpdatedAt: string) {
+    return this.transaction(() => {
+      this.requireIdleProject(projectId)
+      if (this.project(projectId).updatedAt !== expectedUpdatedAt) throw new HttpError(409, '会话已更新，请重新确认清空。')
+      for (const table of ['messages', 'jobs', 'agent_runs', 'sessions', 'message_resends', 'avatar_jobs']) this.db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId)
+      this.event(projectId, 'conversation.cleared')
+    })
+  }
+
+  deleteImage(id: string, expectedHash: string) {
+    return this.transaction(() => {
+      const asset = this.asset(id)
+      this.requireIdleProject(asset.projectId)
+      if ((asset.mediaType ?? 'image') !== 'image') throw new HttpError(400, '此操作仅支持删除图片。')
+      if (asset.hash !== expectedHash) throw new HttpError(409, '图片已更新，请重新确认删除。')
+      if (asset.kind === 'reference') this.db.prepare('INSERT OR IGNORE INTO hidden_references VALUES (?)').run(asset.sourceAssetId ?? asset.id)
+      for (const extension of [assetExtension(asset), ...(assetHasThumbnail(asset) ? ['webp'] : [])]) this.db.prepare('INSERT OR IGNORE INTO asset_cleanup VALUES (?)').run(`${asset.id}.${extension}`)
+      const messages = this.db.prepare('SELECT id, data FROM messages WHERE project_id = ?').all(asset.projectId)
+      for (const row of messages) {
+        const message: Message = JSON.parse(row.data as string)
+        if (message.assetIds.includes(id)) this.db.prepare('UPDATE messages SET data = ? WHERE id = ?').run(JSON.stringify({ ...message, assetIds: message.assetIds.filter(assetId => assetId !== id) }), row.id)
+      }
+      const runs = this.db.prepare('SELECT id, data FROM agent_runs WHERE project_id = ?').all(asset.projectId)
+      for (const row of runs) {
+        const run: AgentRun = JSON.parse(row.data as string)
+        if (run.assetId === id || run.processedAssetIds?.includes(id)) {
+          if (run.assetId === id) delete run.assetId
+          if (run.processedAssetIds) run.processedAssetIds = run.processedAssetIds.filter(assetId => assetId !== id)
+          this.db.prepare('UPDATE agent_runs SET data = ? WHERE id = ?').run(JSON.stringify(run), row.id)
+        }
+      }
+      this.db.prepare('DELETE FROM assets WHERE id = ?').run(id)
+      this.event(asset.projectId, 'asset.deleted')
     })
   }
 
@@ -332,6 +375,27 @@ export class Store {
     const row = this.db.prepare('SELECT data FROM assets WHERE id = ?').get(id)
     if (!row) throw new HttpError(404, 'Image not found')
     return JSON.parse(row.data as string)
+  }
+
+  referenceImages(userId?: string): Asset[] {
+    const rows = this.db.prepare(`SELECT assets.data FROM assets
+      WHERE json_extract(assets.data, '$.kind') = 'reference'
+      AND COALESCE(json_extract(assets.data, '$.mediaType'), 'image') = 'image'
+      AND NOT EXISTS (SELECT 1 FROM hidden_references WHERE source_id = COALESCE(json_extract(assets.data, '$.sourceAssetId'), assets.id))
+      ${userId === undefined ? '' : 'AND EXISTS (SELECT 1 FROM project_owners WHERE project_id = assets.project_id AND user_id = ?)'}
+      ORDER BY assets.rowid`).all(...(userId === undefined ? [] : [userId]))
+    const images = new Map<string, Asset>()
+    for (const row of rows) {
+      const asset: Asset = JSON.parse(row.data as string)
+      const sourceId = asset.sourceAssetId ?? asset.id
+      if (!images.has(sourceId)) images.set(sourceId, asset)
+    }
+    return [...images.values()].reverse()
+  }
+
+  referenceCopy(projectId: string, sourceId: string): Asset | undefined {
+    const row = this.db.prepare("SELECT data FROM assets WHERE project_id = ? AND (id = ? OR json_extract(data, '$.sourceAssetId') = ?) AND json_extract(data, '$.kind') = 'reference' LIMIT 1").get(projectId, sourceId, sourceId)
+    return row ? JSON.parse(row.data as string) : undefined
   }
 
   addAsset(asset: Asset) {

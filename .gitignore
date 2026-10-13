@@ -1,4 +1,5 @@
 app/node_modules/
+runtime/node_modules/
 app/dist/
 app/.data/
 app/.test-data/
@@ -9,3 +10,4 @@ app/playwright-report/
 !.env.example
 .local/
 runtime/__pycache__/
+project_test_assets/

@@ -193,6 +193,12 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     store.deleteProject(request.params.id, input.expectedUpdatedAt)
     return { deleted: true, pendingCleanup: await cleanupAssets() }
   })
+  app.delete<{ Params: { id: string } }>('/api/projects/:id/conversation', async request => {
+    const input = z.object({ expectedUpdatedAt: z.string().datetime() }).strict().parse(request.body)
+    if (worker?.hasActiveProject(request.params.id)) throw new HttpError(409, '运行尚未结束，请稍后再清空。')
+    store.clearConversation(request.params.id, input.expectedUpdatedAt)
+    return { cleared: true }
+  })
   app.get<{ Params: { id: string } }>('/api/projects/:id', async request => {
     const { before } = z.object({ before: z.string().uuid().optional() }).strict().parse(request.query)
     return store.conversation(request.params.id, before)
@@ -204,6 +210,41 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     return reply.code(202).send(job)
   })
   app.post<{ Params: { id: string } }>('/api/jobs/:id/cancel', async request => store.cancel(request.params.id))
+
+  app.delete<{ Params: { id: string } }>('/api/assets/:id', async request => {
+    const input = z.object({ expectedHash: z.string().min(1) }).strict().parse(request.body)
+    const asset = store.asset(request.params.id)
+    if (worker?.hasActiveProject(asset.projectId)) throw new HttpError(409, '运行尚未结束，请稍后再删除图片。')
+    store.deleteImage(asset.id, input.expectedHash)
+    return { deleted: true, pendingCleanup: await cleanupAssets() }
+  })
+  app.get('/api/references', async request => store.referenceImages(request.studioSession?.user.id))
+  app.post<{ Params: { id: string } }>('/api/projects/:id/references', async (request, reply) => {
+    store.project(request.params.id)
+    const input = z.object({ assetId: z.string().uuid() }).strict().parse(request.body)
+    const source = store.asset(input.assetId)
+    if (authentication) store.requireOwner(source.projectId, request.studioSession!.user.id)
+    if (source.kind !== 'reference' || (source.mediaType ?? 'image') !== 'image') throw new HttpError(400, '请选择已上传的参考图片')
+    const sourceId = source.sourceAssetId ?? source.id
+    const existing = store.referenceCopy(request.params.id, sourceId)
+    if (existing) return existing
+    const id = randomUUID()
+    const asset: Asset = { ...source, id, projectId: request.params.id, sourceAssetId: sourceId, sourceHash: source.hash, createdAt: new Date().toISOString() }
+    const extensions = [assetExtension(source), ...(assetHasThumbnail(source) ? ['webp'] : [])]
+    try {
+      for (const extension of extensions) await assetStorage.put(`${id}.${extension}`, await assetStorage.read(`${source.id}.${extension}`))
+      const concurrent = store.referenceCopy(request.params.id, sourceId)
+      if (concurrent) {
+        await Promise.allSettled(extensions.map(extension => assetStorage.remove(`${id}.${extension}`)))
+        return concurrent
+      }
+      store.addAsset(asset)
+    } catch (error) {
+      await Promise.allSettled(extensions.map(extension => assetStorage.remove(`${id}.${extension}`)))
+      throw error
+    }
+    return reply.code(201).send(asset)
+  })
 
   app.post<{ Params: { id: string } }>('/api/projects/:id/uploads', async (request, reply) => {
     store.project(request.params.id)

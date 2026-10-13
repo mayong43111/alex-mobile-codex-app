@@ -99,7 +99,7 @@ export function directImageDecision(input) {
   if (ratios.length > 1) throw new Error('需求中有多个不同的图片比例，请只保留本次要生成的比例。')
   if (ratios.length && !supportedRatios.includes(ratios[0])) throw new Error('直接生图不支持指定的比例，请使用表单中的比例选项。')
   return { action: request.operation === 'edit' ? 'edit' : 'image', imagePrompt: input.text,
-    sourceAssetId, ratio: ratios[0] ?? (request.operation === 'edit' ? null : input.ratio), quality: input.quality,
+    sourceAssetId, ratio: ratios[0] ?? input.ratio, quality: input.quality,
     size: null, reply: '', videoPrompt: null, avatarPlan: null, storyPlan: null }
 }
 
