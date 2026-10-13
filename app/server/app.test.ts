@@ -7,7 +7,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import sharp from 'sharp'
 import { buildApp } from './app.ts'
 import { Store } from './store.ts'
-import { AgentWorker, managedModelToken } from './agent.ts'
+import { AgentWorker, managedModelToken, localModelToken, loadAgentTransport } from './agent.ts'
 import type { AgentTransport, ImageCandidate, RemoteRun, SourceImage } from './agent.ts'
 import type { AssetStorage } from './assets.ts'
 import { VmController, VmRegistry } from './vm.ts'
@@ -23,6 +23,124 @@ async function loginHeaders(app: Awaited<ReturnType<typeof buildApp>>, dataDir: 
   assert.equal(response.statusCode, 200)
   return { host, origin, cookie: `${response.cookies[0].name}=${response.cookies[0].value}`, 'x-csrf-token': response.json().csrf }
 }
+
+test('direct image API preserves operation, validates source ownership and deduplicates submissions', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'direct-image-'))
+  const transport: AgentTransport = { health: async () => ({}), submit: async () => {}, get: async () => { throw new Error('Offline test') }, stop: async () => {} }
+  const app = await buildApp({ dataDir, agent: transport })
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  try {
+    const project = store.createProject('Direct images')
+    const foreign = store.createProject('Other project')
+    const source = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'source.png', kind: 'reference', width: 1024, height: 1024, bytes: 1, hash: 'fixture', createdAt: new Date().toISOString() })
+    const other = store.addAsset({ ...source, id: randomUUID(), projectId: foreign.id })
+    const input = { requestId: randomUUID(), text: 'literal prompt', mode: 'image', videoModel: 'none', directImage: { operation: 'generate' } }
+    const post = (payload: unknown) => app.inject({ method: 'POST', url: `/api/projects/${project.id}/chat`, payload: payload as Record<string, unknown> })
+    const generated = await post(input)
+    assert.equal(generated.statusCode, 202)
+    assert.deepEqual(generated.json().input.directImage, { operation: 'generate' })
+    assert.equal(generated.json().input.imageModel, 'gpt-image-2.5-flare')
+    assert.equal((await post(input)).json().id, generated.json().id)
+    const edit = { ...input, requestId: randomUUID(), assetIds: [source.id], directImage: { operation: 'edit', sourceAssetId: source.id } }
+    assert.equal((await post(edit)).statusCode, 202)
+    for (const invalid of [
+      { ...input, mode: 'auto' }, { ...input, videoModel: 'minimax-h3' },
+      { ...input, assetIds: [source.id] }, { ...edit, assetIds: [] },
+      { ...edit, assetIds: [other.id], directImage: { operation: 'edit', sourceAssetId: other.id } },
+      { ...edit, directImage: { operation: 'edit', sourceAssetId: other.id } },
+    ]) assert.equal((await post({ ...invalid, requestId: randomUUID() })).statusCode, 400)
+    assert.equal(store.snapshot(project.id).runs.length, 2)
+  } finally { await app.close(); store.db.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('T4 VM probes authenticate only to the configured proxy and refuse a busy shutdown', async () => {
+  const saved = { COMFYUI_T4_URL: process.env.COMFYUI_T4_URL, COMFYUI_T4_TOKEN: process.env.COMFYUI_T4_TOKEN }
+  const directory = await mkdtemp(join(tmpdir(), 'studio-t4-vm-'))
+  process.env.COMFYUI_T4_URL = 'http://10.48.1.5:8189'
+  process.env.COMFYUI_T4_TOKEN = 'fixture-t4-token'
+  const calls: string[] = []
+  try {
+    for (const comfyUrl of ['http://10.48.1.5:8189', 'http://10.48.1.4:8189']) {
+      const controller = new VmController({ subscription: randomUUID(), resourceGroup: 'test', name: 'test', auth: 'cli', comfyUrl }, join(directory, randomUUID()), async (_url, method) => {
+        assert(!method || method === 'GET')
+        return Response.json({ statuses: [{ code: 'PowerState/running' }] })
+      }, async (url, init) => {
+        calls.push(String(url))
+        assert.equal(new Headers(init?.headers).get('Authorization'), comfyUrl === process.env.COMFYUI_T4_URL ? 'Bearer fixture-t4-token' : null)
+        return Response.json(String(url).endsWith('/queue') ? { queue_running: [['another-app-job']], queue_pending: [] } : {})
+      })
+      await controller.initialize()
+      assert.equal((await controller.status()).gpuReady, true)
+      await assert.rejects(controller.act('deallocate', randomUUID(), 'test', false), /GPU 有运行或排队任务/)
+    }
+    assert.equal(calls.filter(url => url.endsWith('/queue')).length, 2)
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('each model turn receives only the latest ten text messages without resuming a thread', async () => {
+  const store = new Store(':memory:')
+  const project = store.createProject('Bounded history')
+  for (let index = 0; index < 8; index++) {
+    const run = store.queueAgent(project.id, { requestId: randomUUID(), text: `question ${index}`, mode: 'chat', ratio: '1:1' })
+    store.updateAgent(run.id, { status: 'completed', reply: `answer ${index}`, threadId: randomUUID() })
+  }
+  const expected = store.snapshot(project.id).messages.slice(-10).map(message => ({ role: message.role ?? 'user', text: message.text }))
+  const current = store.queueAgent(project.id, { requestId: randomUUID(), text: 'current', mode: 'chat', ratio: '1:1' })
+  let submitted = false
+  const worker = new AgentWorker(store, '', {
+    health: async () => ({}), stop: async () => {},
+    get: async id => ({ id, status: 'completed', stage: 'codex', reply: 'ok', threadId: null }),
+    submit: async (run, thread, history, _candidates, _attachments, _readable, _avatar, projectContext) => {
+      submitted = true
+      assert.equal(run.id, current.id)
+      assert.equal(thread, null)
+      assert.deepEqual(history, expected)
+      assert(!JSON.stringify(projectContext).includes('answer 0'))
+      assert(!JSON.stringify(projectContext).includes('question 0'))
+    },
+  })
+  try { await worker.tick(); assert(submitted); assert.equal(store.agentRun(current.id).status, 'running') }
+  finally { await worker.close(); store.db.close() }
+})
+
+test('unchanged polling does not rewrite runs or emit project events', () => {
+  const store = new Store(':memory:')
+  try {
+    const project = store.createProject('Polling')
+    const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'test', mode: 'chat', ratio: '1:1' })
+    const current = store.updateAgent(run.id, { status: 'running', threadId: randomUUID() })
+    const events = store.events(project.id, 0)
+    assert.deepEqual(store.updateAgent(run.id, { status: 'running', threadId: current.threadId }), current)
+    assert.deepEqual(store.events(project.id, 0), events)
+  } finally { store.db.close() }
+})
+
+test('conversation pages contain at most ten messages and omit process payloads', () => {
+  const store = new Store(':memory:')
+  try {
+    const project = store.createProject('Pages')
+    for (let index = 0; index < 13; index++) {
+      const run = store.queueAgent(project.id, { requestId: randomUUID(), text: `question ${index}`, mode: 'chat', ratio: '1:1' })
+      store.updateAgent(run.id, { status: 'completed', reply: `answer ${index}`, progress: [{ id: 'codex:event', label: 'raw', detail: 'large payload', createdAt: new Date().toISOString() }] })
+    }
+    const latest = store.conversation(project.id)
+    assert.equal(latest.messages.length, 10)
+    assert.equal(latest.messages[0].text, 'question 8')
+    assert(latest.runs.every(run => run.progress === undefined))
+    const older = store.conversation(project.id, latest.page!.before!)
+    const oldest = store.conversation(project.id, older.page!.before!)
+    assert.equal(older.messages.length, 10)
+    assert.equal(oldest.messages.length, 6)
+    assert.equal(oldest.page!.before, null)
+    assert.equal(latest.page!.tailId, older.page!.tailId)
+    assert.equal(new Set([...oldest.messages, ...older.messages, ...latest.messages].map(message => message.id)).size, 26)
+    assert.throws(() => store.conversation(store.createProject('Other').id, latest.page!.before!), /对话已更新/)
+    assert.equal(store.tasks(project.id).runs.length, 13)
+  } finally { store.db.close() }
+})
 
 test('story clips update the project progressively and recover without resubmitting', async context => {
   for (const outcome of ['completed', 'cancelled', 'completed-after-stop']) await context.test(outcome, async () => {
@@ -442,7 +560,7 @@ test('worker sends only current attachment metadata and protected locations with
     async submit(_run, _threadId, history, sourceImage, attachments) {
       submissions++
       assert.deepEqual(sourceImage, [])
-      assert.equal(history?.[0].attachments?.[0].assetId, earlierAsset.id)
+      assert.deepEqual(history, [{ role: 'user', text: 'Earlier attachment' }])
       assert(!JSON.stringify(history).includes('unselected.txt'))
       assert.deepEqual(attachments, [{ assetId: asset.id, name: 'notes.txt', mediaType: 'file', mimeType: 'text/plain', bytes: 500, location: `/api/assets/${asset.id}/content` }])
     },
@@ -513,6 +631,39 @@ test('project deletion rejects active and stale changes, removes metadata and fi
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
 })
 
+test('Azure 2.5 and T4 models retain their selection and reject mismatched results', async () => {
+  const store = new Store(':memory:')
+  const { storage } = memoryAssets()
+  const png = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#047d6a' } }).png().toBuffer()
+  let mismatch = false
+  const worker = new AgentWorker(store, '', {
+    health: async () => ({}), submit: async () => {}, stop: async () => {},
+    get: async id => ({ id, status: 'completed', stage: 'image', threadId: null, reply: 'done', image: {
+      png: png.toString('base64'), width: 1024, height: 1024, model: 'configured-deployment',
+      imageModel: mismatch ? 'azure-image2' : store.agentRun(id).input.imageModel, provider: store.agentRun(id).input.imageModel?.includes('-t4') ? 'comfyui' : 'azure', checkpoint: 'test',
+    } }),
+  }, storage)
+  try {
+    for (const imageModel of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'qwen-image-2.1-t4', 'qwen-image-2.1-t4-turbo'] as const) {
+      const project = store.createProject(imageModel)
+      const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'image', mode: 'image', ratio: '1:1', imageModel })
+      await worker.tick(); await worker.tick()
+      assert.equal(store.agentRun(run.id).status, 'completed')
+      assert.equal(store.asset(run.id).provider, imageModel.includes('-t4') ? 'comfyui' : 'azure')
+      assert.equal(store.asset(run.id).model, 'configured-deployment')
+      const resent = worker.resend(project.id, run.messageId, { requestId: randomUUID(), expectedTailId: store.snapshot(project.id).messages.at(-1)!.id, text: 'edited image' })
+      assert('input' in resent)
+      assert.equal(resent.input.imageModel, imageModel)
+      mismatch = true
+      await worker.tick(); await worker.tick()
+      assert.equal(store.agentRun(resent.id).status, 'interrupted')
+      assert.match(store.agentRun(resent.id).error!, /未自动重试/)
+      assert.throws(() => store.asset(resent.id))
+      mismatch = false
+    }
+  } finally { await worker.close(); store.db.close() }
+})
+
 test('model choices persist through resend and videos support range downloads', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'studio-video-'))
   const store = new Store(join(dataDir, 'studio.sqlite'))
@@ -521,7 +672,7 @@ test('model choices persist through resend and videos support range downloads', 
   const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(64)])
   let selected: string | undefined
   const transport: AgentTransport = {
-    async health() { return { models: { images: ['azure-image2', 'qwen-image-2.1'], videos: ['minimax-h3'] } } },
+    async health() { return { models: { images: ['azure-image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'qwen-image-2.1'], videos: ['minimax-h3'] } } },
     async submit(run) { selected = run.input.videoModel },
     async get(id) { return { id, status: 'completed', stage: 'video', threadId: null, reply: '视频已完成', video: { mp4: mp4.toString('base64'), thumbnail: thumbnail.toString('base64'), width: 832, height: 480, duration: 124 / 24, fps: 24, model: 'minimax-h3', provider: 'comfyui', checkpoint: 'test' } } },
     async stop() {},
@@ -561,7 +712,90 @@ test('model choices persist through resend and videos support range downloads', 
     assert.equal(queued.statusCode, 202)
     assert.equal(queued.json().input.imageModel, 'qwen-image-2.1')
     assert.equal((await app.inject({ method: 'POST', url: `/api/projects/${project.id}/chat`, payload: { ...input, imageModel: 'arbitrary-model' } })).statusCode, 400)
+    for (const imageModel of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst']) {
+      assert((await app.inject('/api/health')).json().models.images.includes(imageModel))
+      const target = (await app.inject({ method: 'POST', url: '/api/projects', payload: { title: imageModel } })).json()
+      const response = await app.inject({ method: 'POST', url: `/api/projects/${target.id}/chat`, payload: { ...input, requestId: randomUUID(), imageModel } })
+      assert.equal(response.statusCode, 202)
+      assert.equal(response.json().input.imageModel, imageModel)
+    }
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
+test('Web App transport rejects legacy key configuration and uses MI for both models without fallback', async context => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-mi-'))
+  const configFile = join(directory, 'services.json')
+  const previous = { HOSTING_MODE: process.env.HOSTING_MODE, IDENTITY_ENDPOINT: process.env.IDENTITY_ENDPOINT, IDENTITY_HEADER: process.env.IDENTITY_HEADER }
+  const store = new Store(':memory:')
+  const bodies: Record<string, unknown>[] = []
+  let identityCalls = 0
+  try {
+    Object.assign(process.env, { HOSTING_MODE: 'appservice', IDENTITY_ENDPOINT: 'http://identity.test/token', IDENTITY_HEADER: 'mi-header' })
+    const config = { gateway: 'http://127.0.0.1:3199', token: 'test-runtime-token'.repeat(3), codex: { auth: 'key' }, image: { auth: 'entra', subscription: randomUUID() } }
+    await writeFile(configFile, JSON.stringify(config))
+    await assert.rejects(loadAgentTransport(configFile), /requires managed identity/)
+    config.codex.auth = 'entra'
+    await writeFile(configFile, JSON.stringify(config))
+    context.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.hostname === 'identity.test') {
+        identityCalls++
+        assert.equal(new Headers(init?.headers).get('X-IDENTITY-HEADER'), 'mi-header')
+        assert.equal(url.searchParams.get('resource'), 'https://cognitiveservices.azure.com/')
+        return Response.json({ access_token: 'mi-only-token', expires_on: Date.now() / 1000 + 3600 })
+      }
+      bodies.push(JSON.parse(init!.body as string))
+      return Response.json({ accepted: true })
+    })
+    const transport = (await loadAgentTransport(configFile))!
+    for (const imageModel of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'] as const) {
+      const project = store.createProject(imageModel)
+      await transport.submit(store.queueAgent(project.id, { requestId: randomUUID(), text: 'test', mode: 'image', ratio: '1:1', imageModel }), null)
+    }
+    assert.equal(identityCalls, 2)
+    assert.deepEqual(bodies.map(body => [body.imageModel, body.imageToken, body.codexToken]), [
+      ['gpt-image-2.5-flare', 'mi-only-token', 'mi-only-token'], ['gpt-image-2.5-sunburst', 'mi-only-token', 'mi-only-token'],
+    ])
+    delete process.env.IDENTITY_ENDPOINT
+    const project = store.createProject('Missing MI')
+    await assert.rejects(transport.submit(store.queueAgent(project.id, { requestId: randomUUID(), text: 'test', mode: 'image', ratio: '1:1' }), null), /Managed identity unavailable/)
+    assert.equal(bodies.length, 2)
+  } finally {
+    for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
+    store.db.close(); await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('local transport preserves explicitly configured and legacy key authentication', async context => {
+  const directory = await mkdtemp(join(tmpdir(), 'studio-key-compat-'))
+  const file = join(directory, 'services.json')
+  const saved = process.env.HOSTING_MODE
+  delete process.env.HOSTING_MODE
+  const store = new Store(':memory:')
+  const bodies: Record<string, unknown>[] = []
+  context.mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => { bodies.push(JSON.parse(init!.body as string)); return Response.json({ accepted: true }) })
+  try {
+    for (const codex of [{ auth: 'key' }, {}]) {
+      await writeFile(file, JSON.stringify({ gateway: 'http://127.0.0.1:3199', token: 'internal-token'.repeat(3), codex, image: { auth: 'entra', subscription: randomUUID() } }))
+      const transport = (await loadAgentTransport(file))!
+      const project = store.createProject('Key compatibility')
+      await transport.submit(store.queueAgent(project.id, { requestId: randomUUID(), text: 'hello', mode: 'chat', ratio: '1:1' }), null)
+    }
+    assert.equal(bodies.length, 2)
+    assert(bodies.every(body => body.codexToken === undefined))
+  } finally {
+    if (saved === undefined) delete process.env.HOSTING_MODE; else process.env.HOSTING_MODE = saved
+    store.db.close(); await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('local model authentication uses Azure CLI scope and rejects stale tokens', async () => {
+  assert.equal(await localModelToken(randomUUID(), { getToken: async scope => {
+    assert.equal(scope, 'https://cognitiveservices.azure.com/.default')
+    return { token: 'local-cli-token', expiresOnTimestamp: Date.now() + 3600000 }
+  } }), 'local-cli-token')
+  await assert.rejects(localModelToken(randomUUID(), { getToken: async () => ({ token: 'stale', expiresOnTimestamp: 0 }) }), /expires too soon/)
+  await assert.rejects(localModelToken(randomUUID(), { getToken: async () => { throw new Error('Login required') } }), /Login required/)
 })
 
 test('managed model identity uses the model audience and rejects failed or stale tokens', async () => {
@@ -699,7 +933,7 @@ test('worker serializes turns, imports one image, stops queued work and does not
     assert.equal((await sharp(objects.get(`${first.id}.webp`)).metadata()).format, 'webp')
     assert.deepEqual(await readdir(join(dataDir, 'images')), [])
     await worker.tick()
-    assert.equal(submitted[1].thread, thread)
+    assert.equal(submitted[1].thread, null)
     remote.delete(second.id)
     await worker.tick()
     assert.equal(store.agentRun(second.id).status, 'interrupted')
@@ -963,7 +1197,7 @@ test('resend truncates atomically, resets context, deduplicates and refuses acti
     const later = send('Discard this')
     store.updateAgent(later.id, { status: 'completed', reply: 'Discard reply' })
     const before = store.snapshot(project.id)
-    const request = { requestId: randomUUID(), expectedTailId: before.messages.at(-1)!.id }
+    const request = { requestId: randomUUID(), expectedTailId: before.messages.at(-1)!.id, text: 'Edited request' }
     assert.throws(() => worker.resend(project.id, target.messageId, { ...request, expectedTailId: first.messageId }), /对话已更新/)
     assert.throws(() => worker.resend(project.id, first.assistantId, request), /自己的消息/)
     assert.throws(() => worker.resend(store.createProject('Other').id, target.messageId, request), /自己的消息/)
@@ -973,7 +1207,9 @@ test('resend truncates atomically, resets context, deduplicates and refuses acti
     const resent = worker.resend(project.id, target.messageId, request)
     assert.equal(worker.resend(project.id, target.messageId, request).id, resent.id)
     const after = store.snapshot(project.id)
-    assert.deepEqual(after.messages.map(message => message.text), ['Remember this', 'Retained reply', 'Retry this'])
+    assert.deepEqual(after.messages.map(message => message.text), ['Remember this', 'Retained reply', 'Edited request'])
+    assert.equal(after.runs[1].input.text, 'Edited request')
+    assert.throws(() => worker.resend(project.id, target.messageId, { ...request, text: 'Different edit' }), /Request ID already used/)
     assert.equal(after.runs.length, 2)
     assert.equal(after.threadId, null)
     assert.equal(after.runs[1].input.ratio, '2:3')
@@ -1002,17 +1238,20 @@ test('resend API retains selected message and assets, removes later jobs, and pe
     for (const text of ['Keep', 'Selected', 'Remove']) await app.inject({ method: 'POST', url: `/api/projects/${project.id}/messages`, payload: { requestId: randomUUID(), text, assetIds: [], ratio: '4:3' } })
     const before = (await app.inject(`/api/projects/${project.id}`)).json()
     const url = `/api/projects/${project.id}/messages/${before.messages[1].id}/resend`
-    const payload = { requestId: randomUUID(), expectedTailId: before.messages[2].id }
+    const payload = { requestId: randomUUID(), expectedTailId: before.messages[2].id, text: 'Edited selected' }
     assert.equal((await app.inject({ method: 'POST', url, payload, headers: { origin: 'https://untrusted.example' } })).statusCode, 403)
+    assert.equal((await app.inject({ method: 'POST', url, payload: { ...payload, text: '  ' } })).statusCode, 400)
+    assert.equal((await app.inject({ method: 'POST', url, payload: { ...payload, text: 'x'.repeat(6001) } })).statusCode, 400)
     assert.equal((await app.inject({ method: 'POST', url, payload: { ...payload, expectedTailId: randomUUID() } })).statusCode, 409)
     const response = await app.inject({ method: 'POST', url, payload })
     assert.equal(response.statusCode, 202)
     assert.equal(response.json().ratio, '4:3')
+    assert.equal(response.json().prompt, payload.text)
     await app.close()
     app = await buildApp({ dataDir })
     assert.equal((await app.inject({ method: 'POST', url, payload })).json().id, response.json().id)
     const after = (await app.inject(`/api/projects/${project.id}`)).json()
-    assert.deepEqual(after.messages, before.messages.slice(0, 2))
+    assert.deepEqual(after.messages, [before.messages[0], { ...before.messages[1], text: payload.text }])
     assert.equal(after.jobs.length, 2)
     assert.deepEqual(after.assets, before.assets)
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }) }

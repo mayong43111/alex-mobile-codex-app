@@ -15,6 +15,7 @@ from tools.base_tool import BaseTool, ToolResult, ToolTier, ToolRuntime
 from tools._comfyui.client import ComfyUIClient
 from lib.checkpoint import write_checkpoint
 from tools.video.video_stitch import VideoStitch
+from t4_workflow import T4_MODELS, T4Client, t4_workflow
 
 MODELS = {
     'qwen-image-2.1': ['qwen_image_2.1_bf16.safetensors', 'qwen3vl_8b_bf16.safetensors', 'qwen_image_2.1_vae_bf16.safetensors'],
@@ -23,6 +24,8 @@ MODELS = {
 
 
 def workflow(model, prompt, ratio, seed, source=None, quality='low', size=None):
+    if model in T4_MODELS:
+        return t4_workflow(model, prompt, ratio, seed, source, size)
     weights = MODELS[model]
     video = model == 'minimax-h3'
     width, height = ({'1:1': (640, 640), '3:2': (768, 512), '2:3': (512, 768), '4:3': (768, 576), '3:4': (576, 768), '16:9': (1024, 576), '9:16': (576, 1024)} if video else {'1:1': (1024, 1024), '3:2': (1536, 1024), '2:3': (1024, 1536), '4:3': (1280, 960), '3:4': (960, 1280), '16:9': (1536, 864), '9:16': (864, 1536)})[ratio]
@@ -134,30 +137,34 @@ class ComfyMedia(BaseTool):
         video = model == 'minimax-h3'
         source = inputs.get('sourceImage')
         operation = inputs.get('operation', 'generate')
-        if model not in MODELS or not 1 <= len(inputs['prompt']) <= 6000:
+        t4 = model in T4_MODELS
+        if (model not in MODELS and not t4) or not 1 <= len(inputs['prompt']) <= 6000:
             raise ValueError('Invalid model or prompt')
         if (operation == 'edit') != bool(source) or (video and source):
             raise ValueError('Invalid edit source')
         settings = json.loads(Path(os.environ['SERVICES_FILE']).read_text()).get('comfy', {})
-        server_url = settings.get('url') or os.environ.get('COMFYUI_SERVER_URL')
+        server_url = os.environ.get('COMFYUI_T4_URL') if t4 else settings.get('url') or os.environ.get('COMFYUI_SERVER_URL')
         if not server_url:
             return ToolResult(success=False, error='ComfyUI is not configured; no request submitted')
-        client = ComfyUIClient(server_url)
+        if t4 and not os.environ.get('COMFYUI_T4_TOKEN'):
+            return ToolResult(success=False, error='T4 proxy authentication is missing; no request submitted')
+        client = T4Client(server_url, os.environ['COMFYUI_T4_TOKEN']) if t4 else ComfyUIClient(server_url)
+        transport = client if t4 else requests
         prompt_id = None
         try:
             if ledger.exists():
                 raise ValueError('Existing ComfyUI submission; verify prior result, no automatic resubmission')
-            _, missing = client.check_models(MODELS[model])
+            _, missing = client.check_models(T4_MODELS[model] if t4 else MODELS[model])
             if missing:
                 raise ValueError('Selected model files are not ready')
-            response = requests.get(f'{client.server_url}/queue', timeout=10)
+            response = transport.get(f'{client.server_url}/queue', timeout=10)
             response.raise_for_status()
             queue = response.json()
             if queue.get('queue_running') or queue.get('queue_pending'):
                 raise ValueError('GPU is busy; no request submitted')
             if source:
                 raw = checked_source(source)
-                response = requests.post(f'{client.server_url}/upload/image', files={'image': (f'{run_id}.png', raw, 'image/png')}, data={'type': 'input', 'subfolder': 'studio'}, timeout=30)
+                response = transport.post(f'{client.server_url}/upload/image', files={'image': (f'{run_id}.png', raw, 'image/png')}, data={'type': 'input', 'subfolder': 'studio'}, timeout=30)
                 response.raise_for_status()
                 uploaded = response.json()
                 source = {**source, 'filename': '/'.join(filter(None, [uploaded.get('subfolder'), uploaded['name']]))}
@@ -171,7 +178,7 @@ class ComfyMedia(BaseTool):
             record.update({'prompt_id': prompt_id, 'status': 'submitted'})
             ledger.write_text(json.dumps(record))
             print(json.dumps({'id': 'comfy-submit', 'label': 'ComfyUI 任务已提交', 'detail': prompt_id}), file=__import__('sys').stderr, flush=True)
-            history = client.poll(prompt_id, timeout=1500 if video else 300, interval=2)
+            history = client.poll(prompt_id, timeout=1800 if t4 else 1500 if video else 300, interval=2)
             if not history.get('status', {}).get('completed'):
                 raise ValueError('ComfyUI task did not complete')
             outputs = history['outputs'][output_node]
@@ -182,7 +189,7 @@ class ComfyMedia(BaseTool):
             artifact = artifacts[0]
             if artifact.get('type') != 'output' or '..' in artifact['filename'] or '..' in artifact.get('subfolder', ''):
                 raise ValueError('Invalid artifact reference')
-            with requests.get(f'{client.server_url}/view', params={key: artifact[key] for key in ['filename', 'subfolder', 'type'] if key in artifact}, timeout=(10, 120), stream=True) as response:
+            with transport.get(f'{client.server_url}/view', params={key: artifact[key] for key in ['filename', 'subfolder', 'type'] if key in artifact}, timeout=(10, 120), stream=True) as response:
                 response.raise_for_status()
                 chunks = []
                 total = 0

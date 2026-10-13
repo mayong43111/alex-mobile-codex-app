@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -11,6 +12,42 @@ import requests
 from PIL import Image
 from tools.base_tool import BaseTool, ToolResult, ToolTier, ToolRuntime
 from lib.checkpoint import write_checkpoint
+
+
+def response_error(response, operation, secrets):
+    def safe_text(value, limit=1200):
+        if not isinstance(value, str):
+            return ""
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[redacted]")
+        value = re.sub(r"(?i)(bearer\s+|api[-_ ]?key[\"'=:\s]+)\S+", "[redacted]", value)
+        value = re.sub(r"[A-Za-z0-9_+/=-]{80,}", "[redacted]", value)
+        return " ".join(value.split())[:limit]
+
+    details = [f"Azure image {operation} HTTP {response.status_code}"]
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    error = payload.get("error", payload) if isinstance(payload, dict) else None
+    for depth in range(3):
+        if not isinstance(error, dict):
+            break
+        for field in ("code", "type", "param", "message"):
+            value = safe_text(error.get(field), 1200 if field == "message" else 160)
+            if value:
+                details.append(f"{'inner.' * depth}{field}={value}")
+        error = error.get("innererror", error.get("inner_error"))
+    if len(details) == 1:
+        details.append("error body unavailable or not structured JSON")
+    summary = "; ".join(details)[:2400]
+    request_ids = []
+    for header in ("apim-request-id", "x-request-id", "x-ms-request-id"):
+        value = safe_text(response.headers.get(header), 160)
+        if value:
+            request_ids.append(f"{header}={value}")
+    return "; ".join([summary, *request_ids, "no automatic retry"])
 
 
 class AzureImage(BaseTool):
@@ -30,6 +67,7 @@ class AzureImage(BaseTool):
             "prompt": {"type": "string", "minLength": 1, "maxLength": 6000},
             "size": {"type": "string", "pattern": "^(auto|[1-9][0-9]{0,4}x[1-9][0-9]{0,4})$"},
             "quality": {"enum": ["low", "medium", "high"]},
+            "imageModel": {"enum": ["azure-image2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]},
             "operation": {"enum": ["generate", "edit"]},
             "sourceImage": {"type": "object", "required": ["assetId", "png", "hash", "width", "height"],
                 "properties": {"assetId": {"type": "string"}, "png": {"type": "string", "maxLength": 66_666_668},
@@ -50,11 +88,17 @@ class AzureImage(BaseTool):
         settings = json.loads(Path(os.environ["SERVICES_FILE"]).read_text())["image"]
         started = time.monotonic()
         try:
+            if not isinstance(self.access_token, str) or not self.access_token.strip():
+                return ToolResult(success=False, error="Azure image Entra token unavailable; image API not called")
+            selected_model = inputs.get("imageModel", "azure-image2")
+            deployment = settings["deployment"] if selected_model == "azure-image2" else settings.get("deployments", {}).get(selected_model)
+            if not deployment:
+                return ToolResult(success=False, error="Selected Azure image deployment is not configured; image API not called")
             operation = inputs.get("operation", "generate")
             source = inputs.get("sourceImage")
             if (operation == "edit") != bool(source):
                 raise ValueError("Editing requires a source image")
-            body = {"model": settings["deployment"], "prompt": inputs["prompt"],
+            body = {"model": deployment, "prompt": inputs["prompt"],
                     "size": inputs["size"], "quality": inputs.get("quality", "low"), "n": 1, "output_format": "png"}
             headers = {"Authorization": "Bearer " + self.access_token}
             endpoint = settings["endpoint"].rstrip("/") + "/openai/v1/images/"
@@ -73,7 +117,8 @@ class AzureImage(BaseTool):
             else:
                 response = requests.post(endpoint + "generations", headers=headers, json=body, timeout=(15, 240))
             if response.status_code != 200:
-                return ToolResult(success=False, error=f"Azure image {operation} HTTP {response.status_code}; no automatic retry")
+                return ToolResult(success=False, error=response_error(response, operation,
+                    [self.access_token, inputs["prompt"], source["png"] if source else ""]))
             payload = response.json()
             raw = base64.b64decode(payload["data"][0]["b64_json"], validate=True)
             if len(raw) > 32 * 1024 * 1024:
@@ -87,8 +132,8 @@ class AzureImage(BaseTool):
                 raise ValueError("Unexpected image dimensions or format")
             return ToolResult(success=True, data={"png": base64.b64encode(raw).decode(),
                 "width": image.width, "height": image.height, "usage": payload.get("usage"),
-                "cost_status": "unknown", "provider": "azure", "operation": operation,
-                **({"sourceAssetId": source["assetId"], "sourceHash": source["hash"]} if source else {})}, model=settings["deployment"],
+                "cost_status": "unknown", "provider": "azure", "operation": operation, "imageModel": selected_model,
+                **({"sourceAssetId": source["assetId"], "sourceHash": source["hash"]} if source else {})}, model=deployment,
                 duration_seconds=time.monotonic() - started, cost_usd=None)
         except (requests.RequestException, ValueError, KeyError, IndexError, OSError):
             return ToolResult(success=False, error="Azure image response unavailable or invalid; billing outcome may be uncertain; no automatic retry")
@@ -101,6 +146,7 @@ def main():
     run_id = str(UUID(request["runId"]))
     root = Path("/state/montage")
     result = AzureImage(request["accessToken"]).execute({"prompt": request["prompt"], "size": request["size"],
+        "imageModel": request.get("imageModel", "azure-image2"),
         "quality": request.get("quality", "low"),
         "operation": request.get("operation", "generate"), **({"sourceImage": request["sourceImage"]} if request.get("sourceImage") else {})})
     if not result.success:

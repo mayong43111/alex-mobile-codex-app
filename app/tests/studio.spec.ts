@@ -4,6 +4,168 @@ import { resolve } from 'node:path'
 import sharp from 'sharp'
 import { randomUUID } from 'node:crypto'
 import type { VmProfiles } from '../server/vm.ts'
+import { defaultUserSettings } from '../src/domain.ts'
+import type { UserSettings } from '../src/domain.ts'
+
+test('user settings default to Flare, survive reload and isolate accounts', async ({ page }) => {
+  let account = 'one'
+  let rejectWrite = false
+  const settings = new Map<string, UserSettings>()
+  await page.addInitScript(() => {
+    localStorage.setItem('studio-image-model', 'azure-image2')
+    localStorage.setItem('studio-quality', 'medium')
+  })
+  await page.route('**/api/auth/session', route => route.fulfill({ json: { enabled: false, user: { id: account, name: account, provider: 'local', admin: false } } }))
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', models: { images: ['azure-image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'], videos: [] } } }))
+  await page.route('**/api/settings', async route => {
+    if (route.request().method() === 'PATCH') {
+      if (rejectWrite) return route.fulfill({ status: 503, json: { error: 'Offline save failure' } })
+      settings.set(account, { ...defaultUserSettings, ...settings.get(account), ...route.request().postDataJSON() })
+    }
+    await route.fulfill({ json: settings.get(account) ?? defaultUserSettings })
+  })
+  const openSettings = async () => {
+    await page.goto('/')
+    await page.getByRole('button', { name: '设置', exact: true }).click()
+    await expect(page.getByLabel('图片模型', { exact: true })).toBeEnabled()
+  }
+  await openSettings()
+  const model = page.getByLabel('图片模型', { exact: true })
+  const quality = page.getByLabel('默认质量', { exact: true })
+  await expect(model).toHaveValue('gpt-image-2.5-flare')
+  await expect(quality).toHaveValue('low')
+  await model.selectOption('gpt-image-2.5-sunburst')
+  await expect(model).toHaveValue('gpt-image-2.5-sunburst')
+  await quality.selectOption('high')
+  await expect(quality).toHaveValue('high')
+  await openSettings()
+  await expect(model).toHaveValue('gpt-image-2.5-sunburst')
+  await expect(quality).toHaveValue('high')
+  account = 'two'
+  await openSettings()
+  await expect(model).toHaveValue('gpt-image-2.5-flare')
+  await expect(quality).toHaveValue('low')
+  rejectWrite = true
+  await model.selectOption('azure-image2')
+  await expect(page.getByRole('dialog', { name: '设置', exact: true }).getByRole('alert')).toContainText('设置保存失败')
+  await expect(model).toHaveValue('gpt-image-2.5-flare')
+  rejectWrite = false
+  account = 'one'
+  await openSettings()
+  await expect(model).toHaveValue('gpt-image-2.5-sunburst')
+  await expect(quality).toHaveValue('high')
+})
+
+test('image forms submit directly with explicit source and reuse failed request IDs', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: 'Direct image forms' } })).json()
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  let settings = { ...defaultUserSettings }
+  await page.route('**/api/settings', route => {
+    if (route.request().method() === 'PATCH') settings = { ...settings, ...route.request().postDataJSON() }
+    return route.fulfill({ json: settings })
+  })
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', models: { images: ['gpt-image-2.5-flare'], videos: [] } } }))
+  const submitted: Record<string, unknown>[] = []
+  await page.route('**/api/projects/*/chat', async route => {
+    submitted.push(route.request().postDataJSON())
+    await route.fulfill(submitted.length === 1 ? { status: 503, json: { error: 'Offline response failure' } } : { status: 202, json: { id: randomUUID() } })
+  })
+  await page.goto('/')
+  await expect(page.getByLabel('创作需求')).toBeEnabled()
+  const composer = page.locator('form.composer')
+  await expect(composer.getByLabel('当前图片模型')).toContainText('GPT Image 2.5 Flare')
+  await composer.getByLabel('作图比例').selectOption('3:4')
+  await expect(composer.getByLabel('作图比例')).toHaveValue('3:4')
+  const composerRestingHeight = (await composer.getByLabel('创作需求').boundingBox())!.height
+  expect((await composer.boundingBox())!.height).toBeLessThanOrEqual(112)
+  await page.screenshot({ path: testInfo.outputPath('composer-compact.png') })
+  await page.getByLabel('创作需求').fill('保留这个聊天草稿')
+  expect((await composer.getByLabel('创作需求').boundingBox())!.height).toBeGreaterThan(composerRestingHeight + 40)
+  expect(await composer.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false)
+  const sendBox = (await composer.getByRole('button', { name: '提交需求', exact: true }).boundingBox())!
+  expect(sendBox.y + sendBox.height).toBeLessThanOrEqual(page.viewportSize()!.height)
+  const ratioBox = (await composer.getByLabel('作图比例').boundingBox())!
+  expect(ratioBox.height).toBe(28)
+  expect(ratioBox.x + ratioBox.width).toBeLessThanOrEqual(sendBox.x)
+  expect(ratioBox.y).toBe(sendBox.y)
+  const inputBox = (await composer.getByLabel('创作需求').boundingBox())!
+  const modelBox = (await composer.getByLabel('当前图片模型').boundingBox())!
+  expect(modelBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height)
+  expect(modelBox.y).toBe(ratioBox.y)
+  expect(modelBox.height).toBe(28)
+  expect(modelBox.x + modelBox.width).toBeLessThanOrEqual(ratioBox.x)
+  expect((await composer.locator('.composer-row').boundingBox())!.height).toBe(28)
+  await page.screenshot({ path: testInfo.outputPath('composer-focused.png') })
+  const composerViewport = page.viewportSize()!
+  await page.setViewportSize({ width: 1280, height: 900 })
+  expect(await composer.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false)
+  await page.screenshot({ path: testInfo.outputPath('composer-desktop.png') })
+  await page.setViewportSize(composerViewport)
+  await page.getByRole('button', { name: '做图片', exact: true }).click()
+  const generation = page.getByRole('dialog', { name: '做图片', exact: true })
+  await expect(generation.getByRole('textbox')).toHaveCount(1)
+  await expect(generation.getByLabel('风格与用途', { exact: true })).toHaveCount(0)
+  await expect(generation.getByLabel('当前图片模型')).toContainText('GPT Image 2.5 Flare')
+  await expect(generation.getByLabel('作图比例')).toHaveValue('3:4')
+  await generation.getByLabel('作图比例').selectOption('16:9')
+  await expect(generation.getByLabel('作图比例')).toHaveValue('16:9')
+  const imageParameters = generation.locator('.creation-image-parameters')
+  const imageRatioBox = (await generation.getByLabel('作图比例').boundingBox())!
+  const imageModelBox = (await generation.getByLabel('当前图片模型').boundingBox())!
+  expect((await imageParameters.boundingBox())!.height).toBe(28)
+  expect(imageRatioBox.height).toBe(28)
+  expect(imageModelBox.y).toBe(imageRatioBox.y)
+  expect(imageModelBox.x).toBeGreaterThanOrEqual(imageRatioBox.x + imageRatioBox.width)
+  expect(await imageParameters.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false)
+  const prompt = generation.getByLabel('画面内容', { exact: true })
+  const restingHeight = (await prompt.boundingBox())!.height
+  await prompt.fill('白色背景的一束鲜花')
+  expect((await prompt.boundingBox())!.height).toBeGreaterThan(restingHeight + 40)
+  const subjectBox = (await prompt.boundingBox())!
+  expect((await imageParameters.boundingBox())!.y).toBeGreaterThanOrEqual(subjectBox.y + subjectBox.height)
+  const generateButtonBox = (await generation.getByRole('button', { name: '生成图片', exact: true }).boundingBox())!
+  const draftButtonBox = (await generation.getByRole('button', { name: '带入草稿', exact: true }).boundingBox())!
+  expect(generateButtonBox.y).toBe(draftButtonBox.y)
+  expect(draftButtonBox.x).toBeGreaterThan(generateButtonBox.x + generateButtonBox.width)
+  expect(generateButtonBox.y + generateButtonBox.height).toBeLessThanOrEqual(page.viewportSize()!.height)
+  await page.screenshot({ path: testInfo.outputPath('image-brief-focused.png') })
+  await page.setViewportSize({ width: 1280, height: 900 })
+  expect((await imageParameters.boundingBox())!.height).toBe(28)
+  expect((await generation.boundingBox())!.width).toBeLessThanOrEqual(520)
+  await page.screenshot({ path: testInfo.outputPath('image-parameters-desktop.png') })
+  await page.setViewportSize(composerViewport)
+  await generation.getByRole('button', { name: '生成图片', exact: true }).click()
+  await expect(generation.getByRole('alert')).toBeVisible()
+  await generation.getByRole('button', { name: '生成图片', exact: true }).click()
+  await expect(generation).not.toBeVisible()
+  expect(submitted).toHaveLength(2)
+  expect(submitted[0]).toEqual(submitted[1])
+  expect(submitted[0]).toMatchObject({ mode: 'image', imageModel: 'gpt-image-2.5-flare', ratio: '16:9', directImage: { operation: 'generate' }, assetIds: [], videoModel: 'none' })
+  expect(submitted[0].text).not.toContain('保留这个聊天草稿')
+  expect(submitted[0].text).toBe('请生成一张图片。\n画面内容：白色背景的一束鲜花')
+  await expect(page.getByLabel('创作需求')).toHaveValue('保留这个聊天草稿')
+  await expect(composer.getByLabel('作图比例')).toHaveValue('16:9')
+  await page.locator('input[type=file]').setInputFiles(resolve('public/reference-interior.jpg'))
+  await expect(page.getByRole('button', { name: '移除附件 reference-interior.jpg' })).toBeVisible()
+  const snapshot = await (await request.get(`/api/projects/${project.id}`)).json()
+  const source = snapshot.assets[0]
+  await page.getByRole('button', { name: '修改图片', exact: true }).click()
+  const editing = page.getByRole('dialog', { name: '修改图片', exact: true })
+  await editing.getByLabel('修改要求', { exact: true }).fill('把墙面改为浅灰色')
+  await expect(editing.getByRole('button', { name: '修改图片', exact: true })).toBeDisabled()
+  await editing.getByLabel('项目原图', { exact: true }).selectOption(source.id)
+  await editing.getByRole('button', { name: '修改图片', exact: true }).scrollIntoViewIfNeeded()
+  await page.screenshot({ path: testInfo.outputPath('direct-image-edit.png') })
+  await editing.getByRole('button', { name: '修改图片', exact: true }).click()
+  await expect(editing).not.toBeVisible()
+  expect(submitted).toHaveLength(3)
+  expect(submitted[2]).toMatchObject({ mode: 'image', directImage: { operation: 'edit', sourceAssetId: source.id }, assetIds: [source.id], videoModel: 'none' })
+  expect((await (await request.get(`/api/projects/${project.id}`)).json()).messages).toHaveLength(0)
+  await composer.getByRole('button', { name: '提交需求', exact: true }).click()
+  await expect.poll(() => submitted.length).toBe(4)
+  expect(submitted[3]).toMatchObject({ text: '保留这个聊天草稿', ratio: '16:9', imageModel: 'gpt-image-2.5-flare' })
+  expect(submitted[3]).not.toHaveProperty('directImage')
+})
 
 test('pose studio renders the final mannequin, changes poses and fits mobile and desktop', async ({ page, request }, testInfo) => {
   test.setTimeout(60000)
@@ -1258,19 +1420,79 @@ test('resend selected message confirms truncation and preserves earlier conversa
   await confirmation.getByRole('button', { name: '取消', exact: true }).click()
   await expect(page.locator('.user-message')).toHaveCount(3)
   await target.getByRole('button', { name: '重新发送此消息' }).click()
+  await expect(confirmation.getByLabel('编辑重发消息')).toHaveValue('需要重发的消息')
+  await confirmation.getByLabel('编辑重发消息').fill('修改后重新发送的消息')
   await page.screenshot({ path: testInfo.outputPath('resend-confirmation.png') })
   await confirmation.getByRole('button', { name: '清理并重新发送' }).click()
   await expect(confirmation).toHaveCount(0)
   await expect(page.locator('.user-message')).toHaveCount(2)
   await expect(page.getByText('应该清理的后文', { exact: true })).toHaveCount(0)
   await expect(page.getByText('保留的前文', { exact: true })).toBeVisible()
+  await expect(page.getByText('修改后重新发送的消息', { exact: true })).toBeVisible()
   await expect(page.getByLabel('创作需求')).toHaveValue('还没有发送的草稿')
   await page.reload()
   await expect(page.locator('.user-message')).toHaveCount(2)
+  await expect(page.getByText('修改后重新发送的消息', { exact: true })).toBeVisible()
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await openProjectPanel(page, '任务记录')
   await expect(page.locator('.task')).toHaveCount(2)
   await expect(page.getByText('应该清理的后文', { exact: true })).toHaveCount(0)
+})
+
+test('history loads ten messages at a time and preserves the scroll anchor', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '分页测试' } })).json()
+  for (let index = 0; index < 25; index++) await request.post(`/api/projects/${project.id}/messages`, { data: { requestId: randomUUID(), text: `历史消息 ${index}\n${'分页测试内容。'.repeat(15)}`, assetIds: [], ratio: '1:1' } })
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  await expect(page.locator('.user-message')).toHaveCount(10)
+  await page.getByLabel('创作需求').fill('新消息仍保留十条窗口')
+  await page.getByRole('button', { name: '提交需求' }).click()
+  await expect(page.locator('.message-text').filter({ hasText: '新消息仍保留十条窗口' })).toBeVisible()
+  await expect(page.locator('.user-message')).toHaveCount(10)
+  const scroll = page.locator('.conversation-scroll')
+  const original = page.locator('.user-message').first()
+  const text = await original.locator('.message-text').textContent()
+  await scroll.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event('scroll')) })
+  await expect(page.locator('.user-message')).toHaveCount(20)
+  await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBeGreaterThan(100)
+  await expect(page.locator('.message-text').filter({ hasText: text! })).toHaveCount(1)
+  await scroll.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event('scroll')) })
+  await expect(page.locator('.user-message')).toHaveCount(26)
+  await expect(page.getByRole('button', { name: '加载更早消息' })).toHaveCount(0)
+  await page.screenshot({ path: testInfo.outputPath('history-mobile.png') })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('history-desktop.png') })
+  await page.reload()
+  await expect(page.locator('.user-message')).toHaveCount(10)
+})
+
+test('page boundary keeps an orphan assistant reply and loads process only when opened', async ({ page, request }) => {
+  const project = await (await request.post('/api/projects', { data: { title: '分页边界' } })).json()
+  const now = new Date().toISOString()
+  const runId = randomUUID(), assistantId = randomUUID(), hiddenUserId = randomUUID()
+  const messages = [{ id: assistantId, projectId: project.id, role: 'assistant', text: '页首助手回复', assetIds: [], createdAt: now },
+    ...Array.from({ length: 9 }, (_, index) => ({ id: randomUUID(), projectId: project.id, role: 'user', text: `后续消息 ${index}`, assetIds: [], createdAt: now }))]
+  let processRequests = 0
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: {
+    project, messages, assets: [], jobs: [], threadId: null, page: { before: assistantId, tailId: messages.at(-1)!.id },
+    runs: [{ id: runId, projectId: project.id, messageId: hiddenUserId, assistantId, status: 'completed', stage: 'codex', reply: '页首助手回复', input: { text: '尚未加载的用户消息' }, createdAt: now, updatedAt: now }],
+  } }))
+  await page.route(`**/api/agent-runs/${runId}/progress`, route => {
+    processRequests++
+    return route.fulfill({ json: [{ id: 'codex:raw', label: 'SDK event', detail: '{"event":"original"}', createdAt: now }] })
+  })
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  await expect(page.locator('.user-message')).toHaveCount(9)
+  await expect(page.locator('.assistant-message')).toHaveCount(1)
+  await expect(page.locator('.markdown-reply')).toHaveText('页首助手回复')
+  expect(processRequests).toBe(0)
+  await page.getByLabel('处理过程').click()
+  await expect(page.locator('.run-progress pre')).toHaveText('{"event":"original"}')
+  expect(processRequests).toBe(1)
+  await page.getByLabel('处理过程').click()
+  await expect(page.locator('.run-progress pre')).toHaveCount(0)
 })
 
 test('sample reference is real, uploaded explicitly, and not a generated result', async ({ page }, testInfo) => {
@@ -1351,6 +1573,138 @@ test('phone navigation and composer remain reachable in reduced viewport height'
   await expect(page.getByRole('dialog')).toHaveCount(0)
 })
 
+test('Azure 2.5 and T4 model selection persists and detailed image errors remain visible', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: 'Azure 图片模型' } })).json()
+  const models = ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'qwen-image-2.1-t4', 'qwen-image-2.1-t4-turbo']
+  const now = new Date().toISOString()
+  const messageId = crypto.randomUUID()
+  const assistantId = crypto.randomUUID()
+  const detail = 'Azure image edit HTTP 400; code=invalid_request_error; param=size; message=Unsupported size; apim-request-id=request-123; no automatic retry'
+  const submissions: string[] = []
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', renderer: 'azure_image2', models: { images: ['azure-image2', ...models], videos: [] } } }))
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: {
+    project, threadId: null, jobs: [], assets: [],
+    messages: [{ id: messageId, projectId: project.id, text: '修改图片', assetIds: [], role: 'user', createdAt: now }, { id: assistantId, projectId: project.id, text: '正在修改', assetIds: [], role: 'assistant', createdAt: now }],
+    runs: [{ id: crypto.randomUUID(), projectId: project.id, messageId, assistantId, status: 'failed', stage: 'image', reply: '正在修改', error: detail, createdAt: now, input: { text: '修改图片', mode: 'auto', ratio: '1:1', imageModel: models[0] } }],
+  } }))
+  await page.route(`**/api/projects/${project.id}/chat`, async route => {
+    submissions.push(route.request().postDataJSON().imageModel)
+    await route.fulfill({ status: 202, json: { id: crypto.randomUUID() } })
+  })
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  await expect(page.getByText(detail, { exact: true }).first()).toBeVisible()
+  for (const imageModel of models) {
+    await page.getByRole('button', { name: '设置', exact: true }).click()
+    const select = page.getByLabel('图片模型')
+    await expect(select.locator('option')).toHaveCount(6)
+    await expect(select.locator('option[value="qwen-image-2.1"]')).toHaveJSProperty('disabled', true)
+    await select.selectOption(imageModel)
+    await page.screenshot({ path: testInfo.outputPath(`${imageModel}-mobile.png`) })
+    await page.getByRole('button', { name: '关闭', exact: true }).click()
+    await page.getByLabel('创作需求').fill('修改图片颜色')
+    await page.getByRole('button', { name: '提交需求', exact: true }).click()
+    await expect(page.getByLabel('创作需求')).toHaveValue('')
+    expect(submissions.at(-1)).toBe(imageModel)
+    await page.reload()
+    await page.getByRole('button', { name: '设置', exact: true }).click()
+    await expect(page.getByLabel('图片模型')).toHaveValue(imageModel)
+    await page.getByRole('button', { name: '关闭', exact: true }).click()
+  }
+  expect(submissions).toEqual(models)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.screenshot({ path: testInfo.outputPath('image-models-desktop.png') })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
+
+test('composer sends with Enter and inserts a newline with Control Enter without sending IME input', async ({ page, request }) => {
+  const project = await (await request.post('/api/projects', { data: { title: '消息键盘操作' } })).json()
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/')
+  const input = page.getByRole('textbox', { name: '创作需求', exact: true })
+  const submissions: string[] = []
+  page.on('request', outgoing => {
+    if (outgoing.method() === 'POST' && outgoing.url().endsWith(`/projects/${project.id}/messages`)) submissions.push(outgoing.postDataJSON().text)
+  })
+  await input.press('Enter')
+  await expect(input).toHaveValue('')
+  await input.fill('第一行第二行')
+  await input.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(3, 3))
+  await input.press('Control+Enter')
+  await expect(input).toHaveValue('第一行\n第二行')
+  expect(await input.evaluate((element: HTMLTextAreaElement) => element.selectionStart)).toBe(4)
+  await input.evaluate(element => {
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, isComposing: true }))
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, keyCode: 229 }))
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, repeat: true }))
+  })
+  await expect(input).toHaveValue('第一行\n第二行')
+  expect(submissions).toEqual([])
+  const sent = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith(`/projects/${project.id}/messages`))
+  await input.press('Enter')
+  expect((await sent).ok()).toBe(true)
+  await expect(input).toHaveValue('')
+  expect(submissions).toEqual(['第一行\n第二行'])
+  await input.fill('字'.repeat(6000))
+  await input.press('Control+Enter')
+  await expect(input).toHaveValue('字'.repeat(6000))
+  await input.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(0, 2))
+  await input.press('Control+Enter')
+  await expect(input).toHaveValue(`\n${'字'.repeat(5998)}`)
+  expect(submissions).toHaveLength(1)
+})
+
+test('image frames remain visible while downloading and after failure', async ({ page, request }, testInfo) => {
+  const project = await (await request.post('/api/projects', { data: { title: '图片加载边框' } })).json()
+  const now = new Date().toISOString()
+  const imageId = crypto.randomUUID()
+  const failedId = crypto.randomUUID()
+  const messageId = crypto.randomUUID()
+  const assistantId = crypto.randomUUID()
+  let releaseImage!: () => void
+  const imageReady = new Promise<void>(resolve => { releaseImage = resolve })
+  await page.route(`**/api/projects/${project.id}`, route => route.fulfill({ json: {
+    project, threadId: null, jobs: [],
+    messages: [
+      { id: messageId, projectId: project.id, text: '图片参考', assetIds: [failedId], createdAt: now, role: 'user' },
+      { id: assistantId, projectId: project.id, text: '图片已生成', assetIds: [imageId], createdAt: now, role: 'assistant' },
+    ],
+    assets: [imageId, failedId].map(id => ({ id, projectId: project.id, name: `${id}.png`, width: 640, height: 480, kind: 'generated' })),
+    runs: [{ id: imageId, projectId: project.id, messageId, assistantId, status: 'completed', stage: 'image', reply: '图片已生成', createdAt: now, input: { text: '图片参考', mode: 'auto', ratio: '1:1' } }],
+  } }))
+  await page.route(`**/api/assets/${imageId}/content*`, async route => {
+    await imageReady
+    await route.fulfill({ path: resolve('public/reference-interior.jpg'), contentType: 'image/jpeg' })
+  })
+  await page.route(`**/api/assets/${failedId}/content*`, route => route.abort())
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.goto('/', { waitUntil: 'domcontentloaded' })
+  try {
+    const frame = page.locator('.assistant-message .asset-image-frame')
+    await expect(frame.getByRole('status', { name: '图片加载中' })).toBeVisible()
+    await expect(page.locator('.user-message').getByRole('status', { name: '图片加载失败' })).toBeVisible()
+    await expect(frame).toHaveCSS('border-top-width', '1px')
+    const before = await frame.boundingBox()
+    expect(before!.height).toBeGreaterThan(100)
+    await page.screenshot({ path: testInfo.outputPath('image-loading-mobile.png') })
+    await frame.click()
+    const viewer = page.getByRole('dialog')
+    await expect(viewer.getByRole('status', { name: '图片加载中' })).toBeVisible()
+    await page.screenshot({ path: testInfo.outputPath('image-viewer-loading.png') })
+    releaseImage()
+    await expect(viewer.locator('.asset-image-frame')).toHaveAttribute('data-state', 'loaded')
+    await expect(viewer.getByRole('img')).toBeVisible()
+    await viewer.getByRole('button', { name: '关闭', exact: true }).click()
+    await expect(frame).toHaveAttribute('data-state', 'loaded')
+    await expect(frame.getByRole('status')).toHaveCount(0)
+    expect((await frame.boundingBox())!.height).toBeCloseTo(before!.height, 0)
+    await page.setViewportSize({ width: 1280, height: 800 })
+    await page.screenshot({ path: testInfo.outputPath('image-loaded-desktop.png') })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  } finally { releaseImage() }
+})
+
 test('image loading stays visible after reply, resend sits inside bubble, and replies can be copied', async ({ page, context, request }, testInfo) => {
   const project = await (await request.post('/api/projects', { data: { title: '生成状态测试' } })).json()
   const now = new Date().toISOString()
@@ -1397,7 +1751,7 @@ test('image loading stays visible after reply, resend sits inside bubble, and re
   await expect(assistant.locator('.reply-actions time')).toHaveAttribute('datetime', now)
   await assistant.getByRole('button', { name: '复制回复', exact: true }).click()
   await expect(assistant.getByRole('button', { name: '已复制回复' })).toBeVisible()
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(replyText)
+  expect((await page.evaluate(() => navigator.clipboard.readText())).replaceAll('\r\n', '\n')).toBe(replyText)
   await page.evaluate(() => { navigator.clipboard.writeText = async () => { throw new Error('Permission denied') } })
   await assistant.getByRole('button', { name: '已复制回复' }).click()
   await expect(assistant.getByText('复制失败，请重试或长按选择文字')).toBeVisible()

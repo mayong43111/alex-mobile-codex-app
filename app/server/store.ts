@@ -1,7 +1,8 @@
 import { DatabaseSync } from 'node:sqlite'
 import { randomUUID, createHash } from 'node:crypto'
 import type { AgentInput, AgentRun, Asset, Job, Message, Project, Snapshot, Submission } from '../src/domain.ts'
-import { assetExtension, assetHasThumbnail } from '../src/domain.ts'
+import { assetExtension, assetHasThumbnail, defaultUserSettings } from '../src/domain.ts'
+import type { UserSettings } from '../src/domain.ts'
 
 export class HttpError extends Error {
   statusCode: number
@@ -34,6 +35,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS sessions (project_id TEXT PRIMARY KEY REFERENCES projects(id), thread_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS message_resends (project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL, input_hash TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(project_id, request_id));
       CREATE TABLE IF NOT EXISTS asset_cleanup (name TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS avatar_jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, request_id TEXT NOT NULL, input_hash TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(project_id, request_id));
     `)
   }
@@ -48,6 +50,19 @@ export class Store {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  userSettings(userId: string): UserSettings {
+    const row = this.db.prepare('SELECT data FROM user_settings WHERE user_id = ?').get(userId)
+    return { ...defaultUserSettings, ...(row ? JSON.parse(row.data as string) : {}) }
+  }
+
+  updateUserSettings(userId: string, changes: Partial<UserSettings>): UserSettings {
+    return this.transaction(() => {
+      const settings = { ...this.userSettings(userId), ...changes }
+      this.db.prepare('INSERT INTO user_settings (user_id, data) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET data = excluded.data').run(userId, JSON.stringify(settings))
+      return settings
+    })
   }
 
   project(id: string): Project {
@@ -134,6 +149,27 @@ export class Store {
     return this.db.prepare('SELECT thread_id FROM sessions WHERE project_id = ?').get(projectId)?.thread_id as string ?? null
   }
 
+  conversation(projectId: string, before?: string): Snapshot {
+    const project = this.project(projectId)
+    const cursor = before ? this.db.prepare('SELECT rowid FROM messages WHERE project_id = ? AND id = ?').get(projectId, before) : undefined
+    if (before && !cursor) throw new HttpError(409, '对话已更新，请刷新后加载历史。')
+    const rows = this.db.prepare('SELECT data FROM messages WHERE project_id = ? AND rowid < ? ORDER BY rowid DESC LIMIT 11').all(projectId, cursor?.rowid ?? Number.MAX_SAFE_INTEGER)
+    const messages: Message[] = rows.slice(0, 10).reverse().map(row => JSON.parse(row.data as string))
+    const ids = JSON.stringify(messages.map(message => message.id))
+    const runs = this.db.prepare("SELECT json_remove(data, '$.progress') AS data FROM agent_runs WHERE project_id = ? AND (json_extract(data, '$.messageId') IN (SELECT value FROM json_each(?)) OR json_extract(data, '$.assistantId') IN (SELECT value FROM json_each(?)) OR json_extract(data, '$.status') IN ('queued', 'running')) ORDER BY rowid").all(projectId, ids, ids).map(row => JSON.parse(row.data as string))
+    const jobs = this.db.prepare("SELECT data FROM jobs WHERE project_id = ? AND json_extract(data, '$.messageId') IN (SELECT value FROM json_each(?)) ORDER BY rowid").all(projectId, ids).map(row => JSON.parse(row.data as string))
+    const assets = this.db.prepare('SELECT data FROM assets WHERE project_id = ? ORDER BY rowid').all(projectId).map(row => JSON.parse(row.data as string))
+    const tailId = this.db.prepare('SELECT id FROM messages WHERE project_id = ? ORDER BY rowid DESC LIMIT 1').get(projectId)?.id as string ?? null
+    return { project, messages, runs, jobs, assets, threadId: this.threadId(projectId), page: { before: rows.length > 10 ? messages[0].id : null, tailId } }
+  }
+
+  tasks(projectId: string): Pick<Snapshot, 'runs' | 'jobs'> {
+    this.project(projectId)
+    const runs = this.db.prepare("SELECT json_remove(data, '$.progress') AS data FROM agent_runs WHERE project_id = ? ORDER BY rowid").all(projectId).map(row => JSON.parse(row.data as string))
+    const jobs = this.db.prepare('SELECT data FROM jobs WHERE project_id = ? ORDER BY rowid').all(projectId).map(row => JSON.parse(row.data as string))
+    return { runs, jobs }
+  }
+
   queueAgent(projectId: string, input: AgentInput): AgentRun {
     return this.transaction(() => {
       this.project(projectId)
@@ -148,12 +184,20 @@ export class Store {
       for (const id of assetIds) {
         if (this.asset(id).projectId !== projectId) throw new HttpError(400, 'Attachment belongs to another project')
       }
+      if (input.directImage) {
+        if (input.mode !== 'image' || (input.videoModel ?? 'none') !== 'none') throw new HttpError(400, 'Direct image requires image mode without video')
+        if (input.directImage.operation === 'generate' && assetIds.length) throw new HttpError(400, 'Direct generation does not accept source attachments')
+        if (input.directImage.operation === 'edit') {
+          const sourceId = input.directImage.sourceAssetId
+          if (assetIds.length !== 1 || assetIds[0] !== sourceId || (this.asset(sourceId).mediaType ?? 'image') !== 'image') throw new HttpError(400, 'Direct edit requires one explicitly selected image')
+        }
+      }
       const pending = this.db.prepare("SELECT COUNT(*) AS count FROM agent_runs WHERE json_extract(data, '$.status') IN ('queued', 'running')").get()!
       if (Number(pending.count) >= 10) throw new HttpError(429, 'Too many pending requests')
       const now = new Date().toISOString()
       const message: Message = { id: randomUUID(), projectId, text: input.text, assetIds, role: 'user', createdAt: now }
       const run: AgentRun = { id: randomUUID(), projectId, messageId: message.id, assistantId: randomUUID(), input,
-        status: 'queued', stage: 'codex', reply: '', threadId: null, createdAt: now, updatedAt: now }
+        status: 'queued', stage: input.directImage ? 'image' : 'codex', reply: '', threadId: null, createdAt: now, updatedAt: now }
       this.db.prepare('INSERT INTO messages VALUES (?, ?, ?)').run(message.id, projectId, JSON.stringify(message))
       this.db.prepare('INSERT INTO agent_runs VALUES (?, ?, ?, ?, ?)').run(run.id, projectId, input.requestId, hash, JSON.stringify(run))
       this.event(projectId, 'agent.queued')
@@ -167,7 +211,7 @@ export class Store {
     return JSON.parse(row.data as string)
   }
 
-  resend(projectId: string, messageId: string, request: { requestId: string; expectedTailId: string }, agent: boolean): AgentRun | Job {
+  resend(projectId: string, messageId: string, request: { requestId: string; expectedTailId: string; text?: string }, agent: boolean): AgentRun | Job {
     return this.transaction(() => {
       const hash = createHash('sha256').update(JSON.stringify({ messageId, ...request, agent })).digest('hex')
       const previous = this.db.prepare('SELECT input_hash, result FROM message_resends WHERE project_id = ? AND request_id = ?').get(projectId, request.requestId)
@@ -187,8 +231,8 @@ export class Store {
       const originalRun = snapshot.runs.find(run => run.messageId === messageId)
       const originalJob = snapshot.jobs.find(job => job.messageId === messageId)
       if (!originalRun && !originalJob) throw new HttpError(400, '找不到这条消息的发送参数。')
-      const history = snapshot.messages.slice(0, position)
-      if (agent && (history.length > 200 || history.reduce((total, entry) => total + entry.text.length, 0) > 200000)) throw new HttpError(400, '保留的历史过长，请新建项目。')
+      const text = request.text === undefined ? message.text : request.text.trim()
+      if (!text || text.length > 6000) throw new HttpError(400, '消息需要包含 1 到 6000 个字符。')
       if (agent && Number(this.db.prepare("SELECT COUNT(*) AS count FROM agent_runs WHERE json_extract(data, '$.status') IN ('queued', 'running')").get()!.count) >= 10) throw new HttpError(429, 'Too many pending requests')
       for (const removed of snapshot.messages.slice(position)) {
         this.db.prepare("DELETE FROM agent_runs WHERE project_id = ? AND json_extract(data, '$.messageId') = ?").run(projectId, removed.id)
@@ -196,17 +240,18 @@ export class Store {
         if (removed.id !== messageId) this.db.prepare('DELETE FROM messages WHERE id = ? AND project_id = ?').run(removed.id, projectId)
       }
       this.db.prepare('DELETE FROM sessions WHERE project_id = ?').run(projectId)
+      this.db.prepare('UPDATE messages SET data = ? WHERE id = ?').run(JSON.stringify({ ...message, text }), messageId)
       const now = new Date().toISOString()
       let result: AgentRun | Job
       if (agent) {
-        const input: AgentInput = originalRun ? { ...originalRun.input, requestId: request.requestId } : {
-          requestId: request.requestId, text: message.text, assetIds: message.assetIds, mode: 'auto', ratio: '1:1',
+        const input: AgentInput = originalRun ? { ...originalRun.input, text, requestId: request.requestId } : {
+          requestId: request.requestId, text, assetIds: message.assetIds, mode: 'auto', ratio: '1:1',
         }
-        result = { id: randomUUID(), projectId, messageId, assistantId: randomUUID(), input, status: 'queued', stage: 'codex', reply: '', threadId: null, createdAt: now, updatedAt: now }
+        result = { id: randomUUID(), projectId, messageId, assistantId: randomUUID(), input, status: 'queued', stage: input.directImage ? 'image' : 'codex', reply: '', threadId: null, createdAt: now, updatedAt: now }
         this.db.prepare('INSERT INTO agent_runs VALUES (?, ?, ?, ?, ?)').run(result.id, projectId, request.requestId, createHash('sha256').update(JSON.stringify(input)).digest('hex'), JSON.stringify(result))
       } else {
         if (!originalJob) throw new HttpError(503, 'Codex 未配置，无法重新发送此消息。')
-        result = { ...originalJob, id: randomUUID(), status: 'waiting_service', createdAt: now, updatedAt: now }
+        result = { ...originalJob, prompt: text, id: randomUUID(), status: 'waiting_service', createdAt: now, updatedAt: now }
         const input = { text: result.prompt, assetIds: result.assetIds, ratio: result.ratio }
         this.db.prepare('INSERT INTO jobs VALUES (?, ?, ?, ?, ?)').run(result.id, projectId, request.requestId, createHash('sha256').update(JSON.stringify(input)).digest('hex'), JSON.stringify(result))
       }
@@ -223,7 +268,9 @@ export class Store {
 
   updateAgent(id: string, changes: Partial<Pick<AgentRun, 'status' | 'stage' | 'reply' | 'threadId' | 'error' | 'assetId' | 'processedAssetIds' | 'progress' | 'imageOperation' | 'sourceAssetId' | 'avatarJobId' | 'narration' | 'story'>>): AgentRun {
     return this.transaction(() => {
-      const run = { ...this.agentRun(id), ...changes, updatedAt: new Date().toISOString() }
+      const current = this.agentRun(id)
+      if (Object.entries(changes).every(([key, value]) => JSON.stringify(current[key as keyof AgentRun]) === JSON.stringify(value))) return current
+      const run = { ...current, ...changes, updatedAt: new Date().toISOString() }
       this.db.prepare('UPDATE agent_runs SET data = ? WHERE id = ?').run(JSON.stringify(run), id)
       if (run.threadId) this.db.prepare('INSERT INTO sessions VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET thread_id = excluded.thread_id').run(run.projectId, run.threadId)
       if (run.reply) {

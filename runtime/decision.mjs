@@ -1,6 +1,17 @@
 import { z } from 'zod'
 import { readFile } from 'node:fs/promises'
 
+export const t4Models = ['qwen-image-2.1-t4', 'qwen-image-2.1-t4-turbo']
+export function availableT4Models(nodes) {
+  const has = (node, field, name) => nodes[node]?.input?.required?.[field]?.[0]?.includes(name)
+  const common = ['TextEncodeQwenImage21', 'QwenImage21Cache', 'VAEDecode', 'SaveImageAdvanced', 'LoadImage', 'EmptyLatentImage']
+  if (!common.every(node => nodes[node]) || !has('UNETLoader', 'unet_name', 'qwen_image_2.1_int8_convrot.safetensors') || !has('CLIPLoader', 'clip_name', 'qwen3vl_8b_int8_convrot.safetensors') || !has('VAELoader', 'vae_name', 'qwen_image_2.1_vae_bf16.safetensors')) return []
+  return [
+    ...(nodes.KSampler ? [t4Models[0]] : []),
+    ...(['SamplerCustom', 'KSamplerSelect', 'ManualSigmas'].every(node => nodes[node]) && has('LoraLoaderModelOnly', 'lora_name', 'qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors') ? [t4Models[1]] : []),
+  ]
+}
+
 export const narrationEditingSkill = await readFile(new URL('./skills/narration-editing/SKILL.md', import.meta.url), 'utf8')
 
 export const decisionSchema = {
@@ -68,16 +79,40 @@ export function renderSettings(decision, defaults) {
   return { ratio, quality }
 }
 
+export const azureImageModels = ['azure-image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst']
+export const isAzureImageModel = model => azureImageModels.includes(model)
+
+export const directImageSchema = z.discriminatedUnion('operation', [
+  z.object({ operation: z.literal('generate') }).strict(),
+  z.object({ operation: z.literal('edit'), sourceAssetId: z.string().uuid() }).strict(),
+])
+
+export function directImageDecision(input) {
+  const request = directImageSchema.parse(input.directImage)
+  if (input.mode !== 'image' || input.videoModel !== 'none') throw new Error('Direct image requests require image mode without video')
+  const sourceAssetId = request.operation === 'edit' ? request.sourceAssetId : null
+  if (sourceAssetId && !input.imageCandidates.some(candidate => candidate.assetId === sourceAssetId)) throw new Error('Direct edit requires the explicitly selected source')
+  const supportedRatios = ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']
+  const labeled = [...input.text.matchAll(/(?:比例|画幅|aspect\s+ratio)\s*(?:为|是|[:：=])?\s*([1-9]\d*)\s*[:：]\s*([1-9]\d*)/giu)].map(match => `${match[1]}:${match[2]}`)
+  const numeric = [...input.text.matchAll(/(?<![\d:：])([1-9]\d*)\s*[:：]\s*([1-9]\d*)(?![\d:：])/gu)].map(match => `${match[1]}:${match[2]}`).filter(ratio => supportedRatios.includes(ratio))
+  const ratios = [...new Set([...labeled, ...numeric])]
+  if (ratios.length > 1) throw new Error('需求中有多个不同的图片比例，请只保留本次要生成的比例。')
+  if (ratios.length && !supportedRatios.includes(ratios[0])) throw new Error('直接生图不支持指定的比例，请使用表单中的比例选项。')
+  return { action: request.operation === 'edit' ? 'edit' : 'image', imagePrompt: input.text,
+    sourceAssetId, ratio: ratios[0] ?? (request.operation === 'edit' ? null : input.ratio), quality: input.quality,
+    size: null, reply: '', videoPrompt: null, avatarPlan: null, storyPlan: null }
+}
+
 function validImageSize(size, model) {
   if (!/^[1-9][0-9]{0,4}x[1-9][0-9]{0,4}$/.test(size)) return false
   const [width, height] = size.split('x').map(Number)
-  if (model === 'azure-image2') return width % 16 === 0 && height % 16 === 0 && Math.max(width, height) <= 3840 && Math.max(width, height) <= 3 * Math.min(width, height) && width * height >= 655360 && width * height <= 8294400
+  if (isAzureImageModel(model)) return width % 16 === 0 && height % 16 === 0 && Math.max(width, height) <= 3840 && Math.max(width, height) <= 3 * Math.min(width, height) && width * height >= 655360 && width * height <= 8294400
   return width % 32 === 0 && height % 32 === 0 && width * height <= 4194304
 }
 
 export function editOutputSize(source, model) {
   const size = `${source.width}x${source.height}`
-  return model === 'azure-image2' && !validImageSize(size, model) ? 'auto' : size
+  return isAzureImageModel(model) && !validImageSize(size, model) ? 'auto' : size
 }
 
 export function imageOutputSize(decision, defaults, source) {

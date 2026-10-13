@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import Fastify from 'fastify'
+import type { LightMyRequestResponse } from 'fastify'
 import { DatabaseSync } from 'node:sqlite'
 import { registerAuth, provisionLocalUser } from './auth.ts'
 import { buildApp } from './app.ts'
@@ -67,6 +68,53 @@ test('password sessions require origin and CSRF, rotate on login and revoke on l
   } finally { await app.close(); database.close() }
 })
 
+test('settings persist per user with Flare defaults and require authentication and CSRF', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'studio-settings-'))
+  const origin = 'https://localhost'
+  const app = await buildApp({ dataDir, auth: { origin }, origins: [origin], agent: {
+    health: async () => ({}), submit: async () => {}, stop: async () => {}, get: async () => { throw new Error('Offline test') },
+  } })
+  const store = new Store(join(dataDir, 'studio.sqlite'))
+  try {
+    const headers = []
+    const userIds = []
+    for (const username of ['settings-one', 'settings-two']) {
+      userIds.push(await provisionLocalUser(store.db, username, 'test-password-123', username))
+      const login = await app.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username, password: 'test-password-123' } })
+      assert.equal(login.statusCode, 200)
+      headers.push({ origin, cookie: `${login.cookies[0].name}=${login.cookies[0].value}`, 'x-csrf-token': login.json().csrf })
+    }
+    assert.equal((await app.inject('/api/settings')).statusCode, 401)
+    assert.equal((await app.inject({ method: 'PATCH', url: '/api/settings', headers: { origin }, payload: { quality: 'high' } })).statusCode, 403)
+    const defaults = { ratio: '1:1', quality: 'low', imageModel: 'gpt-image-2.5-flare', videoModel: 'none' }
+    assert.deepEqual((await app.inject({ url: '/api/settings', headers: headers[0] })).json(), defaults)
+    assert.equal((await app.inject({ method: 'PATCH', url: '/api/settings', headers: { origin, cookie: headers[0].cookie }, payload: { quality: 'high' } })).statusCode, 403)
+    for (const payload of [{ userId: userIds[1], quality: 'high' }, { imageModel: 'unknown' }, { ratio: 'invalid' }, {}]) {
+      assert.equal((await app.inject({ method: 'PATCH', url: '/api/settings', headers: headers[0], payload })).statusCode, 400)
+    }
+    const changed = { ...defaults, ratio: '16:9', quality: 'high', imageModel: 'gpt-image-2.5-sunburst' }
+    assert.deepEqual((await app.inject({ method: 'PATCH', url: '/api/settings', headers: headers[0], payload: changed })).json(), changed)
+    assert.deepEqual((await app.inject({ url: '/api/settings', headers: headers[1] })).json(), defaults)
+    assert.deepEqual((await app.inject({ method: 'PATCH', url: '/api/settings', headers: headers[0], payload: { videoModel: 'minimax-h3' } })).json(), { ...changed, videoModel: 'minimax-h3' })
+    for (const [index, expected] of [changed, defaults].entries()) {
+      const project: { id: string } = (await app.inject({ method: 'POST', url: '/api/projects', headers: headers[index], payload: { title: 'Defaults' } })).json()
+      const queued: LightMyRequestResponse = await app.inject({ method: 'POST', url: `/api/projects/${project.id}/chat`, headers: headers[index], payload: { requestId: randomUUID(), text: 'offline', mode: 'chat' } })
+      assert.equal(queued.statusCode, 202)
+      assert.equal(queued.json().input.imageModel, expected.imageModel)
+      assert.equal(queued.json().input.ratio, expected.ratio)
+      assert.equal(queued.json().input.quality, expected.quality)
+      const explicit: LightMyRequestResponse = await app.inject({ method: 'POST', url: `/api/projects/${project.id}/chat`, headers: headers[index], payload: { requestId: randomUUID(), text: 'override', mode: 'chat', imageModel: 'azure-image2' } })
+      assert.equal(explicit.statusCode, 202)
+      assert.equal(explicit.json().input.imageModel, 'azure-image2')
+    }
+    const reopened = new Store(join(dataDir, 'studio.sqlite'))
+    try {
+      assert.deepEqual(reopened.userSettings(userIds[0]), { ...changed, videoModel: 'minimax-h3' })
+      assert.deepEqual(reopened.userSettings(userIds[1]), defaults)
+    } finally { reopened.db.close() }
+  } finally { await app.close(); store.db.close(); await rm(dataDir, { recursive: true, force: true }) }
+})
+
 test('two users cannot access each other projects, assets, tasks or streams', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'studio-auth-'))
   const origin = 'https://localhost'
@@ -89,7 +137,7 @@ test('two users cannot access each other projects, assets, tasks or streams', as
     const asset = store.addAsset({ id: randomUUID(), projectId: project.id, name: 'private.png', kind: 'reference', width: 1, height: 1, bytes: 1, hash: 'private', createdAt: new Date().toISOString() })
     const run = store.queueAgent(project.id, { requestId: randomUUID(), text: 'private', mode: 'chat', ratio: '1:1' })
     const job = store.submit(project.id, { requestId: randomUUID(), text: 'private', ratio: '1:1', assetIds: [] })
-    for (const url of [`/api/projects/${project.id}`, `/api/projects/${project.id}/events`, `/api/assets/${asset.id}/content`, `/api/assets/${asset.id}/content?thumbnail=1`, `/api/assets/${asset.id}/content?download=1`]) assert.equal((await app.inject({ url, headers: headers[1] })).statusCode, 404, url)
+    for (const url of [`/api/projects/${project.id}`, `/api/projects/${project.id}?before=${run.messageId}`, `/api/projects/${project.id}/tasks`, `/api/agent-runs/${run.id}/progress`, `/api/projects/${project.id}/events`, `/api/assets/${asset.id}/content`, `/api/assets/${asset.id}/content?thumbnail=1`, `/api/assets/${asset.id}/content?download=1`]) assert.equal((await app.inject({ url, headers: headers[1] })).statusCode, 404, url)
     for (const url of [`/api/projects/${project.id}/chat`, `/api/projects/${project.id}/uploads`, `/api/projects/${project.id}/messages`, `/api/projects/${project.id}/messages/${run.messageId}/resend`, `/api/agent-runs/${run.id}/stop`, `/api/jobs/${job.id}/cancel`]) assert.equal((await app.inject({ method: 'POST', url, headers: headers[1], payload: {} })).statusCode, 404, url)
     for (const method of ['PATCH', 'DELETE'] as const) assert.equal((await app.inject({ method, url: `/api/projects/${project.id}`, headers: headers[1], payload: {} })).statusCode, 404)
     assert.equal((await app.inject({ url: `/api/projects/${project.id}`, headers: headers[0] })).statusCode, 200)

@@ -1,6 +1,11 @@
 export type Ratio = '1:1' | '4:3' | '3:4' | '16:9' | '9:16' | '3:2' | '2:3'
 export type Quality = 'low' | 'medium' | 'high'
-export type ImageModel = 'azure-image2' | 'qwen-image-2.1'
+export const imageModels = ['azure-image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'qwen-image-2.1', 'qwen-image-2.1-t4', 'qwen-image-2.1-t4-turbo'] as const
+export type ImageModel = typeof imageModels[number]
+export const imageModelNames: Record<ImageModel, string> = { 'azure-image2': 'GPT Image 2', 'gpt-image-2.5-flare': 'GPT Image 2.5 Flare', 'gpt-image-2.5-sunburst': 'GPT Image 2.5 Sunburst', 'qwen-image-2.1': 'Qwen Image 2.1', 'qwen-image-2.1-t4': 'Qwen Image 2.1 T4', 'qwen-image-2.1-t4-turbo': 'Qwen Image 2.1 Turbo T4' }
+export const isAzureImageModel = (model: ImageModel) => !model.startsWith('qwen-image-')
+export type UserSettings = { ratio: Ratio; quality: Quality; imageModel: ImageModel; videoModel: VideoModel }
+export const defaultUserSettings: UserSettings = { ratio: '1:1', quality: 'low', imageModel: 'gpt-image-2.5-flare', videoModel: 'none' }
 export type VideoModel = 'none' | 'minimax-h3'
 export type Project = { id: string; title: string; createdAt: string; updatedAt: string }
 export type Asset = {
@@ -23,7 +28,8 @@ export type Job = {
   id: string; projectId: string; messageId: string; prompt: string; assetIds: string[]
   ratio: Ratio; status: 'waiting_service' | 'cancelled'; createdAt: string; updatedAt: string
 }
-export type AgentInput = { requestId: string; text: string; assetIds?: string[]; mode: 'auto' | 'chat' | 'image'; ratio: Ratio; quality?: Quality; imageModel?: ImageModel; videoModel?: VideoModel }
+export type DirectImage = { operation: 'generate' } | { operation: 'edit'; sourceAssetId: string }
+export type AgentInput = { requestId: string; text: string; assetIds?: string[]; mode: 'auto' | 'chat' | 'image'; ratio: Ratio; quality?: Quality; imageModel?: ImageModel; videoModel?: VideoModel; directImage?: DirectImage }
 export type AgentProgress = { id: string; label: string; detail?: string; createdAt: string }
 export type NarrationProgress = { phase: 'script' | 'speech' | 'queued' | 'rendering' | 'tail' | 'stitching' | 'completed' | 'stopped'; segment: number; updatedAt: string }
 export type NarrationState = { segments: { text: string; continueFromPrevious: boolean }[]; progress?: NarrationProgress; stopRequested?: boolean; scriptAssetId?: string }
@@ -38,5 +44,5 @@ export type AgentRun = {
   narration?: NarrationState
   story?: StoryState
 }
-export type Snapshot = { project: Project; messages: Message[]; assets: Asset[]; jobs: Job[]; runs: AgentRun[]; threadId: string | null }
+export type Snapshot = { project: Project; messages: Message[]; assets: Asset[]; jobs: Job[]; runs: AgentRun[]; threadId: string | null; page?: { before: string | null; tailId: string | null } }
 export type Submission = { requestId: string; text: string; assetIds: string[]; ratio: Ratio }

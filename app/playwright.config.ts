@@ -13,7 +13,7 @@ export default defineConfig({
     { name: 'mobile', use: { ...devices['iPhone 13'], defaultBrowserType: 'chromium' } },
   ],
   webServer: {
-    command: 'npm run dev',
+    command: 'npm run predev && npx concurrently -k -n api,web "node --import tsx server/index.ts" "vite"',
     url: 'http://127.0.0.1:5198/api/health',
     reuseExistingServer: false,
     env: { WEB_PORT: '5198', API_PORT: '3198', APP_ORIGINS: 'http://127.0.0.1:5198', DATA_DIR: mkdtempSync(join(tmpdir(), 'qwen-e2e-')) },

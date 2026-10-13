@@ -7,7 +7,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Store, HttpError } from './store.ts'
 import type { Asset } from '../src/domain.ts'
-import { assetExtension, assetHasThumbnail, assetContentType } from '../src/domain.ts'
+import { assetExtension, assetHasThumbnail, assetContentType, imageModels } from '../src/domain.ts'
 import { AgentWorker } from './agent.ts'
 import type { AgentTransport } from './agent.ts'
 import { BlobAssetStorage, LocalAssetStorage, prepareUpload } from './assets.ts'
@@ -21,6 +21,12 @@ import { avatarInputSchema } from './avatar-provider.ts'
 import type { AvatarProvider } from './avatar-provider.ts'
 
 const titleSchema = z.object({ title: z.string().trim().min(1).max(80) }).strict()
+const settingsSchema = z.object({
+  ratio: z.enum(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']),
+  quality: z.enum(['low', 'medium', 'high']),
+  imageModel: z.enum(imageModels),
+  videoModel: z.enum(['none', 'minimax-h3']),
+}).partial().strict().refine(value => Object.keys(value).length > 0)
 const submissionSchema = z.object({
   requestId: z.string().uuid(), text: z.string().trim().min(1).max(6000),
   assetIds: z.array(z.string().uuid()).max(10).refine(ids => new Set(ids).size === ids.length),
@@ -89,6 +95,8 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
 
   const authentication = options.auth ? await registerAuth(app, store.db, options.auth) : undefined
   if (!authentication) app.get('/api/auth/session', async () => ({ enabled: false, user: null }))
+  app.get('/api/settings', async request => store.userSettings(authentication ? request.studioSession!.user.id : 'local'))
+  app.patch('/api/settings', async request => store.updateUserSettings(authentication ? request.studioSession!.user.id : 'local', settingsSchema.parse(request.body)))
   app.addHook('preHandler', async request => {
     if (!authentication || !request.routeOptions.url?.startsWith('/api/')) return
     const route = request.routeOptions.url
@@ -148,17 +156,20 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
   app.get('/api/health', async () => {
     const status = options.agent ? await options.agent.health().catch(() => null) : null
     const ready = status !== null
-    const models = z.object({ models: z.object({ images: z.array(z.enum(['azure-image2', 'qwen-image-2.1'])), videos: z.array(z.literal('minimax-h3')) }) }).safeParse(status)
+    const models = z.object({ models: z.object({ images: z.array(z.enum(imageModels)), videos: z.array(z.literal('minimax-h3')) }) }).safeParse(status)
     return { storage: 'ready', agentConfigured: !!options.agent, agent: ready ? 'configured' : 'not_connected', renderer: ready ? 'azure_image2' : 'not_connected',
       openmontage: ready ? 'installed' : 'not_connected', mode: options.auth ? 'private-user-workspace' : 'local-development', models: models.success ? models.data.models : { images: ready ? ['azure-image2'] : [], videos: [] } }
   })
   app.post<{ Params: { id: string } }>('/api/projects/:id/chat', async (request, reply) => {
     if (!worker) throw new HttpError(503, 'Codex 未配置')
     if (options.vm?.busy) throw new HttpError(409, 'VM 操作尚未确认完成，请先刷新 VM 状态。')
+    const defaults = store.userSettings(authentication ? request.studioSession!.user.id : 'local')
     const input = z.object({ requestId: z.string().uuid(), text: z.string().trim().min(1).max(6000),
       assetIds: z.array(z.string().uuid()).max(10).refine(ids => new Set(ids).size === ids.length).default([]),
-      mode: z.enum(['auto', 'chat', 'image']), ratio: z.enum(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']), quality: z.enum(['low', 'medium', 'high']).default('low'),
-      imageModel: z.enum(['azure-image2', 'qwen-image-2.1']).default('azure-image2'), videoModel: z.enum(['none', 'minimax-h3']).default('none') }).strict().parse(request.body)
+      mode: z.enum(['auto', 'chat', 'image']), ratio: z.enum(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']).default(defaults.ratio), quality: z.enum(['low', 'medium', 'high']).default(defaults.quality),
+      imageModel: z.enum(imageModels).default(defaults.imageModel), videoModel: z.enum(['none', 'minimax-h3']).default(defaults.videoModel),
+      directImage: z.discriminatedUnion('operation', [z.object({ operation: z.literal('generate') }).strict(), z.object({ operation: z.literal('edit'), sourceAssetId: z.string().uuid() }).strict()]).optional(),
+    }).strict().refine(input => !input.directImage || (input.mode === 'image' && input.videoModel === 'none')).parse(request.body)
     return reply.code(202).send(store.queueAgent(request.params.id, input))
   })
   app.post<{ Params: { id: string } }>('/api/agent-runs/:id/stop', async request => {
@@ -166,7 +177,7 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     return worker.stop(request.params.id)
   })
   app.post<{ Params: { id: string; messageId: string } }>('/api/projects/:id/messages/:messageId/resend', async (request, reply) => {
-    const input = z.object({ requestId: z.string().uuid(), expectedTailId: z.string().uuid() }).strict().parse(request.body)
+    const input = z.object({ requestId: z.string().uuid(), expectedTailId: z.string().uuid(), text: z.string().trim().min(1).max(6000).optional() }).strict().parse(request.body)
     const result = worker ? worker.resend(request.params.id, request.params.messageId, input) : store.resend(request.params.id, request.params.messageId, input, false)
     return reply.code(202).send(result)
   })
@@ -182,7 +193,12 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     store.deleteProject(request.params.id, input.expectedUpdatedAt)
     return { deleted: true, pendingCleanup: await cleanupAssets() }
   })
-  app.get<{ Params: { id: string } }>('/api/projects/:id', async request => store.snapshot(request.params.id))
+  app.get<{ Params: { id: string } }>('/api/projects/:id', async request => {
+    const { before } = z.object({ before: z.string().uuid().optional() }).strict().parse(request.query)
+    return store.conversation(request.params.id, before)
+  })
+  app.get<{ Params: { id: string } }>('/api/projects/:id/tasks', async request => store.tasks(request.params.id))
+  app.get<{ Params: { id: string } }>('/api/agent-runs/:id/progress', async request => store.agentRun(request.params.id).progress ?? [])
   app.post<{ Params: { id: string } }>('/api/projects/:id/messages', async (request, reply) => {
     const job = store.submit(request.params.id, submissionSchema.parse(request.body))
     return reply.code(202).send(job)

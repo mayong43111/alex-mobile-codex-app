@@ -13,10 +13,13 @@ const environment = z.object({
   AZURE_MODEL_SUBSCRIPTION: z.string().uuid(),
   AZURE_STORAGE_BLOB_ENDPOINT: z.url().startsWith('https://'), AZURE_STORAGE_CONTAINER: z.string().min(1),
   COMFYUI_SERVER_URL: z.url().optional(),
+  COMFYUI_T4_URL: z.url().regex(/^http:\/\/(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+):8189\/?$/).optional(),
+  COMFYUI_T4_TOKEN: z.string().min(1).optional(),
   SPEECH_AVATAR_ENDPOINT: z.url().startsWith('https://').optional(),
   OPENMONTAGE_AVATAR_ENABLED: z.enum(['0', '1']).optional(),
   VM_CONFIG: z.string().startsWith('/home/').optional(),
 }).parse(process.env)
+if (Boolean(environment.COMFYUI_T4_URL) !== Boolean(environment.COMFYUI_T4_TOKEN)) throw new Error('T4 proxy URL and token must be configured together')
 environment.ENTRA_ALLOWED_USER_IDS.split(',').forEach(id => z.string().uuid().parse(id))
 environment.ENTRA_ADMIN_USER_IDS?.split(',').forEach(id => { z.string().uuid().parse(id); if (!environment.ENTRA_ALLOWED_USER_IDS.split(',').includes(id)) throw new Error('Administrator outside allowed users') })
 await mkdir('/home/studio/runtime', { recursive: true })
@@ -26,7 +29,8 @@ const configFile = `${temporary}/services.json`
 await writeFile(configFile, JSON.stringify({
   gateway: 'http://127.0.0.1:3199', token: randomBytes(32).toString('hex'),
   codex: { auth: 'entra', endpoint: environment.AZURE_GPT_ENDPOINT.replace(/\/$/, ''), deployment: environment.AZURE_GPT_DEPLOYMENT },
-  image: { auth: 'entra', endpoint: environment.AZURE_IMAGE_ENDPOINT.replace(/\/$/, ''), deployment: environment.AZURE_IMAGE_DEPLOYMENT, subscription: environment.AZURE_MODEL_SUBSCRIPTION },
+  image: { auth: 'entra', endpoint: environment.AZURE_IMAGE_ENDPOINT.replace(/\/$/, ''), deployment: environment.AZURE_IMAGE_DEPLOYMENT, subscription: environment.AZURE_MODEL_SUBSCRIPTION,
+    deployments: { 'gpt-image-2.5-flare': 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst': 'gpt-image-2.5-sunburst' } },
 }), { mode: 0o600 })
 
 const children = new Set()
@@ -56,8 +60,9 @@ function launch(args, options) {
 }
 const gateway = launch(['runtime/gateway.mjs'], { env: {
   PATH: process.env.PATH, HOME: '/home/node', CODEX_HOME: '/state/codex',
-  SERVICES_FILE: configFile, RUNTIME_HOST: '127.0.0.1',
+  SERVICES_FILE: configFile, RUNTIME_HOST: '127.0.0.1', HOSTING_MODE: 'appservice',
   ...(environment.COMFYUI_SERVER_URL ? { COMFYUI_SERVER_URL: environment.COMFYUI_SERVER_URL } : {}),
+  ...(environment.COMFYUI_T4_URL ? { COMFYUI_T4_URL: environment.COMFYUI_T4_URL, COMFYUI_T4_TOKEN: environment.COMFYUI_T4_TOKEN } : {}),
 } })
 gateway.once('message', message => {
   if (message.type !== 'ready' || stopping) return
@@ -68,6 +73,7 @@ gateway.once('message', message => {
     ...(environment.SPEECH_AVATAR_ENDPOINT ? { SPEECH_AVATAR_ENDPOINT: environment.SPEECH_AVATAR_ENDPOINT } : {}),
     ...(environment.OPENMONTAGE_AVATAR_ENABLED === '1' ? { OPENMONTAGE_AVATAR_ENABLED: '1', COMFYUI_SERVER_URL: environment.COMFYUI_SERVER_URL } : {}),
     ...(environment.VM_CONFIG ? { VM_CONFIG: environment.VM_CONFIG } : {}),
+    ...(environment.COMFYUI_T4_URL ? { COMFYUI_T4_URL: environment.COMFYUI_T4_URL, COMFYUI_T4_TOKEN: environment.COMFYUI_T4_TOKEN } : {}),
     APP_ORIGINS: `https://${environment.WEBSITE_HOSTNAME}`,
     WEBSITE_HOSTNAME: environment.WEBSITE_HOSTNAME, ENTRA_TENANT_ID: environment.ENTRA_TENANT_ID, ENTRA_ALLOWED_USER_IDS: environment.ENTRA_ALLOWED_USER_IDS,
     ENTRA_CLIENT_ID: environment.ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET: environment.ENTRA_CLIENT_SECRET,

@@ -11,9 +11,94 @@ from uuid import uuid4
 
 from PIL import Image
 from comfy_media import workflow, checked_source, validate_media, MODELS, ComfyMedia, stitch_story
+from t4_workflow import t4_workflow, T4_MODELS, T4Client
 
 
 class ComfyMediaTest(unittest.TestCase):
+    def test_t4_execution_uses_only_authenticated_proxy_and_keeps_source_bytes(self):
+        buffer = io.BytesIO()
+        Image.new('RGB', (1024, 1024), 'red').save(buffer, format='PNG')
+        raw = buffer.getvalue()
+        for model in T4_MODELS:
+            for editing in [False, True]:
+                with self.subTest(model=model, editing=editing), tempfile.TemporaryDirectory() as directory:
+                    settings = Path(directory) / 'settings.json'
+                    settings.write_text(json.dumps({'comfy': {'url': 'http://legacy.invalid'}}))
+                    run_id = str(uuid4())
+                    request = {'runId': run_id, 'model': model, 'prompt': 'test', 'ratio': '1:1'}
+                    if editing:
+                        request.update({'operation': 'edit', 'sourceImage': {'assetId': str(uuid4()), 'png': base64.b64encode(raw).decode(), 'hash': hashlib.sha256(raw).hexdigest(), 'width': 1024, 'height': 1024}})
+                    client = Mock(server_url='http://10.48.1.5:8189')
+                    client.check_models.return_value = (T4_MODELS[model], [])
+                    client.submit.return_value = str(uuid4())
+                    client.poll.return_value = {'status': {'completed': True}, 'outputs': {'10': {'images': [{'filename': 'image.png', 'subfolder': 'codex-studio', 'type': 'output'}]}}}
+                    queue = Mock()
+                    queue.json.return_value = {'queue_running': [], 'queue_pending': []}
+                    artifact = Mock()
+                    artifact.iter_content.return_value = [raw]
+                    stream = Mock()
+                    stream.__enter__ = Mock(return_value=artifact)
+                    stream.__exit__ = Mock(return_value=False)
+                    client.get.side_effect = [queue, stream]
+                    client.post.return_value.json.return_value = {'name': f'{run_id}.png', 'subfolder': 'studio'}
+                    with patch.dict(os.environ, {'SERVICES_FILE': str(settings), 'COMFYUI_T4_URL': client.server_url, 'COMFYUI_T4_TOKEN': 'fixture'}), patch('comfy_media.Path', side_effect=lambda value: Path(directory) if value == '/state/montage' else Path(value)), patch('comfy_media.T4Client', return_value=client), patch('comfy_media.ComfyUIClient', side_effect=AssertionError('Unexpected fallback')):
+                        result = ComfyMedia().execute(request)
+                        self.assertTrue(result.success, result.error)
+                        self.assertEqual(result.model, model)
+                        self.assertEqual((Path(directory) / run_id / 'image.png').read_bytes(), raw)
+                        if editing:
+                            self.assertEqual(client.post.call_args.kwargs['files']['image'][1], raw)
+                            self.assertEqual(result.data['sourceHash'], hashlib.sha256(raw).hexdigest())
+                        else:
+                            client.post.assert_not_called()
+                        self.assertFalse(ComfyMedia().execute(request).success)
+                        client.submit.assert_called_once()
+
+    def test_t4_proxy_auth_is_scoped_and_never_retries_submission(self):
+        prompt_id = str(uuid4())
+        client = T4Client('http://10.48.1.5:8189', 'fixture-token')
+        response = Mock(status_code=200)
+        response.json.return_value = {'prompt_id': prompt_id}
+        with patch('t4_workflow.requests.request', return_value=response) as request:
+            self.assertEqual(client.submit({}), prompt_id)
+            request.assert_called_once()
+            self.assertEqual(request.call_args.kwargs['headers'], {'Authorization': 'Bearer fixture-token'})
+            self.assertFalse(request.call_args.kwargs['allow_redirects'])
+            response.status_code = 302
+            with self.assertRaisesRegex(ValueError, 'HTTP 302'):
+                client.get(client.server_url + '/queue', timeout=1)
+            with self.assertRaisesRegex(ValueError, 'outside'):
+                client.get('https://example.com/queue')
+            self.assertEqual(request.call_count, 2)
+        for url in ['http://example.com:8189', 'http://10.48.1.5:8188', 'http://127.0.0.1:8189']:
+            with self.assertRaises(ValueError):
+                T4Client(url, 'fixture-token')
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            T4Client('http://10.48.1.5:8189', '')
+
+    def test_t4_four_workflows_preserve_reference_graph_parameters(self):
+        for model in T4_MODELS:
+            for source in [None, {'filename': 'original.png', 'width': 960, 'height': 1280}]:
+                graph, width, height, output = t4_workflow(model, 'Exact prompt', '1:1', 123, source)
+                self.assertEqual(graph['2']['inputs']['unet_name'], T4_MODELS[model][0])
+                self.assertEqual(graph['5']['inputs']['prompt'], 'Exact prompt')
+                self.assertEqual(graph['7']['class_type'], 'QwenImage21Cache')
+                self.assertEqual(graph[output]['class_type'], 'SaveImageAdvanced')
+                self.assertEqual((width, height), (960, 1280) if source else (1024, 1024))
+                if source:
+                    self.assertEqual(graph['8']['inputs']['latent_image'], ['5', 2])
+                    self.assertEqual(graph['12']['inputs']['image'], source['filename'])
+                if model.endswith('-turbo'):
+                    self.assertEqual(graph['17']['inputs']['strength_model'], 1)
+                    self.assertEqual(len(graph['19']['inputs']['sigmas'].split(',')), 9)
+                    self.assertEqual(graph['8']['class_type'], 'SamplerCustom')
+                else:
+                    self.assertEqual(graph['8']['inputs']['steps'], 25)
+            graph, width, height, _ = t4_workflow(model, 'Reframe', '1:1', 1, source, '2048x1152')
+            self.assertEqual((width, height), (2048, 1152))
+            self.assertEqual(graph['8']['inputs']['latent_image'], ['6', 0])
+            self.assertEqual(graph['12']['inputs']['image'], 'original.png')
+
     def test_story_stitch_uses_native_tool_and_validates_project_clip_order(self):
         import subprocess
         with tempfile.TemporaryDirectory() as directory:

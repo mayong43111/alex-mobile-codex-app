@@ -1,6 +1,7 @@
 FROM node:22.23.2-bookworm-slim AS web-build
 WORKDIR /opt/web
 COPY app/package.json app/package-lock.json ./
+ARG NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
 RUN npm ci
 COPY app/ ./
 RUN npm run build
@@ -9,6 +10,7 @@ FROM node:22.23.2-bookworm-slim AS runtime
 ARG OPENMONTAGE_REV=08e2151fa02de28a5d6a312b3d575692bf147ad7
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+ARG PIP_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple
 RUN git clone https://github.com/calesthio/OpenMontage.git /opt/openmontage \
     && cd /opt/openmontage && git checkout "$OPENMONTAGE_REV" \
     && python3 -m venv /opt/venv \
@@ -17,6 +19,7 @@ COPY runtime/configure-openmontage.py /tmp/configure-openmontage.py
 RUN /opt/venv/bin/python /tmp/configure-openmontage.py /opt/openmontage/tools/audio/azure_tts.py && rm /tmp/configure-openmontage.py
 WORKDIR /opt/studio
 COPY app/package.json app/package-lock.json ./
+ARG NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
 RUN npm ci --omit=dev && npm install --global @openai/codex@0.155.1
 COPY runtime/ ./runtime/
 ENV PYTHONPATH=/opt/openmontage PATH=/opt/venv/bin:$PATH CODEX_HOME=/state/codex SERVICES_FILE=/run/secrets/services

@@ -7,6 +7,7 @@
     "predev": "node scripts/create-icons.mjs",
     "prebuild": "node scripts/create-icons.mjs",
     "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite\"",
+    "dev:connected": "node --env-file=../.env node_modules/concurrently/dist/bin/index.js -k -n api,web \"node --watch --import tsx server/index.ts\" \"vite\"",
     "test": "node --import tsx --test server/*.test.ts",
     "test:e2e": "playwright test",
     "build": "tsc -b && vite build",
@@ -21,10 +22,10 @@
     "@fastify/multipart": "^10.1.1",
     "@fastify/rate-limit": "^11.2.0",
     "@fastify/static": "^10.1.4",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@openai/codex-sdk": "0.155.1",
-    "@radix-ui/react-dialog": "^1.1.23",
     "@pixiv/three-vrm": "^3.4.2",
+    "@radix-ui/react-dialog": "^1.1.23",
     "argon2": "^0.45.1",
     "fastify": "^5.12.5",
     "ffprobe-static": "^3.1.0",
@@ -35,9 +36,14 @@
     "react-markdown": "^10.1.0",
     "react-zoom-pan-pinch": "^4.2.0",
     "remark-gfm": "^4.0.1",
-    "sharp": "^0.35.4",
+    "sharp": "^0.35.5",
     "three": "^0.180.0",
     "zod": "^4.6.5"
+  },
+  "overrides": {
+    "concurrently": {
+      "shell-quote": "^1.11.0"
+    }
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

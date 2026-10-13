@@ -1,12 +1,13 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react'
-import type { ButtonHTMLAttributes, FormEvent, ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import type { ButtonHTMLAttributes, CSSProperties, FormEvent, KeyboardEvent, ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film, Pencil } from 'lucide-react'
+import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, ImageOff, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film, Pencil } from 'lucide-react'
 import type { AgentRun, Asset, ImageModel, VideoModel, Job, Message, Project, Ratio, Quality, Snapshot, Submission } from './domain'
-import { assetHasThumbnail } from './domain'
+import { assetHasThumbnail, defaultUserSettings, imageModels, imageModelNames } from './domain'
+import type { AgentInput, UserSettings } from './domain'
 import type { VmStatus, VmAction, VmProfile, VmProfileInput, VmProfiles } from '../server/vm'
 import './MobileApp.css'
 import { authenticatedFetch } from './auth-client'
@@ -25,23 +26,43 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json()
 }
 const json = (method: string, payload: unknown): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+function mergeLatest(previous: Snapshot | null, latest: Snapshot): Snapshot {
+  if (!previous || previous.project.id !== latest.project.id || previous.messages.length <= 10 || !latest.messages.length) return latest
+  const overlap = previous.messages.findIndex(message => message.id === latest.messages[0].id)
+  if (overlap <= 0) return latest
+  const messages = [...previous.messages.slice(0, overlap), ...latest.messages]
+  const oldIds = new Set(previous.messages.slice(0, overlap).map(message => message.id))
+  const latestRunIds = new Set(latest.runs.map(run => run.messageId))
+  return { ...latest, messages,
+    runs: [...previous.runs.filter(run => (oldIds.has(run.messageId) || oldIds.has(run.assistantId)) && !latestRunIds.has(run.messageId)), ...latest.runs],
+    jobs: [...previous.jobs.filter(job => oldIds.has(job.messageId)), ...latest.jobs],
+    page: latest.page ? { ...latest.page, before: previous.page?.before ?? null } : undefined }
+}
 const imageUrl = (asset: Asset, thumbnail = true) => `/api/assets/${asset.id}/content${thumbnail ? '?thumbnail=1' : ''}`
 const fileSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.ceil(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`
 const assetDetails = (asset: Asset) => `${asset.width && asset.height ? `${asset.width} × ${asset.height} · ` : ''}${asset.duration ? `${asset.duration.toFixed(2)} 秒 · ` : ''}${fileSize(asset.bytes)}`
+function AssetImage({ asset, thumbnail = true }: { asset: Asset; thumbnail?: boolean }) {
+  const [state, setState] = useState<'loading' | 'loaded' | 'failed'>('loading')
+  const label = state === 'failed' ? '图片加载失败' : '图片加载中'
+  return <span className="asset-image-frame" data-state={state} style={{ '--image-ratio': asset.width > 0 && asset.height > 0 ? `${asset.width} / ${asset.height}` : '1' } as CSSProperties}>
+    <img src={imageUrl(asset, thumbnail)} alt={asset.name} width={asset.width || undefined} height={asset.height || undefined} loading={thumbnail ? 'lazy' : 'eager'} onLoad={() => setState('loaded')} onError={() => setState('failed')} />
+    {state !== 'loaded' && <span className="asset-image-status" role="status" aria-label={label} title={label}>{state === 'failed' ? <ImageOff size={22} aria-hidden="true" /> : <LoaderCircle size={22} className="spin" aria-hidden="true" />}</span>}
+  </span>
+}
 function AssetPreview({ asset }: { asset: Asset }) {
-  return assetHasThumbnail(asset) ? <img src={imageUrl(asset)} alt={asset.name} loading="lazy" /> : <span className="file-preview" aria-label={asset.name}>{asset.mediaType === 'video' ? <Film size={28} /> : <FileText size={28} />}</span>
+  return assetHasThumbnail(asset) ? <AssetImage key={asset.id} asset={asset} /> : <span className="file-preview" aria-label={asset.name}>{asset.mediaType === 'video' ? <Film size={28} /> : <FileText size={28} />}</span>
 }
 const time = (value: string) => new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 type Health = { storage: string; agentConfigured?: boolean; agent: string; renderer: string; openmontage?: string; models?: { images: ImageModel[]; videos: Exclude<VideoModel, 'none'>[] } }
 const runLabel = (run: AgentRun) => ({ queued: '等待处理', running: run.story?.stopRequested ? '正在停止后续步骤' : run.story ? run.story.phase === 'stitching' ? '正在拼接故事' : `故事制作 · 已保存 ${run.processedAssetIds?.length ?? 0}/${run.story.segments.length} 段` : run.avatarJobId ? '正在制作口播' : run.stage === 'video' ? '正在生成视频' : run.stage === 'image' ? run.imageOperation === 'edit' ? '正在修改图片' : '正在生成图片' : 'Codex 正在回复', completed: '已完成', failed: '失败', cancelled: '已停止', interrupted: '结果待核实' })[run.status]
-const runModel = (run: AgentRun) => run.avatarJobId ? 'OpenMontage · SadTalker' : run.stage === 'video' ? 'MiniMax H3 · 24fps' : run.stage === 'image' ? run.input.imageModel === 'qwen-image-2.1' ? 'Qwen Image 2.1 · BF16' : 'Azure image2 · 1 张' : 'Codex · GPT-5.4'
+const runModel = (run: AgentRun) => run.avatarJobId ? 'OpenMontage · SadTalker' : run.stage === 'video' ? 'MiniMax H3 · 24fps' : run.stage === 'image' ? `${imageModelNames[run.input.imageModel ?? 'azure-image2']} · ${run.input.imageModel === 'qwen-image-2.1' ? 'BF16' : '1 张'}` : 'Codex · GPT-5.4'
 const qualityNames = { low: '低', medium: '中', high: '高' }
 const references = [
   { name: '午后空间', file: '/reference-interior.jpg', prompt: '保留空间结构，营造午后自然光下安静、通透的室内氛围。' },
   { name: '静物与光', file: '/reference-still-life.jpg', prompt: '参考这张图片的构图，创作一幅自然光静物照片，保留细腻材质。' },
 ]
 const creationGuides = {
-  image: { title: '做图片', icon: Images, subject: '画面内容', placeholder: '例如：窗边的一束白色花，清晨自然光', detail: '风格与用途', prefix: '请生成一张图片。' },
+  image: { title: '做图片', icon: Images, subject: '画面内容', placeholder: '例如：窗边的一束白色花，清晨自然光', detail: null, prefix: '请生成一张图片。' },
   edit: { title: '修改图片', icon: ImagePlus, subject: '修改要求', placeholder: '例如：把背景换成浅灰色，保留主体', detail: '需要保留的内容', prefix: '请修改我明确指定的原图，另存结果，不覆盖原图。' },
   video: { title: '做短镜头', icon: Film, subject: '镜头内容', placeholder: '例如：雨后的街道，镜头缓慢向前推进', detail: '动作与运镜', prefix: '请制作一个约 5 秒的短镜头，使用我已启用的视频模型；未启用或不可用时先告知，不改用其他服务。' },
   script: { title: '写脚本分镜', icon: FileText, subject: '主题与受众', placeholder: '例如：面向新手的咖啡冲煮介绍', detail: '时长与表达重点', prefix: '请编写脚本和分镜，包含镜号、时长、画面、运镜、旁白及字幕。只输出文字方案，不生成图片、音频或视频。' },
@@ -65,11 +86,21 @@ function Modal({ open, onOpenChange, title, children, className = '' }: { open: 
 }
 
 function RunProgress({ run }: { run: AgentRun }) {
-  const entries = run.progress ?? []
+  const [open, setOpen] = useState(false)
+  const [fetchedEntries, setEntries] = useState<NonNullable<AgentRun['progress']>>([])
+  const entries = run.progress ?? fetchedEntries
+  const [error, setError] = useState('')
+  const [retry, setRetry] = useState(0)
+  useEffect(() => {
+    if (!open || run.progress) return
+    let active = true
+    api<NonNullable<AgentRun['progress']>>(`/agent-runs/${run.id}/progress`).then(result => { if (active) { setEntries(result); setError('') } }).catch(() => { if (active) setError('过程加载失败') })
+    return () => { active = false }
+  }, [open, run.id, run.updatedAt, run.progress, retry])
   const running = run.status === 'running' || run.status === 'queued'
-  return <details className="run-progress">
+  return <details className="run-progress" onToggle={event => setOpen(event.currentTarget.open)}>
     <summary aria-label="处理过程" title="处理过程"><Aperture size={16} /><strong>Codex</strong><span className="progress-state">{running && <LoaderCircle size={13} className="spin" />}{runLabel(run)}</span><ChevronRight size={14} className="progress-chevron" /></summary>
-    {entries.length ? <ol>{entries.map(entry => <li key={entry.id}><div className="progress-heading"><strong>{entry.label}</strong><time dateTime={entry.createdAt}>{time(entry.createdAt)}</time></div>{entry.detail && (entry.id.startsWith('codex:') ? <pre>{entry.detail}</pre> : <p>{entry.detail}</p>)}</li>)}</ol> : <p className="progress-empty">{running ? (run.status === 'queued' ? '等待开始处理' : '等待 Codex 运行事件') : '此运行未记录详细过程'}</p>}
+    {open && (error ? <p role="alert">{error}<IconButton label="重试加载过程" onClick={() => setRetry(value => value + 1)}><RefreshCw size={16} /></IconButton></p> : entries.length ? <ol>{entries.map(entry => <li key={entry.id}><div className="progress-heading"><strong>{entry.label}</strong><time dateTime={entry.createdAt}>{time(entry.createdAt)}</time></div>{entry.detail && (entry.id.startsWith('codex:') ? <pre>{entry.detail}</pre> : <p>{entry.detail}</p>)}</li>)}</ol> : <p className="progress-empty">{running ? (run.status === 'queued' ? '等待开始处理' : '等待 Codex 运行事件') : '此运行未记录详细过程'}</p>)}
   </details>
 }
 
@@ -126,7 +157,7 @@ function ReplyAssets({ ids, assets, select }: { ids: string[]; assets: Asset[]; 
     return asset.mediaType === 'video' ? <div className="video-result" key={id}>
       <video className="generated-video" controls playsInline preload="metadata" poster={assetHasThumbnail(asset) ? imageUrl(asset) : undefined} src={imageUrl(asset, false)} aria-label={asset.name} />
       <div className="video-meta"><span>{asset.model === 'minimax-h3' ? 'MiniMax H3' : asset.name} · {asset.duration?.toFixed(2)} 秒</span><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={18} /></a><ShareAssetButton asset={asset} /></div>
-    </div> : asset.mediaType === 'file' ? <button className="message-file" key={id} onClick={() => select(asset)}><AssetPreview asset={asset} /><span>{asset.name}<small>{fileSize(asset.bytes)}</small></span></button> : <button key={id} onClick={() => select(asset)}><img src={imageUrl(asset)} alt={asset.name} width={asset.width} height={asset.height} /></button>
+    </div> : asset.mediaType === 'file' ? <button className="message-file" key={id} onClick={() => select(asset)}><AssetPreview asset={asset} /><span>{asset.name}<small>{fileSize(asset.bytes)}</small></span></button> : <button key={id} onClick={() => select(asset)}><AssetImage asset={asset} /></button>
   })}</div>
 }
 
@@ -168,7 +199,7 @@ function Viewer({ asset, close, reference }: { asset: Asset | null; close: () =>
   return <Modal open={!!asset} onOpenChange={open => { if (!open) close() }} title={asset?.name ?? '图片'} className="viewer">
     {asset?.mediaType === 'file' ? <div className="file-viewer"><AssetPreview asset={asset} /><p>{asset.mimeType ?? '文件'} · {fileSize(asset.bytes)}</p><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载文件" title="下载文件"><ArrowDownToLine size={19} /></a><ShareAssetButton key={asset.id} asset={asset} /><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div> : asset?.mediaType === 'video' ? <><video className="generated-video" controls playsInline preload="metadata" poster={assetHasThumbnail(asset) ? imageUrl(asset) : undefined} src={imageUrl(asset, false)} aria-label={asset.name} /><div className="viewer-footer"><span>{assetDetails(asset)}</span><div className="actions"><a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载视频" title="下载视频"><ArrowDownToLine size={19} /></a><ShareAssetButton key={asset.id} asset={asset} /><button className="primary" onClick={() => reference(asset)}><Paperclip size={17} />附加到对话</button></div></div></> : asset && <TransformWrapper initialScale={1} minScale={0.5} maxScale={8}>
       {({ zoomIn, zoomOut, resetTransform }) => <>
-        <div className="image-stage"><TransformComponent wrapperClass="zoom-wrapper" contentClass="zoom-content"><img src={imageUrl(asset, false)} alt={asset.name} /></TransformComponent></div>
+        <div className="image-stage"><TransformComponent wrapperClass="zoom-wrapper" contentClass="zoom-content"><AssetImage key={asset.id} asset={asset} thumbnail={false} /></TransformComponent></div>
         <div className="viewer-footer"><span>{asset.width} × {asset.height} · {asset.kind === 'generated' ? `${asset.provider} / ${asset.model}` : '参考图'}</span><div className="actions">
           <IconButton label="放大" onClick={() => zoomIn()}><ZoomIn size={19} /></IconButton><IconButton label="缩小" onClick={() => zoomOut()}><ZoomOut size={19} /></IconButton><IconButton label="重置缩放" onClick={() => resetTransform()}><Maximize size={19} /></IconButton>
           <a className="icon-button" href={`${imageUrl(asset, false)}?download=1`} download target="_blank" rel="noopener noreferrer" aria-label="下载图片" title="下载图片"><ArrowDownToLine size={19} /></a>
@@ -303,10 +334,15 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [view, setView] = useState<'chat' | 'images' | 'tasks'>('chat')
   const [draft, setDraft] = useState('')
-  const [ratio, setRatio] = useState<Ratio>(() => (['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'].includes(localStorage.getItem('studio-ratio') ?? '') ? localStorage.getItem('studio-ratio') : '1:1') as Ratio)
-  const [quality, setQuality] = useState<Quality>(() => (['low', 'medium', 'high'].includes(localStorage.getItem('studio-quality') ?? '') ? localStorage.getItem('studio-quality') : 'low') as Quality)
-  const [imageModel, setImageModel] = useState<ImageModel>(() => localStorage.getItem('studio-image-model') === 'qwen-image-2.1' ? 'qwen-image-2.1' : 'azure-image2')
-  const [videoModel, setVideoModel] = useState<VideoModel>(() => localStorage.getItem('studio-video-model') === 'minimax-h3' ? 'minimax-h3' : 'none')
+  const [ratio, setRatio] = useState<Ratio>(defaultUserSettings.ratio)
+  const [quality, setQuality] = useState<Quality>(defaultUserSettings.quality)
+  const [imageModel, setImageModel] = useState<ImageModel>(defaultUserSettings.imageModel)
+  const [videoModel, setVideoModel] = useState<VideoModel>(defaultUserSettings.videoModel)
+  const [settingsReady, setSettingsReady] = useState(false)
+  const [savingSettings, setSavingSettings] = useState(false)
+  const settingsWrite = useRef(false)
+  const [settingsError, setSettingsError] = useState('')
+  const [settingsLoadAttempt, setSettingsLoadAttempt] = useState(0)
   const [attachments, setAttachments] = useState<Asset[]>([])
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all')
@@ -329,18 +365,35 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [poseOpen, setPoseOpen] = useState(false)
   const [poseDraft, setPoseDraft] = useState<PoseDraft>({ angles: null, presetId: 'ual1Idle' })
   const [brief, setBrief] = useState('')
+  const [briefExpanded, setBriefExpanded] = useState(false)
   const [briefDetail, setBriefDetail] = useState('')
   const [sourceId, setSourceId] = useState('')
   const [sourceFile, setSourceFile] = useState<File | null>(null)
+  const creationRequest = useRef<{ signature: string; projectId: string; body: AgentInput } | null>(null)
   const [deleting, setDeleting] = useState<Project | null>(null)
-  const [resending, setResending] = useState<{ message: Message; requestId: string; expectedTailId: string } | null>(null)
+  const [resending, setResending] = useState<{ message: Message; text: string; requestId: string; expectedTailId: string } | null>(null)
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+  const historyRequest = useRef<symbol | null>(null)
+  const historyAnchor = useRef<{ height: number; top: number } | null>(null)
+  const latestRequest = useRef(0)
+  const [taskRecords, setTaskRecords] = useState<Pick<Snapshot, 'runs' | 'jobs'> | null>(null)
   const [storageStatus, setStorageStatus] = useState<'checking' | 'ready' | 'offline'>('checking')
   const [health, setHealth] = useState<Health | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const draftInput = useRef<HTMLTextAreaElement>(null)
+  const [expandedDraftProject, setExpandedDraftProject] = useState<string | null>(null)
+  const draftExpanded = !!projectId && expandedDraftProject === projectId
   const conversationScroll = useRef<HTMLDivElement>(null)
   const followConversation = useRef(true)
-  const conversationReady = !initializing && snapshot !== null
+  const conversationReady = !initializing && settingsReady && !savingSettings && snapshot !== null
+  useLayoutEffect(() => {
+    const viewport = conversationScroll.current
+    if (viewport && historyAnchor.current) {
+      viewport.scrollTop = historyAnchor.current.top + viewport.scrollHeight - historyAnchor.current.height
+      historyAnchor.current = null
+    }
+  }, [snapshot])
   useEffect(() => {
     const viewport = conversationScroll.current
     const content = viewport?.firstElementChild
@@ -368,9 +421,9 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   useEffect(() => {
     const input = draftInput.current
     if (!input) return
-    input.style.height = '60px'
-    input.style.height = `${Math.min(input.scrollHeight, 100)}px`
-  }, [draft, view])
+    input.style.height = 'auto'
+    input.style.height = `${Math.min(input.scrollHeight, Number.parseFloat(getComputedStyle(input).maxHeight))}px`
+  }, [draft, view, draftExpanded])
   const submitRequest = useRef<{ projectId: string; body: Submission & { imageModel?: ImageModel; videoModel?: VideoModel; quality?: Quality }; mode?: 'auto' } | null>(null)
   const currentProject = useRef(projectId)
   useEffect(() => { currentProject.current = projectId }, [projectId])
@@ -384,6 +437,10 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     setPoseDraft({ angles: null, presetId: 'ual1Idle' })
     setProjectId(id); setSnapshot(null); setAttachments([]); setDraft(''); setSidebarOpen(false); setView('chat'); setConnected(false)
     setResending(null)
+    latestRequest.current++
+    historyRequest.current = null
+    historyAnchor.current = null
+    setLoadingHistory(false); setHistoryError(''); setTaskRecords(null)
     submitRequest.current = null
   }
 
@@ -427,11 +484,64 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     setProjects(result)
     return result
   }
+  function applySettings(settings: UserSettings) {
+    setRatio(settings.ratio); setQuality(settings.quality); setImageModel(settings.imageModel); setVideoModel(settings.videoModel)
+    submitRequest.current = null
+  }
+  async function saveSettings(changes: Partial<UserSettings>) {
+    if (!settingsReady || settingsWrite.current) return
+    settingsWrite.current = true; setSavingSettings(true); setSettingsError('')
+    try { applySettings(await api<UserSettings>('/settings', json('PATCH', changes))) }
+    catch { setSettingsError('设置保存失败，请重试。') }
+    finally { settingsWrite.current = false; setSavingSettings(false) }
+  }
+  useEffect(() => {
+    let alive = true
+    api<UserSettings>('/settings').then(settings => {
+      if (alive) { applySettings(settings); setSettingsReady(true); setSettingsError('') }
+    }).catch(() => { if (alive) setSettingsError('设置读取失败，请重试。') })
+    return () => { alive = false }
+  }, [settingsLoadAttempt])
+
   async function refresh(id: string) {
+    const sequence = ++latestRequest.current
     const result = await api<Snapshot>(`/projects/${id}`)
-    if (currentProject.current === id) setSnapshot(result)
+    if (currentProject.current === id && sequence === latestRequest.current) setSnapshot(previous => mergeLatest(previous, result))
     await loadProjects()
   }
+  async function loadOlder() {
+    const before = snapshot?.page?.before
+    if (!before || historyRequest.current || busy) return
+    const id = projectId
+    const tailId = snapshot.page?.tailId
+    const request = Symbol()
+    historyRequest.current = request
+    setLoadingHistory(true); setHistoryError('')
+    try {
+      const older = await api<Snapshot>(`/projects/${id}?before=${before}`)
+      if (currentProject.current !== id || historyRequest.current !== request) return
+      if (older.page?.tailId !== tailId) { setHistoryError('对话已更新，请重试加载历史。'); return }
+      followConversation.current = false
+      const viewport = conversationScroll.current
+      if (viewport) historyAnchor.current = { height: viewport.scrollHeight, top: viewport.scrollTop }
+      setSnapshot(previous => {
+        if (!previous || previous.page?.tailId !== tailId) { historyAnchor.current = null; return previous }
+        const ids = new Set(previous.messages.map(message => message.id))
+        const runIds = new Set(previous.runs.map(run => run.id))
+        const jobIds = new Set(previous.jobs.map(job => job.id))
+        return { ...previous, messages: [...older.messages.filter(message => !ids.has(message.id)), ...previous.messages],
+          runs: [...older.runs.filter(run => !runIds.has(run.id)), ...previous.runs], jobs: [...older.jobs.filter(job => !jobIds.has(job.id)), ...previous.jobs],
+          page: { before: older.page?.before ?? null, tailId: previous.page?.tailId ?? null } }
+      })
+    } catch (failure) { if (currentProject.current === id) setHistoryError(failure instanceof Error ? failure.message : '历史加载失败') }
+    finally { if (historyRequest.current === request) { historyRequest.current = null; setLoadingHistory(false) } }
+  }
+  useEffect(() => {
+    if (view !== 'tasks' || !projectId) return
+    let active = true
+    api<Pick<Snapshot, 'runs' | 'jobs'>>(`/projects/${projectId}/tasks`).then(result => { if (active) setTaskRecords(result) }).catch(() => { if (active) setError('任务记录加载失败') })
+    return () => { active = false }
+  }, [view, projectId, snapshot?.project.updatedAt])
   useEffect(() => {
     let alive = true
     api<Project[]>('/projects').then(result => {
@@ -447,18 +557,31 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     if (!projectId) return
     localStorage.setItem('qwen-project', projectId)
     let active = true
-    const sync = () => api<Snapshot>(`/projects/${projectId}`).then(result => { if (active) setSnapshot(result) }).catch(() => { if (active) setConnected(false) })
+    let pending = false
+    let inFlight = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const sync = async () => {
+      if (inFlight) { pending = true; return }
+      inFlight = true
+      const sequence = ++latestRequest.current
+      try {
+        const result = await api<Snapshot>(`/projects/${projectId}`)
+        if (active && sequence === latestRequest.current) setSnapshot(previous => mergeLatest(previous, result))
+      } catch { if (active) setConnected(false) }
+      finally { inFlight = false; if (active && pending) { pending = false; schedule() } }
+    }
+    const schedule = () => { if (!timer) timer = setTimeout(() => { timer = undefined; void sync() }, 200) }
     void sync()
     const stream = new EventSource(`/api/projects/${projectId}/events`)
     stream.addEventListener('expired', () => { stream.close(); window.dispatchEvent(new Event('studio-session-expired')) })
-    stream.addEventListener('connected', () => { setConnected(true); void sync() })
-    stream.addEventListener('changed', () => { void sync() })
+    stream.addEventListener('connected', () => { setConnected(true); schedule() })
+    stream.addEventListener('changed', schedule)
     stream.addEventListener('deleted', () => {
       stream.close()
       void loadProjects().then(result => { if (active) switchProject(result[0]?.id ?? '') })
     })
     stream.onerror = () => setConnected(false)
-    return () => { active = false; stream.close() }
+    return () => { active = false; clearTimeout(timer); stream.close() }
   }, [projectId])
 
   const perform = async (operation: () => Promise<void>) => {
@@ -477,12 +600,25 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     })
   }
   function editDraft(text: string) { setDraft(text); submitRequest.current = null }
+  function handleDraftKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+    event.preventDefault()
+    if (event.repeat) return
+    const input = event.currentTarget
+    if (event.ctrlKey) {
+      if (input.value.length - (input.selectionEnd - input.selectionStart) >= input.maxLength) return
+      input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end')
+      editDraft(input.value)
+    } else input.form?.requestSubmit()
+  }
   function openAvatarConversation() {
     setGuidesOpen(false); setSidebarOpen(false); setView('chat')
     if (!draft.trim()) editDraft('我想制作完整的数字人口播。请先确认文案、主播图片和分段续接安排，再开始生成。')
     requestAnimationFrame(() => draftInput.current?.focus())
   }
   function openGuide(kind: CreationGuide) {
+    creationRequest.current = null
+    setBriefExpanded(false)
     setGuidesOpen(false)
     setSidebarOpen(false); setGuide(kind); setBrief(''); setBriefDetail(''); setSourceId(''); setSourceFile(null); setError('')
   }
@@ -490,14 +626,24 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     event.preventDefault()
     if (!guide || busy || !brief.trim()) return
     const kind = guide
+    const direct = (kind === 'image' || kind === 'edit') && (event.nativeEvent as SubmitEvent).submitter?.getAttribute('name') !== 'draft'
     const selected = creationGuides[kind]
-    const requirement = `${selected.prefix}\n${selected.subject}：${brief.trim()}${briefDetail.trim() ? `\n${selected.detail}：${briefDetail.trim()}` : ''}`
+    const requirement = `${selected.prefix}\n${selected.subject}：${brief.trim()}${selected.detail && briefDetail.trim() ? `\n${selected.detail}：${briefDetail.trim()}` : ''}`
     const nextDraft = [draft.trim(), requirement].filter(Boolean).join('\n\n')
     await perform(async () => {
-      if (nextDraft.length + (kind === 'edit' ? 60 : 0) > 6000) throw new Error('现有草稿与新需求合计超过 6000 字，请先精简草稿。')
+      if (direct && (!settingsReady || savingSettings || !health?.agentConfigured || !health.models?.images.includes(imageModel))) throw new Error('所选图片模型尚未就绪，未提交生成。')
+      const signature = JSON.stringify({ kind, requirement, imageModel, ratio, quality, sourceId, file: sourceFile ? [sourceFile.name, sourceFile.size, sourceFile.lastModified] : null })
+      const finishDirect = async (request: { projectId: string; body: AgentInput }) => {
+        await api<AgentRun>(`/projects/${request.projectId}/chat`, json('POST', request.body))
+        creationRequest.current = null
+        setView('chat'); setGuide(null); setSourceFile(null)
+        await refresh(request.projectId)
+      }
+      if (direct && creationRequest.current?.signature === signature) { await finishDirect(creationRequest.current); return }
+      if ((direct ? requirement : nextDraft).length + (!direct && kind === 'edit' ? 60 : 0) > 6000) throw new Error('需求超过 6000 字，请先精简。')
       let source = kind === 'edit' ? assets.find(asset => asset.id === sourceId && (asset.mediaType ?? 'image') === 'image') : undefined
       if (kind === 'edit' && !source && !sourceFile) throw new Error('请明确选择或上传一张原图。')
-      if (kind === 'edit' && attachments.length >= 10 && !attachments.some(asset => asset.id === source?.id)) throw new Error('最多选择 10 个附件，请先移除一个附件。')
+      if (!direct && kind === 'edit' && attachments.length >= 10 && !attachments.some(asset => asset.id === source?.id)) throw new Error('最多选择 10 个附件，请先移除一个附件。')
       if (sourceFile && (!sourceFile.size || sourceFile.size > 64 * 1024 * 1024)) throw new Error('原图必须为非空文件且不超过 64 MB。')
       let id = projectId
       if (!id) {
@@ -508,6 +654,12 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       }
       if (kind === 'edit' && sourceFile) source = await upload(sourceFile, id)
       if (source && (source.mediaType ?? 'image') !== 'image') throw new Error('请选择有效的 PNG、JPEG 或 WebP 图片。')
+      if (direct) {
+        const body: AgentInput = { requestId: crypto.randomUUID(), text: requirement, assetIds: source ? [source.id] : [], mode: 'image', imageModel, ratio, quality, videoModel: 'none', directImage: source ? { operation: 'edit', sourceAssetId: source.id } : { operation: 'generate' } }
+        creationRequest.current = { signature, projectId: id, body }
+        await finishDirect(creationRequest.current)
+        return
+      }
       if (source) setAttachments(previous => previous.some(asset => asset.id === source.id) ? previous : [...previous, source])
       editDraft(`${nextDraft}${source ? `\n原图附件 ID：${source.id}` : ''}`)
       setView('chat'); setGuide(null); setSourceFile(null)
@@ -610,8 +762,11 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     if (!resending || busy) return
     const selected = resending
     await perform(async () => {
-      await api(`/projects/${selected.message.projectId}/messages/${selected.message.id}/resend`, json('POST', { requestId: selected.requestId, expectedTailId: selected.expectedTailId }))
+      await api(`/projects/${selected.message.projectId}/messages/${selected.message.id}/resend`, json('POST', { requestId: selected.requestId, expectedTailId: selected.expectedTailId, text: selected.text }))
       submitRequest.current = null
+      historyRequest.current = null
+      setLoadingHistory(false)
+      setSnapshot(null)
       setResending(null)
       await refresh(selected.message.projectId)
     })
@@ -635,8 +790,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     await refresh(id)
   })
   const assets = snapshot?.assets ?? []
-  const jobs = snapshot?.jobs ?? []
-  const runs = snapshot?.runs ?? []
+  const jobs = (view === 'tasks' ? taskRecords?.jobs : undefined) ?? snapshot?.jobs ?? []
+  const runs = (view === 'tasks' ? taskRecords?.runs : undefined) ?? snapshot?.runs ?? []
   const activeRuns = runs.filter(run => run.status === 'queued' || run.status === 'running')
   const stopRun = (run: AgentRun) => perform(async () => { await api(`/agent-runs/${run.id}/stop`, { method: 'POST' }); await refresh(run.projectId) })
   const waiting = jobs.filter(job => job.status === 'waiting_service').length + activeRuns.length
@@ -662,19 +817,20 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       <header className="topbar"><IconButton label="项目列表" onClick={() => setSidebarOpen(true)}><PanelLeft size={21} /></IconButton><div className="breadcrumb"><h1 className="project-heading">{projectId ? <button type="button" aria-label="重命名项目" title={title} disabled={busy} onClick={() => { setProjectName(title); setProjectDialog('rename') }}>{title}</button> : 'Codex Studio'}</h1><span role="status" aria-label={connected ? '已同步' : '连接中'} title={connected ? '已同步' : '连接中'} className={`status-dot ${connected ? '' : 'gray'}`} /></div><IconButton label="VM 管理" onClick={() => setVmOpen(true)}><Cpu size={19} /></IconButton><IconButton label="设置" onClick={() => setOptionsOpen(true)}><Settings size={19} /></IconButton></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="关闭提示" onClick={() => setError('')}><X size={16} /></IconButton><IconButton label="重试连接" onClick={() => void perform(async () => { const result = await loadProjects(); if (projectId) await refresh(projectId); else if (result.length) switchProject(result[0].id) })}><RefreshCw size={16} /></IconButton></div>}
       {initializing ? <div className="empty"><LoaderCircle className="spin" /><h2>正在读取工作空间</h2></div> : <div className="workspace-body chat-layout">
-          <section className="conversation"><div className="conversation-scroll" ref={conversationScroll}><div className="conversation-content">
-            {!snapshot?.messages.length ? <div className="welcome"><div className="welcome-heading"><div><p className="welcome-brand">Codex Studio</p><h2>今天，想创作什么？</h2></div><Aperture size={25} aria-hidden="true" /></div><div className="welcome-status"><span className={`status-dot ${health?.agent === 'configured' ? '' : 'gray'}`} />{health?.agent === 'configured' ? 'Codex · GPT-5.4' : 'Codex 尚未连接'}</div>{creationEntries}{!projectId ? <button className="welcome-secondary" onClick={newProject}><Plus size={18} /><span>创建项目</span><ChevronRight size={16} /></button> : <button className="welcome-secondary" onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button>}{sampleSection}</div> : <div className="messages">{snapshot.messages.filter(message => message.role !== 'assistant').map(message => {
+          <section className="conversation"><div className="conversation-scroll" ref={conversationScroll} onScroll={event => { if (event.currentTarget.scrollTop < 80 && !followConversation.current && !historyError) void loadOlder() }}><div className="conversation-content">
+            {snapshot?.page?.before && <div className="history-loader"><IconButton label="加载更早消息" disabled={loadingHistory} onClick={() => void loadOlder()}>{loadingHistory ? <LoaderCircle size={18} className="spin" /> : <ArrowUp size={18} />}</IconButton>{historyError && <p role="alert">{historyError}</p>}</div>}
+            {!snapshot?.messages.length ? <div className="welcome"><div className="welcome-heading"><div><p className="welcome-brand">Codex Studio</p><h2>今天，想创作什么？</h2></div><Aperture size={25} aria-hidden="true" /></div><div className="welcome-status"><span className={`status-dot ${health?.agent === 'configured' ? '' : 'gray'}`} />{health?.agent === 'configured' ? 'Codex · GPT-5.4' : 'Codex 尚未连接'}</div>{creationEntries}{!projectId ? <button className="welcome-secondary" onClick={newProject}><Plus size={18} /><span>创建项目</span><ChevronRight size={16} /></button> : <button className="welcome-secondary" onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button>}{sampleSection}</div> : <div className="messages">{snapshot.messages.filter(message => message.role !== 'assistant' || !runs.some(run => run.assistantId === message.id && snapshot.messages.some(item => item.id === run.messageId))).map(message => {
               const job = jobs.find(item => item.messageId === message.id)
-              const run = runs.find(item => item.messageId === message.id)
-              const reply = run ? snapshot.messages.find(item => item.id === run.assistantId) : undefined
+              const run = runs.find(item => item.messageId === message.id || item.assistantId === message.id)
+              const reply = message.role === 'assistant' ? message : run ? snapshot.messages.find(item => item.id === run.assistantId) : undefined
               return <section className="conversation-turn" key={message.id}>
-                <article className="message user-message" aria-label="你的消息">
+                {message.role !== 'assistant' && <article className="message user-message" aria-label="你的消息">
                   <div className="message-content">
                     <p className="message-text">{message.text}</p>
                     {message.assetIds.length > 0 && <div className="message-images">{message.assetIds.map(id => { const asset = assets.find(item => item.id === id); return asset && <button className={asset.mediaType === 'file' || !assetHasThumbnail(asset) ? 'message-file' : ''} key={id} onClick={() => setSelectedAsset(asset)}><AssetPreview asset={asset} />{(asset.mediaType === 'file' || !assetHasThumbnail(asset)) && <span>{asset.name}<small>{fileSize(asset.bytes)}</small></span>}</button> })}</div>}
-                    <div className="message-actions"><time dateTime={message.createdAt}>{time(message.createdAt)}</time><IconButton label="重新发送此消息" disabled={busy} onClick={() => { setError(''); setResending({ message, requestId: crypto.randomUUID(), expectedTailId: snapshot.messages.at(-1)!.id }) }}><RefreshCw size={15} /></IconButton></div>
+                    <div className="message-actions"><time dateTime={message.createdAt}>{time(message.createdAt)}</time><IconButton label="重新发送此消息" disabled={busy} onClick={() => { setError(''); setResending({ message, text: message.text, requestId: crypto.randomUUID(), expectedTailId: snapshot.page?.tailId ?? snapshot.messages.at(-1)!.id }) }}><RefreshCw size={15} /></IconButton></div>
                   </div>
-                </article>
+                </article>}
                 {run && <article className="message assistant-message" aria-label="Codex 回复">
                   <RunProgress run={run} />
                   {reply && <div className="message-content"><MarkdownReply text={reply.text} /></div>}
@@ -692,10 +848,11 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
           </div></div>
           {activeRuns.some(run => run.stage !== 'codex' && run.status === 'running') && <div className="generation-status" role="status" aria-label={activeRuns.some(run => run.stage === 'video') ? '当前视频任务' : '当前图片任务'}><LoaderCircle size={16} className="spin" aria-hidden="true" /><span>{connected ? runLabel(activeRuns.find(run => run.stage !== 'codex' && run.status === 'running')!) : '连接已断开，正在同步生成状态'}</span></div>}
           {view === 'chat' && !guide && uploadStatus}
-          <form className="composer" onSubmit={event => void submit(event)}>
+          <form className={`composer${draftExpanded ? ' is-expanded' : ''}`} onSubmit={event => void submit(event)}>
+            {settingsError && <p role="alert" className="form-error">{settingsError}</p>}
             {attachments.length > 0 && <div className="attachments">{attachments.map(asset => <div key={asset.id}><button type="button" className="attachment-preview" aria-label={`查看附件 ${asset.name}`} onClick={() => setSelectedAsset(asset)}><AssetPreview asset={asset} /><span>{asset.name}</span></button><IconButton label={`移除附件 ${asset.name}`} disabled={busy} onClick={() => { setAttachments(previous => previous.filter(item => item.id !== asset.id)); submitRequest.current = null }}><X size={13} /></IconButton></div>)}</div>}
-            <div className="composer-input"><textarea ref={draftInput} aria-label="创作需求" placeholder={projectId ? '说说你的想法…' : '先创建一个项目'} value={draft} disabled={!projectId || busy} maxLength={6000} onChange={event => editDraft(event.target.value)} rows={2} /></div>
-            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={20} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={20} /></IconButton><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={18} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={17} />}</button></div></div>
+            <div className="composer-input"><textarea ref={draftInput} aria-label="创作需求" placeholder={projectId ? '说说你的想法…' : '先创建一个项目'} value={draft} disabled={!projectId || busy} maxLength={6000} onFocus={() => setExpandedDraftProject(projectId)} onChange={event => editDraft(event.target.value)} onKeyDown={handleDraftKeyDown} rows={2} /></div>
+            <div className="composer-row"><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={16} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={16} /></IconButton><div className="composer-model" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><span>{qualityNames[quality]}质量</span></div><select className="composer-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={16} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={16} />}</button></div></div>
           </form></section>
         <Modal open={view !== 'chat'} onOpenChange={open => { if (!open) setView('chat') }} title={view === 'images' ? '素材库' : '任务记录'} className="project-panel">
         {uploadStatus}
@@ -708,14 +865,21 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
     <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
     <Modal open={poseOpen} onOpenChange={setPoseOpen} title="姿势生图" className="pose-modal"><Suspense fallback={<p role="status">加载姿势工作台</p>}><PoseStudio assets={assets} value={poseDraft} onChange={setPoseDraft} onPrepare={preparePose} /></Suspense></Modal>
-    <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'}>
+    <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'} className={guide === 'image' ? 'image-create-sheet' : undefined}>
       {guide && <form className="creation-brief" onSubmit={event => void prepareCreation(event)}>
         {uploadStatus}
+        {(guide === 'image' || guide === 'edit') && <div className="creation-image-parameters">
+          {guide === 'image' && <select className="creation-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select>}
+          <div className="creation-model-info" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><small>{qualityNames[quality]}质量</small></div>
+        </div>}
         {guide === 'edit' && <><label>项目原图<select aria-label="项目原图" value={sourceId} disabled={busy} onChange={event => { setSourceId(event.target.value); setSourceFile(null) }}><option value="">选择原图</option>{assets.filter(asset => (asset.mediaType ?? 'image') === 'image').map(asset => <option key={asset.id} value={asset.id}>{asset.name} · {asset.id.slice(0, 8)}</option>)}</select></label><label>上传原图<input key={sourceId} aria-label="上传原图" type="file" accept="image/png,image/jpeg,image/webp" disabled={busy} onChange={event => { setSourceFile(event.target.files?.[0] ?? null); setSourceId('') }} /></label>{sourceFile && <span className="brief-source">{sourceFile.name}</span>}{sourceId && <img className="brief-source-preview" src={`/api/assets/${sourceId}/content?thumbnail=1`} alt="已选原图" />}</>}
-        <label>{creationGuides[guide].subject}<textarea required aria-label={creationGuides[guide].subject} maxLength={1600} rows={3} placeholder={creationGuides[guide].placeholder} value={brief} disabled={busy} onChange={event => setBrief(event.target.value)} /></label>
-        <label>{creationGuides[guide].detail}<textarea aria-label={creationGuides[guide].detail} maxLength={1200} rows={2} value={briefDetail} disabled={busy} onChange={event => setBriefDetail(event.target.value)} /></label>
-        {guide === 'video' && <><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy} onChange={event => { const value = event.target.value as VideoModel; setVideoModel(value); localStorage.setItem('studio-video-model', value); submitRequest.current = null }}><option value="none">不启用</option><option value="minimax-h3" disabled={!health?.models?.videos.includes('minimax-h3')}>MiniMax H3{health?.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label><p className="muted" role="status">MiniMax H3 · {videoModel === 'none' ? '未启用' : health?.models?.videos.includes('minimax-h3') ? '已启用' : '服务未就绪'}</p></>}
-        <button type="submit" className="primary" disabled={busy || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}带入草稿</button>
+        <label className="creation-subject">{creationGuides[guide].subject}<textarea className={guide === 'image' || guide === 'edit' ? `image-brief-input${briefExpanded ? ' is-expanded' : ''}` : undefined} onFocus={() => setBriefExpanded(true)} required aria-label={creationGuides[guide].subject} maxLength={1600} rows={3} placeholder={creationGuides[guide].placeholder} value={brief} disabled={busy} onChange={event => setBrief(event.target.value)} /></label>
+        {creationGuides[guide].detail && <label>{creationGuides[guide].detail}<textarea aria-label={creationGuides[guide].detail ?? undefined} maxLength={1200} rows={2} value={briefDetail} disabled={busy} onChange={event => setBriefDetail(event.target.value)} /></label>}
+        {guide === 'video' && <><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ videoModel: event.target.value as VideoModel })}><option value="none">不启用</option><option value="minimax-h3" disabled={!health?.models?.videos.includes('minimax-h3')}>MiniMax H3{health?.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label><p className="muted" role="status">MiniMax H3 · {videoModel === 'none' ? '未启用' : health?.models?.videos.includes('minimax-h3') ? '已启用' : '服务未就绪'}</p>{settingsError && <p role="alert" className="form-error">{settingsError}</p>}</>}
+        <div className="creation-actions">
+          {(guide === 'image' || guide === 'edit') && <button type="submit" name="direct" className="primary" disabled={busy || !settingsReady || savingSettings || !health?.models?.images.includes(imageModel) || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Images size={17} />}{guide === 'edit' ? '修改图片' : '生成图片'}</button>}
+          <button type="submit" name="draft" className={guide === 'image' || guide === 'edit' ? '' : 'primary'} disabled={busy || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}带入草稿</button>
+        </div>
         {error && <p role="alert" className="form-error">{error}</p>}
       </form>}
     </Modal>
@@ -723,15 +887,17 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     <Modal open={optionsOpen} onOpenChange={setOptionsOpen} title="设置">
       {user && <div className="account-settings"><span>{user.name}</span><small>{user.provider === 'entra' ? 'Microsoft Entra ID' : '本地账号'}</small><button type="button" onClick={() => void perform(async () => { await onLogout?.() })}>退出登录</button></div>}
       {user?.admin && <LocalAccounts />}
-      <div className="creation-options"><label className="ratio-control">默认比例<select aria-label="默认比例" value={ratio} disabled={busy} onChange={event => { setRatio(event.target.value as Ratio); localStorage.setItem('studio-ratio', event.target.value); submitRequest.current = null }}>{(health?.agentConfigured ? ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] : ['1:1', '4:3', '3:4', '16:9']).map(value => <option key={value}>{value}</option>)}</select></label>{health?.agentConfigured && <label className="ratio-control">默认质量<select aria-label="默认质量" value={quality} disabled={busy} onChange={event => { setQuality(event.target.value as Quality); localStorage.setItem('studio-quality', event.target.value); submitRequest.current = null }}>{(['low', 'medium', 'high'] as const).map(value => <option key={value} value={value}>{qualityNames[value]}</option>)}</select></label>}</div>
-      {health?.agentConfigured && <div className="model-options"><label>图片模型<select aria-label="图片模型" value={imageModel} disabled={busy} onChange={event => { const value = event.target.value as ImageModel; setImageModel(value); localStorage.setItem('studio-image-model', value); submitRequest.current = null }}><option value="azure-image2">Azure image2</option><option value="qwen-image-2.1" disabled={!health.models?.images.includes('qwen-image-2.1')}>Qwen Image 2.1{health.models?.images.includes('qwen-image-2.1') ? '' : ' · 未就绪'}</option></select></label><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy} onChange={event => { const value = event.target.value as VideoModel; setVideoModel(value); localStorage.setItem('studio-video-model', value); submitRequest.current = null }}><option value="none">不启用</option><option value="minimax-h3" disabled={!health.models?.videos.includes('minimax-h3')}>MiniMax H3{health.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label></div>}
+      <div className="creation-options"><label className="ratio-control">默认比例<select aria-label="默认比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(health?.agentConfigured ? ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] : ['1:1', '4:3', '3:4', '16:9']).map(value => <option key={value}>{value}</option>)}</select></label>{health?.agentConfigured && <label className="ratio-control">默认质量<select aria-label="默认质量" value={quality} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ quality: event.target.value as Quality })}>{(['low', 'medium', 'high'] as const).map(value => <option key={value} value={value}>{qualityNames[value]}</option>)}</select></label>}</div>
+      {health?.agentConfigured && <div className="model-options"><label>图片模型<select aria-label="图片模型" value={imageModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ imageModel: event.target.value as ImageModel })}>{imageModels.map(model => <option key={model} value={model} disabled={!health.models?.images.includes(model)}>{imageModelNames[model]}{!health.models?.images.includes(model) ? ' · 未就绪' : ''}</option>)}</select></label><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ videoModel: event.target.value as VideoModel })}><option value="none">不启用</option><option value="minimax-h3" disabled={!health.models?.videos.includes('minimax-h3')}>MiniMax H3{health.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label></div>}
+      {savingSettings && <p role="status">正在保存设置</p>}
+      {settingsError && <div role="alert" className="form-error">{settingsError}<IconButton label="重新读取设置" disabled={savingSettings} onClick={() => { setSettingsReady(false); setSettingsLoadAttempt(attempt => attempt + 1) }}><RefreshCw size={18} /></IconButton></div>}
       {snapshot?.threadId && <p className="session-info">会话 {snapshot.threadId.slice(-8)}</p>}
     </Modal>
     <Modal open={!!resending} onOpenChange={open => { if (!open && !busy) setResending(null) }} title="重新发送这条消息？">
-      <div className="resend-confirmation"><blockquote>{resending?.message.text}</blockquote><p>此消息之后的对话和任务记录将被清除，无法撤销。图片仍保留在素材库。</p>{health?.agentConfigured && <p>将重新调用模型，可能再次计费。</p>}<div className="actions"><button type="button" disabled={busy} onClick={() => setResending(null)}>取消</button><button type="button" className="primary" disabled={busy} onClick={() => void resend()}>{busy ? <LoaderCircle size={17} className="spin" /> : <RefreshCw size={17} />}清理并重新发送</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div>
+      <div className="resend-confirmation"><label>消息内容<textarea aria-label="编辑重发消息" rows={3} maxLength={6000} disabled={busy} value={resending?.text ?? ''} onChange={event => { const text = event.target.value; setResending(previous => previous ? { ...previous, text, requestId: crypto.randomUUID() } : null) }} /></label><p>此消息之后的对话和任务记录将被清除，无法撤销。图片仍保留在素材库。</p>{health?.agentConfigured && <p>将重新调用模型，可能再次计费。</p>}<div className="actions"><button type="button" disabled={busy} onClick={() => setResending(null)}>取消</button><button type="button" className="primary" aria-label="清理并重新发送" disabled={busy || !resending?.text.trim()} onClick={() => void resend()}>{busy ? <LoaderCircle size={17} className="spin" /> : <RefreshCw size={17} />}确认重发</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div>
     </Modal>
     <Modal open={!!projectDialog} onOpenChange={open => { if (!open && !busy) setProjectDialog(null) }} title={projectDialog === 'rename' ? '重命名项目' : '新建项目'}><form className="project-form" onSubmit={event => void saveProject(event)}><label htmlFor="project-title">项目名称</label><input id="project-title" autoFocus required maxLength={80} value={projectName} placeholder="为这次创作命名" onChange={event => setProjectName(event.target.value)} /><button className="primary" disabled={busy || !projectName.trim()} type="submit">{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}保存项目</button>{error && <p role="alert" className="form-error">{error}</p>}</form></Modal>
-    <Modal open={servicesOpen} onOpenChange={setServicesOpen} title="服务状态"><div className="service-list"><p>{storageStatus === 'ready' ? <Check size={18} /> : <CirclePause size={18} />}<strong>本地数据</strong><span>{storageStatus === 'ready' ? 'SQLite 已连接' : storageStatus === 'checking' ? '检查中' : '连接失败'}</span></p><p><CirclePause size={18} /><strong>Codex / GPT-5.4</strong><span>{storageStatus === 'ready' && health?.agent === 'configured' ? '容器已配置' : '未连接'}</span></p><p><Cpu size={18} /><strong>OpenMontage</strong><span>{storageStatus === 'ready' && health?.openmontage === 'installed' ? '已安装' : '未连接'}</span></p><p><Images size={18} /><strong>Azure image2</strong><span>{storageStatus === 'ready' && health?.renderer === 'azure_image2' ? '已配置 · 按量计费' : '未连接'}</span></p><p><Cpu size={18} /><strong>ComfyUI / GPU</strong><span>{storageStatus === 'ready' && (health?.models?.images.includes('qwen-image-2.1') || health?.models?.videos.includes('minimax-h3')) ? '已连接 · GPU 计费' : '未就绪'}</span></p></div></Modal>
+    <Modal open={servicesOpen} onOpenChange={setServicesOpen} title="服务状态"><div className="service-list"><p>{storageStatus === 'ready' ? <Check size={18} /> : <CirclePause size={18} />}<strong>本地数据</strong><span>{storageStatus === 'ready' ? 'SQLite 已连接' : storageStatus === 'checking' ? '检查中' : '连接失败'}</span></p><p><CirclePause size={18} /><strong>Codex / GPT-5.4</strong><span>{storageStatus === 'ready' && health?.agent === 'configured' ? '容器已配置' : '未连接'}</span></p><p><Cpu size={18} /><strong>OpenMontage</strong><span>{storageStatus === 'ready' && health?.openmontage === 'installed' ? '已安装' : '未连接'}</span></p><p><Images size={18} /><strong>Azure 图片</strong><span>{storageStatus === 'ready' && health?.renderer === 'azure_image2' ? '已配置 · 按量计费' : '未连接'}</span></p><p><Cpu size={18} /><strong>ComfyUI / GPU</strong><span>{storageStatus === 'ready' && (health?.models?.images.some(model => model.startsWith('qwen-image-')) || health?.models?.videos.includes('minimax-h3')) ? '已连接 · GPU 计费' : '未就绪'}</span></p></div></Modal>
     <Viewer asset={selectedAsset} close={() => setSelectedAsset(null)} reference={attachReference} />
     <Modal open={vmOpen} onOpenChange={setVmOpen} title="VM 管理"><VmPanel /></Modal>
     <Modal open={!!deleting} onOpenChange={open => { if (!open && !busy) setDeleting(null) }} title="删除项目？"><div className="resend-confirmation"><strong>{deleting?.title}</strong><p>将删除项目、对话、任务及素材，无法撤销。运行时检查点、模型会话及备份不在此次清理范围内。</p><div className="actions"><button disabled={busy} onClick={() => setDeleting(null)}>取消</button><button className="primary danger" disabled={busy} onClick={() => void deleteProject()}><Trash2 size={18} />确认删除</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div></Modal>

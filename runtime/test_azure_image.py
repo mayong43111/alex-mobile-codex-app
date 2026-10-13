@@ -119,6 +119,61 @@ class AzureImageTest(unittest.TestCase):
         post.assert_not_called()
 
     @patch("azure_image.requests.post")
+    def test_selected_25_deployment_is_used_for_generation_and_edit(self, post):
+        models = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]
+        self.settings.write_text(json.dumps({"image": {"endpoint": "https://test.invalid", "deployment": "gpt-image-2",
+            "deployments": {model: model + "-deployment" for model in models}}}))
+        post.return_value = self.response
+        for model in models:
+            for operation in ["generate", "edit"]:
+                result = AzureImage("test-token").execute({"prompt": "test", "size": "1024x1024", "imageModel": model,
+                    "operation": operation, **({"sourceImage": self.source} if operation == "edit" else {})})
+                self.assertTrue(result.success)
+                self.assertEqual(result.model, model + "-deployment")
+                self.assertEqual(post.call_args.kwargs["data" if operation == "edit" else "json"]["model"], result.model)
+                self.assertEqual(post.call_args.kwargs["headers"], {"Authorization": "Bearer test-token"})
+
+    @patch("azure_image.requests.post")
+    def test_missing_deployment_or_token_never_falls_back(self, post):
+        result = AzureImage("test-token").execute({"prompt": "test", "size": "1024x1024", "imageModel": "gpt-image-2.5-flare"})
+        self.assertFalse(result.success)
+        self.assertIn("not configured", result.error)
+        result = AzureImage("").execute({"prompt": "test", "size": "1024x1024"})
+        self.assertFalse(result.success)
+        self.assertIn("token unavailable", result.error)
+        post.assert_not_called()
+
+    @patch("azure_image.requests.post")
+    def test_error_details_keep_codes_and_request_ids_without_secrets(self, post):
+        response = Mock(status_code=400, headers={"apim-request-id": "request-123"})
+        response.json.return_value = {"error": {"code": "invalid_request_error", "param": "size",
+            "message": "Unsupported size; private prompt; Bearer test-token", "innererror": {"code": "InvalidSize"},
+            "input": self.source}}
+        post.return_value = response
+        result = AzureImage("test-token").execute({"prompt": "private prompt", "size": "1024x1024", "operation": "edit", "sourceImage": self.source})
+        self.assertFalse(result.success)
+        for expected in ["edit HTTP 400", "invalid_request_error", "param=size", "Unsupported size", "InvalidSize", "request-123", "no automatic retry"]:
+            self.assertIn(expected, result.error)
+        for secret in ["test-token", "private prompt", self.source["png"]]:
+            self.assertNotIn(secret, result.error)
+        post.assert_called_once()
+
+    @patch("azure_image.requests.post")
+    def test_error_details_are_bounded_and_non_json_is_safe(self, post):
+        response = Mock(status_code=502, headers={"x-request-id": "gateway-123"})
+        response.json.side_effect = ValueError("HTML error page")
+        post.return_value = response
+        result = AzureImage("test-token").execute({"prompt": "test", "size": "1024x1024"})
+        self.assertIn("HTTP 502", result.error)
+        self.assertIn("gateway-123", result.error)
+        response.json.side_effect = None
+        response.json.return_value = {"error": {"message": "long error " * 2000, "innererror": {"message": "nested error " * 2000, "innererror": {"message": "deeper error " * 2000}}}}
+        result = AzureImage("test-token").execute({"prompt": "test", "size": "1024x1024"})
+        self.assertLessEqual(len(result.error), 3020)
+        self.assertIn("long error", result.error)
+        self.assertIn("gateway-123", result.error)
+
+    @patch("azure_image.requests.post")
     def test_failed_edit_does_not_retry_or_fall_back(self, post):
         post.return_value = Mock(status_code=400)
         result = AzureImage("test-token").execute({"prompt": "Edit", "size": "1024x1024", "operation": "edit", "sourceImage": self.source})

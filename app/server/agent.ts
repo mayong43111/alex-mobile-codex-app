@@ -1,12 +1,10 @@
 import { readFile } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-import { homedir } from 'node:os'
+import { AzureCliCredential } from '@azure/identity'
 import { createHash, randomUUID } from 'node:crypto'
 import sharp from 'sharp'
 import { z } from 'zod'
 import type { AgentRun, Asset, Message } from '../src/domain.ts'
-import { assetContentType, assetExtension } from '../src/domain.ts'
+import { assetContentType, assetExtension, imageModels, isAzureImageModel } from '../src/domain.ts'
 import { Store, HttpError } from './store.ts'
 import { LocalAssetStorage } from './assets.ts'
 import type { AssetStorage } from './assets.ts'
@@ -30,6 +28,7 @@ const remoteSchema = z.object({
   processedImages: z.array(z.object({ assetId: z.string().uuid(), sourceAssetId: z.string().uuid(), sourceHash: z.string().regex(/^[a-f0-9]{64}$/), hash: z.string().regex(/^[a-f0-9]{64}$/), width: z.number().int().positive().max(40_000_000), height: z.number().int().positive().max(40_000_000), bytes: z.number().int().positive().max(16 * 1024 * 1024), name: z.string().min(1).max(160), png: z.string().max(24 * 1024 * 1024) }).refine(image => image.width * image.height <= 40_000_000)).max(4).optional(),
   progress: z.array(z.object({ id: z.string().max(200), label: z.string().max(120), detail: z.string().optional(), createdAt: z.string().datetime() })).optional(),
   image: z.object({ png: z.string().max(48 * 1024 * 1024), width: z.number(), height: z.number(), model: z.string(), checkpoint: z.string(),
+    imageModel: z.enum(imageModels).optional(),
     provider: z.enum(['azure', 'comfyui']).optional(), operation: z.enum(['generate', 'edit']).optional(), sourceAssetId: z.string().uuid().optional(), sourceHash: z.string().regex(/^[0-9a-f]{64}$/).optional() }).optional(),
   video: videoSchema.optional(),
 })
@@ -64,6 +63,12 @@ export async function managedModelToken(environment: NodeJS.ProcessEnv = process
   return result.access_token
 }
 
+export async function localModelToken(subscription: string, credential: Pick<AzureCliCredential, 'getToken'> = new AzureCliCredential({ subscription })): Promise<string> {
+  const token = await credential.getToken('https://cognitiveservices.azure.com/.default')
+  if (!token?.token || token.expiresOnTimestamp < Date.now() + 420000) throw new Error('Azure CLI model token unavailable or expires too soon')
+  return token.token
+}
+
 export async function loadAgentTransport(file: string): Promise<AgentTransport | undefined> {
   let config: z.infer<typeof configSchema>
   try { config = configSchema.parse(JSON.parse(await readFile(file, 'utf8'))) }
@@ -71,6 +76,7 @@ export async function loadAgentTransport(file: string): Promise<AgentTransport |
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw new Error('Invalid runtime configuration; credential contents omitted')
   }
+  if (process.env.HOSTING_MODE === 'appservice' && config.codex?.auth !== 'entra') throw new Error('Web App requires managed identity model authentication; key and CLI fallback are disabled')
   async function request(path: string, method = 'GET', body?: unknown): Promise<unknown> {
     const response = await fetch(`${config.gateway}${path}`, { method, signal: AbortSignal.timeout(15000),
       headers: { Authorization: `Bearer ${config.token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
@@ -86,20 +92,19 @@ export async function loadAgentTransport(file: string): Promise<AgentTransport |
     },
     async provideSource(runId, source) { await request(`/runs/${runId}/source`, 'PUT', source) },
     async submit(run, threadId, history = [], imageCandidates = [], attachments = [], readableAttachments = [], avatarEnabled = false, projectContext) {
-      let imageToken: string | undefined
       let codexToken: string | undefined
-      if (config.codex?.auth === 'entra') {
-        codexToken = await managedModelToken()
+      let imageToken: string | undefined
+      if (run.input.directImage) {
+        if (isAzureImageModel(run.input.imageModel ?? 'azure-image2')) imageToken = process.env.HOSTING_MODE === 'appservice' ? await managedModelToken() : await localModelToken(config.image.subscription)
+      } else if (config.codex?.auth === 'entra') {
+        codexToken = process.env.HOSTING_MODE === 'appservice' ? await managedModelToken() : await localModelToken(config.image.subscription)
         imageToken = codexToken
-      } else if ((run.input.mode === 'image' || run.input.mode === 'auto') && (run.input.imageModel ?? 'azure-image2') === 'azure-image2') {
-        try {
-          const { stdout } = await promisify(execFile)(`${homedir()}/.local/share/qwen-azure-cli/bin/az`,
-            ['account', 'get-access-token', '--subscription', config.image.subscription, '--resource', 'https://cognitiveservices.azure.com/', '-o', 'json'], { timeout: 30000, maxBuffer: 256 * 1024 })
-          imageToken = z.string().min(1).parse(JSON.parse(stdout).accessToken)
-        } catch { if (run.input.mode === 'image') throw new Error('Azure 登录不可用，请在本机重新登录；未发送图片请求。') }
+      } else if ((run.input.mode === 'image' || run.input.mode === 'auto') && isAzureImageModel(run.input.imageModel ?? 'azure-image2')) {
+        try { imageToken = await localModelToken(config.image.subscription) }
+        catch { if (run.input.mode === 'image') throw new Error('Azure 登录不可用，请在本机重新登录；未发送图片请求。') }
       }
       await request('/runs', 'POST', { id: run.id, projectId: run.projectId, threadId, text: run.input.text,
-        mode: run.input.mode, ratio: run.input.ratio, quality: run.input.quality ?? 'low', imageModel: run.input.imageModel ?? 'azure-image2', videoModel: run.input.videoModel ?? 'none', imageToken, codexToken, attachments, readableAttachments, imageCandidates, avatarEnabled, projectContext, ...(history.length ? { history } : {}) })
+        mode: run.input.mode, ratio: run.input.ratio, quality: run.input.quality ?? 'low', imageModel: run.input.imageModel ?? 'azure-image2', videoModel: run.input.videoModel ?? 'none', imageToken, codexToken, ...(run.input.directImage ? { directImage: run.input.directImage } : {}), attachments, readableAttachments, imageCandidates, avatarEnabled, projectContext, ...(history.length ? { history } : {}) })
     },
     async get(id) { return remoteSchema.parse(await request(`/runs/${id}`)) },
     async stop(id) { await request(`/runs/${id}`, 'DELETE') },
@@ -139,7 +144,8 @@ export class AgentWorker {
     const position = snapshot.messages.findIndex(message => message.id === run.messageId)
     if (position < 0) throw new Error('Run message missing')
     const candidates = new Map<string, ImageCandidate>()
-    for (const message of snapshot.messages.slice(0, position + 1)) {
+    const recent = snapshot.messages.slice(0, position).filter(message => message.text.trim()).slice(-10)
+    for (const message of [...recent, snapshot.messages[position]]) {
       const completed = snapshot.runs.find(candidate => candidate.messageId === message.id && candidate.id !== run.id && candidate.status === 'completed')
       for (const id of [...message.assetIds, ...(completed?.assetId ? [completed.assetId] : [])]) {
         const asset = this.store.asset(id)
@@ -160,7 +166,7 @@ export class AgentWorker {
       this.store.updateAgent(run.id, { status: 'running' })
       if (run.avatarJobId || run.story) return
       try {
-        const threadId = this.store.threadId(run.projectId)
+        const threadId = null
         const snapshot = this.store.snapshot(run.projectId)
         const messages = snapshot.messages
         const notices = (ids: string[]) => ids.map(id => {
@@ -169,22 +175,25 @@ export class AgentWorker {
           return attachmentNotice(asset)
         })
         const attachments = notices(run.input.assetIds ?? [])
-        const previousMessages = messages.slice(0, messages.findIndex(message => message.id === run.messageId))
+        const previousMessages = messages.slice(0, messages.findIndex(message => message.id === run.messageId)).filter(message => message.text.trim()).slice(-10)
         const readableIds = attachments.length ? run.input.assetIds! : [...previousMessages].reverse().find(message => message.role !== 'assistant' && message.assetIds.length)?.assetIds ?? []
-        const readableAttachments: ReadableAttachment[] = this.transport.uploadAttachment ? notices(readableIds).map(notice => ({ ...notice, sha256: this.store.asset(notice.assetId).hash })) : []
+        const readableAttachments: ReadableAttachment[] = !run.input.directImage && this.transport.uploadAttachment ? notices(readableIds).map(notice => ({ ...notice, sha256: this.store.asset(notice.assetId).hash })) : []
         for (const notice of readableAttachments) {
           const asset = this.store.asset(notice.assetId)
           const bytes = await this.assetStorage.read(`${asset.id}.${assetExtension(asset)}`)
           if (bytes.length !== notice.bytes || bytes.length > 64 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== notice.sha256) throw new Error('Invalid attachment bytes')
           await this.transport.uploadAttachment!(run.id, notice, bytes)
         }
-        const history = threadId ? [] : messages.slice(0, messages.findIndex(message => message.id === run.messageId)).map(message => ({ role: message.role ?? 'user', text: message.text, ...(message.assetIds.length ? { attachments: notices(message.assetIds) } : {}) }))
+        const history = previousMessages.map(message => ({ role: message.role ?? 'user', text: message.text }))
+        const recentIds = new Set(previousMessages.map(message => message.id))
         const projectContext: ProjectContext = {
           title: snapshot.project.title,
-          runs: snapshot.runs.filter(item => item.id !== run.id).slice(-8).map(item => ({ id: item.id, status: item.status, reply: (item.story ? `${item.reply}\n${item.story.segments.map((segment, index) => `${index + 1}. ${segment.text}`).join('\n')}` : item.reply).slice(0, 6000), phase: item.story?.phase ?? item.narration?.progress?.phase, stopRequested: item.story?.stopRequested ?? item.narration?.stopRequested, segments: item.narration?.segments, assetIds: [...(item.narration?.scriptAssetId ? [item.narration.scriptAssetId] : []), ...(item.story?.scriptAssetId ? [item.story.scriptAssetId] : []), ...(item.processedAssetIds ?? []), ...(item.assetId ? [item.assetId] : [])] })),
+          runs: snapshot.runs.filter(item => item.id !== run.id && (recentIds.has(item.messageId) || recentIds.has(item.assistantId))).slice(-8).map(item => ({ id: item.id, status: item.status, reply: '', phase: item.story?.phase ?? item.narration?.progress?.phase, stopRequested: item.story?.stopRequested ?? item.narration?.stopRequested, assetIds: [...(item.narration?.scriptAssetId ? [item.narration.scriptAssetId] : []), ...(item.story?.scriptAssetId ? [item.story.scriptAssetId] : []), ...(item.processedAssetIds ?? []), ...(item.assetId ? [item.assetId] : [])] })),
           assets: snapshot.assets.slice(-100).map(attachmentNotice),
         }
-        await this.transport.submit(run, threadId, history, this.imageCandidates(run), attachments, readableAttachments, !!this.avatars, projectContext)
+        const direct = run.input.directImage
+        const candidates = this.imageCandidates(run).filter(candidate => !direct || (direct.operation === 'edit' && candidate.assetId === direct.sourceAssetId))
+        await this.transport.submit(run, threadId, direct ? [] : history, candidates, attachments, readableAttachments, direct ? false : !!this.avatars, direct ? undefined : projectContext)
       }
       catch {
         this.store.updateAgent(run.id, { status: 'interrupted', error: '运行请求未确认，请检查容器及 Azure 登录；可能已计费，未自动重试。' })
@@ -231,11 +240,12 @@ export class AgentWorker {
         if (JSON.stringify(processedAssetIds) !== JSON.stringify(local.processedAssetIds)) local = this.store.updateAgent(id, { processedAssetIds })
       }
       if (remote.needsSource) {
+        if (local.input.directImage && (local.input.directImage.operation !== 'edit' || local.input.directImage.sourceAssetId !== remote.sourceAssetId)) throw new Error('Direct image source mismatch')
         if (remote.status !== 'running' || remote.imageOperation !== 'edit' || local.input.mode === 'chat' || !this.transport.provideSource) throw new Error('Unexpected source request')
         const candidate = this.imageCandidates(local).find(candidate => candidate.assetId === remote.sourceAssetId) ?? (local.processedAssetIds?.includes(remote.sourceAssetId ?? '') ? { assetId: remote.sourceAssetId! } : undefined)
         if (!candidate || (local.sourceAssetId && local.sourceAssetId !== candidate.assetId)) throw new Error('Source outside run candidates')
         const source = this.store.asset(candidate.assetId)
-        const azure = (local.input.imageModel ?? 'azure-image2') === 'azure-image2'
+        const azure = isAzureImageModel(local.input.imageModel ?? 'azure-image2')
         if (azure ? source.bytes >= 50_000_000 : source.bytes > 32 * 1024 * 1024) {
           await this.transport.stop(id)
           this.store.updateAgent(id, { status: 'failed', threadId: remote.threadId, progress, error: azure ? '编辑原图必须小于 50 MB；未调用图片接口，请先让 Codex 缩放或压缩图片。' : 'Qwen 编辑原图不能超过 32 MiB；未调用图片接口，请先让 Codex 缩放或压缩图片。' })
@@ -338,7 +348,7 @@ export class AgentWorker {
   private async saveImage(run: AgentRun, image: NonNullable<RemoteRun['image']>): Promise<Asset> {
     const provider = image.provider ?? 'azure'
     const selected = run.input.imageModel ?? 'azure-image2'
-    if (provider !== (selected === 'azure-image2' ? 'azure' : 'comfyui') || (selected === 'qwen-image-2.1' && image.model !== selected)) throw new Error('Unexpected image provider or model')
+    if (provider !== (isAzureImageModel(selected) ? 'azure' : 'comfyui') || (selected !== 'azure-image2' && (image.imageModel ?? image.model) !== selected)) throw new Error('Unexpected image provider or model')
     if (image.operation === 'edit') {
       if (!image.sourceAssetId || image.sourceAssetId !== run.sourceAssetId) throw new Error('Mismatched edit source')
       const source = this.store.asset(image.sourceAssetId)
@@ -392,7 +402,7 @@ export class AgentWorker {
     return stopped
   }
 
-  resend(projectId: string, messageId: string, request: { requestId: string; expectedTailId: string }) {
+  resend(projectId: string, messageId: string, request: { requestId: string; expectedTailId: string; text?: string }) {
     if (this.activeId && this.store.agentRun(this.activeId).projectId === projectId) throw new HttpError(409, '请先停止当前回复，待运行结束后重新发送。')
     return this.store.resend(projectId, messageId, request, true)
   }

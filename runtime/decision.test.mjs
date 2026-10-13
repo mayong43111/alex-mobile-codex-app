@@ -1,10 +1,39 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseDecision, renderSettings, editOutputSize, imageOutputSize, narrationEditingSkill } from './decision.mjs'
+import { parseDecision, renderSettings, editOutputSize, imageOutputSize, narrationEditingSkill, availableT4Models, t4Models } from './decision.mjs'
 import { ImageSourceRequest, sourceBodyLimit } from './image-source.mjs'
 import Fastify from 'fastify'
 import { createHash, randomUUID } from 'node:crypto'
 import { executeStory } from './story.mjs'
+
+test('T4 readiness requires exact INT8 models, cache and separate Turbo dependencies', () => {
+  const nodes = Object.fromEntries(['TextEncodeQwenImage21', 'QwenImage21Cache', 'VAEDecode', 'SaveImageAdvanced', 'LoadImage', 'EmptyLatentImage', 'KSampler', 'SamplerCustom', 'KSamplerSelect', 'ManualSigmas'].map(name => [name, {}]))
+  for (const [name, field, model] of [
+    ['UNETLoader', 'unet_name', 'qwen_image_2.1_int8_convrot.safetensors'],
+    ['CLIPLoader', 'clip_name', 'qwen3vl_8b_int8_convrot.safetensors'],
+    ['VAELoader', 'vae_name', 'qwen_image_2.1_vae_bf16.safetensors'],
+    ['LoraLoaderModelOnly', 'lora_name', 'qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors'],
+  ]) nodes[name] = { input: { required: { [field]: [[model]] } } }
+  assert.deepEqual(availableT4Models(nodes), t4Models)
+  delete nodes.ManualSigmas
+  assert.deepEqual(availableT4Models(nodes), [t4Models[0]])
+  delete nodes.QwenImage21Cache
+  assert.deepEqual(availableT4Models(nodes), [])
+  for (const imageModel of t4Models) {
+    assert.equal(imageOutputSize({ action: 'image', size: '2048x1152' }, { imageModel, ratio: '1:1' }), '2048x1152')
+    assert.throws(() => imageOutputSize({ action: 'image', size: '1040x1040' }, { imageModel, ratio: '1:1' }), /不支持输出尺寸/)
+  }
+})
+
+test('Azure 2.5 models use Azure dimensions and never GPU rounding', () => {
+  for (const imageModel of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst']) {
+    assert.equal(imageOutputSize({ action: 'image' }, { imageModel, ratio: '16:9' }), '1536x864')
+    assert.equal(imageOutputSize({ action: 'image', size: '2048x1152' }, { imageModel, ratio: '1:1' }), '2048x1152')
+    assert.equal(editOutputSize({ width: 3024, height: 4032 }, imageModel), 'auto')
+    assert.equal(editOutputSize({ width: 960, height: 1280 }, imageModel), '960x1280')
+    assert.throws(() => imageOutputSize({ action: 'image', size: '1920x1080' }, { imageModel, ratio: '1:1' }), /不支持输出尺寸/)
+  }
+})
 
 test('story execution persists each clip, stops at boundaries and never retries a started plan', async context => {
   for (const stopAt of [0, 1, 2, null]) await context.test(`stop ${stopAt}`, async () => {

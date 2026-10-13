@@ -38,7 +38,12 @@ export class VmController implements VmControl {
     this.config = configSchema.parse(config)
     this.stateFile = stateFile
     this.request = request
-    this.gpuFetch = gpuFetch
+    this.gpuFetch = (input, init) => {
+      const base = this.config.comfyUrl.replace(/\/$/, '')
+      const headers = new Headers(init?.headers)
+      if (base === process.env.COMFYUI_T4_URL?.replace(/\/$/, '') && process.env.COMFYUI_T4_TOKEN && (input === `${base}/system_stats` || input === `${base}/queue`)) headers.set('Authorization', `Bearer ${process.env.COMFYUI_T4_TOKEN}`)
+      return gpuFetch(input, { ...init, headers })
+    }
     this.base = `https://management.azure.com/subscriptions/${config.subscription}/resourceGroups/${config.resourceGroup}/providers/Microsoft.Compute/virtualMachines/${config.name}`
   }
 
