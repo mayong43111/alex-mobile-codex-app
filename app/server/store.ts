@@ -232,7 +232,7 @@ export class Store {
         if (input.directImage.operation === 'generate' && assetIds.length) throw new HttpError(400, 'Direct generation does not accept source attachments')
         if (input.directImage.operation === 'edit') {
           const sourceId = input.directImage.sourceAssetId
-          if (assetIds.length !== 1 || assetIds[0] !== sourceId || (this.asset(sourceId).mediaType ?? 'image') !== 'image') throw new HttpError(400, 'Direct edit requires one explicitly selected image')
+          if (!assetIds.length || assetIds[0] !== sourceId || assetIds.some(id => (this.asset(id).mediaType ?? 'image') !== 'image')) throw new HttpError(400, 'Direct edit requires explicitly selected images with the primary source first')
         }
       }
       const pending = this.db.prepare("SELECT COUNT(*) AS count FROM agent_runs WHERE json_extract(data, '$.status') IN ('queued', 'running')").get()!
@@ -316,7 +316,7 @@ export class Store {
       const run = { ...current, ...changes, updatedAt: new Date().toISOString() }
       this.db.prepare('UPDATE agent_runs SET data = ? WHERE id = ?').run(JSON.stringify(run), id)
       if (run.threadId) this.db.prepare('INSERT INTO sessions VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET thread_id = excluded.thread_id').run(run.projectId, run.threadId)
-      if (run.reply) {
+      if (run.reply || run.assetId) {
         const message: Message = { id: run.assistantId, projectId: run.projectId, role: 'assistant', text: run.reply,
           assetIds: [...(run.narration?.scriptAssetId ? [run.narration.scriptAssetId] : []), ...(run.story?.scriptAssetId ? [run.story.scriptAssetId] : []), ...(run.processedAssetIds ?? []), ...(run.assetId ? [run.assetId] : [])], createdAt: run.createdAt }
         this.db.prepare('INSERT INTO messages VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data').run(message.id, message.projectId, JSON.stringify(message))

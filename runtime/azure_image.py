@@ -76,6 +76,10 @@ class AzureImage(BaseTool):
         },
         "additionalProperties": False,
     }
+    input_schema['properties']['sourceImages'] = {
+        'type': 'array', 'minItems': 1, 'maxItems': 10,
+        'items': input_schema['properties']['sourceImage'],
+    }
 
     def execute(self, inputs):
         import jsonschema
@@ -95,7 +99,12 @@ class AzureImage(BaseTool):
             if not deployment:
                 return ToolResult(success=False, error="Selected Azure image deployment is not configured; image API not called")
             operation = inputs.get("operation", "generate")
-            source = inputs.get("sourceImage")
+            sources = inputs.get('sourceImages', [inputs['sourceImage']] if inputs.get('sourceImage') else [])
+            source = sources[0] if sources else None
+            if inputs.get('sourceImage') and inputs['sourceImage'] != source:
+                raise ValueError('Primary source mismatch')
+            if len({item['assetId'] for item in sources}) != len(sources):
+                raise ValueError('Duplicate source images')
             if (operation == "edit") != bool(source):
                 raise ValueError("Editing requires a source image")
             body = {"model": deployment, "prompt": inputs["prompt"],
@@ -103,22 +112,25 @@ class AzureImage(BaseTool):
             headers = {"Authorization": "Bearer " + self.access_token}
             endpoint = settings["endpoint"].rstrip("/") + "/openai/v1/images/"
             if source:
-                original = base64.b64decode(source["png"], validate=True)
-                if len(original) >= 50_000_000 or hashlib.sha256(original).hexdigest() != source["hash"]:
-                    raise ValueError("Invalid source image")
-                with Image.open(io.BytesIO(original)) as original_image:
-                    if original_image.format != "PNG" or original_image.width * original_image.height > 40_000_000:
-                        raise ValueError("Invalid source format or size")
-                    original_image.load()
-                    if original_image.size != (source["width"], source["height"]):
-                        raise ValueError("Invalid source dimensions")
+                files = []
+                for index, reference in enumerate(sources):
+                    original = base64.b64decode(reference['png'], validate=True)
+                    if len(original) >= 50_000_000 or hashlib.sha256(original).hexdigest() != reference['hash']:
+                        raise ValueError('Invalid source image')
+                    with Image.open(io.BytesIO(original)) as original_image:
+                        if original_image.format != 'PNG' or original_image.width * original_image.height > 40_000_000:
+                            raise ValueError('Invalid source format or size')
+                        original_image.load()
+                        if original_image.size != (reference['width'], reference['height']):
+                            raise ValueError('Invalid source dimensions')
+                    files.append(('image[]', (f'source-{index + 1}.png', original, 'image/png')))
                 response = requests.post(endpoint + "edits", headers=headers, data=body,
-                    files={"image": ("source.png", original, "image/png")}, timeout=(15, 240))
+                    files=files if len(files) > 1 else {'image': ('source.png', files[0][1][1], 'image/png')}, timeout=(15, 240))
             else:
                 response = requests.post(endpoint + "generations", headers=headers, json=body, timeout=(15, 240))
             if response.status_code != 200:
                 return ToolResult(success=False, error=response_error(response, operation,
-                    [self.access_token, inputs["prompt"], source["png"] if source else ""]))
+                    [self.access_token, inputs['prompt'], *[reference['png'] for reference in sources]]))
             payload = response.json()
             raw = base64.b64decode(payload["data"][0]["b64_json"], validate=True)
             if len(raw) > 32 * 1024 * 1024:
@@ -148,7 +160,8 @@ def main():
     result = AzureImage(request["accessToken"]).execute({"prompt": request["prompt"], "size": request["size"],
         "imageModel": request.get("imageModel", "azure-image2"),
         "quality": request.get("quality", "low"),
-        "operation": request.get("operation", "generate"), **({"sourceImage": request["sourceImage"]} if request.get("sourceImage") else {})})
+        "operation": request.get("operation", "generate"), **({"sourceImage": request["sourceImage"]} if request.get("sourceImage") else {}),
+        **({'sourceImages': request['sourceImages']} if 'sourceImages' in request else {})})
     if not result.success:
         write_checkpoint(root, run_id, "assets", "failed", {}, error=result.error)
         print(json.dumps({"success": False, "error": result.error}))

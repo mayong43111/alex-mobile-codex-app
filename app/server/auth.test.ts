@@ -92,7 +92,7 @@ test('settings persist per user with Flare defaults and require authentication a
     for (const payload of [{ userId: userIds[1], quality: 'high' }, { imageModel: 'unknown' }, { ratio: 'invalid' }, {}]) {
       assert.equal((await app.inject({ method: 'PATCH', url: '/api/settings', headers: headers[0], payload })).statusCode, 400)
     }
-    const changed = { ...defaults, ratio: '16:9', quality: 'high', imageModel: 'gpt-image-2.5-sunburst' }
+    const changed = { ...defaults, ratio: 'auto', quality: 'high', imageModel: 'gpt-image-2.5-sunburst' }
     assert.deepEqual((await app.inject({ method: 'PATCH', url: '/api/settings', headers: headers[0], payload: changed })).json(), changed)
     assert.deepEqual((await app.inject({ url: '/api/settings', headers: headers[1] })).json(), defaults)
     assert.deepEqual((await app.inject({ method: 'PATCH', url: '/api/settings', headers: headers[0], payload: { videoModel: 'minimax-h3' } })).json(), { ...changed, videoModel: 'minimax-h3' })

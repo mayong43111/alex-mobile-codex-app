@@ -171,13 +171,21 @@ test('direct image API preserves operation, validates source ownership and dedup
     assert.equal((await post(input)).json().id, generated.json().id)
     const edit = { ...input, requestId: randomUUID(), assetIds: [source.id], directImage: { operation: 'edit', sourceAssetId: source.id } }
     assert.equal((await post(edit)).statusCode, 202)
+    const pose = store.addAsset({ ...source, id: randomUUID(), name: 'pose.png' })
+    const product = store.addAsset({ ...source, id: randomUUID(), name: 'product.png' })
+    const multi = await post({ ...edit, requestId: randomUUID(), assetIds: [source.id, pose.id, product.id] })
+    assert.equal(multi.statusCode, 202)
+    assert.deepEqual(multi.json().input.assetIds, [source.id, pose.id, product.id])
     for (const invalid of [
       { ...input, mode: 'auto' }, { ...input, videoModel: 'minimax-h3' },
       { ...input, assetIds: [source.id] }, { ...edit, assetIds: [] },
       { ...edit, assetIds: [other.id], directImage: { operation: 'edit', sourceAssetId: other.id } },
       { ...edit, directImage: { operation: 'edit', sourceAssetId: other.id } },
+      { ...edit, assetIds: [pose.id, source.id] },
+      { ...edit, assetIds: [source.id, other.id] },
+      { ...edit, assetIds: [source.id, source.id] },
     ]) assert.equal((await post({ ...invalid, requestId: randomUUID() })).statusCode, 400)
-    assert.equal(store.snapshot(project.id).runs.length, 2)
+    assert.equal(store.snapshot(project.id).runs.length, 3)
   } finally { await app.close(); store.db.close(); await rm(dataDir, { recursive: true, force: true }) }
 })
 
@@ -1135,6 +1143,63 @@ test('editing transfers only the Codex-selected retained image and checks lineag
     assert.equal(store.agentRun(retry.id).status, 'interrupted')
     assert.equal(objects.has(`${retry.id}.png`), false)
     assert.equal(store.snapshot(project.id).assets.length, 4)
+  } finally { await worker.close(); store.db.close() }
+})
+
+test('multiple current references transfer sequentially without allowing additional sources', async () => {
+  const store = new Store(':memory:')
+  const { storage, objects } = memoryAssets()
+  const project = store.createProject('Multiple references')
+  const png = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#0088aa' } }).png().toBuffer()
+  const rendered = await sharp(png).modulate({ brightness: 0.7 }).png().toBuffer()
+  const references = Array.from({ length: 4 }, () => store.addAsset({ id: randomUUID(), projectId: project.id, name: 'reference.png', kind: 'reference', width: 64, height: 64, bytes: png.length, hash: createHash('sha256').update(png).digest('hex'), createdAt: new Date().toISOString() }))
+  for (const asset of references) objects.set(`${asset.id}.png`, png)
+  let selected = references.slice(0, 3).map(asset => asset.id)
+  let delivered = 0
+  let current: RemoteRun
+  const deliveries: SourceImage[] = []
+  const worker = new AgentWorker(store, '', {
+    async health() { return {} }, async stop() {}, async get() { return current },
+    async submit(run, _thread, _history, candidates) {
+      assert.deepEqual(candidates?.map(candidate => candidate.assetId), selected)
+      delivered = 0
+      current = { id: run.id, threadId: null, status: 'running', stage: 'image', reply: '', imageOperation: 'edit', sourceAssetId: selected[0], sourceAssetIds: selected, requestedSourceAssetId: selected[0], needsSource: true }
+    },
+    async provideSource(_id, source) {
+      deliveries.push(source); delivered++
+      current = delivered === selected.length
+        ? { ...current, status: 'completed', needsSource: false, image: { png: rendered.toString('base64'), width: 64, height: 64, model: 'test', checkpoint: 'test', operation: 'edit', sourceAssetId: selected[0], sourceHash: store.asset(selected[0]).hash } }
+        : { ...current, requestedSourceAssetId: selected[delivered] }
+    },
+  }, storage)
+  try {
+    const input = { requestId: randomUUID(), text: 'Combine model, pose and product references', mode: 'image' as const, ratio: '1:1' as const, assetIds: selected, directImage: { operation: 'edit' as const, sourceAssetId: selected[0] } }
+    const run = store.queueAgent(project.id, input)
+    for (let tick = 0; tick < 5; tick++) await worker.tick()
+    assert.equal(store.agentRun(run.id).status, 'completed')
+    assert.equal(store.agentRun(run.id).sourceAssetId, selected[0])
+    assert.deepEqual(deliveries.map(source => source.assetId), selected)
+    for (const source of deliveries) assert.deepEqual(Buffer.from(source.png, 'base64'), png)
+    assert.equal(store.asset(run.id).kind, 'generated')
+    assert.equal(store.asset(run.id).sourceAssetId, selected[0])
+    assert.deepEqual(objects.get(`${run.id}.png`), rendered)
+    assert.deepEqual(store.snapshot(project.id).messages.find(message => message.id === run.messageId)?.assetIds, selected)
+    assert.deepEqual(store.snapshot(project.id).messages.find(message => message.id === run.assistantId)?.assetIds, [run.id])
+    for (const reference of references) assert.deepEqual(objects.get(`${reference.id}.png`), png)
+    const invalid = store.queueAgent(project.id, { ...input, requestId: randomUUID() })
+    await worker.tick()
+    current!.requestedSourceAssetId = references[3].id
+    await worker.tick()
+    assert.equal(store.agentRun(invalid.id).status, 'interrupted')
+    assert.equal(deliveries.length, 3)
+    selected = [run.id]
+    const continued = store.queueAgent(project.id, { ...input, requestId: randomUUID(), text: 'Refine the new work', assetIds: selected, directImage: { operation: 'edit', sourceAssetId: run.id } })
+    await worker.tick(); await worker.tick(); await worker.tick()
+    assert.equal(store.agentRun(continued.id).status, 'completed')
+    assert.equal(deliveries[3].assetId, run.id)
+    assert.deepEqual(Buffer.from(deliveries[3].png, 'base64'), rendered)
+    assert.equal(store.asset(continued.id).sourceAssetId, run.id)
+    assert.deepEqual(store.snapshot(project.id).assets.filter(asset => asset.kind === 'generated').map(asset => asset.id), [run.id, continued.id])
   } finally { await worker.close(); store.db.close() }
 })
 

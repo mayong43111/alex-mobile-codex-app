@@ -9,11 +9,12 @@ import './PoseStudio.css'
 export type PoseDraft = { angles: PoseAngles | null; presetId: string; placement?: PosePlacement; rotation?: number }
 const emptyPoseDraft = (): PoseDraft => ({ angles: null, presetId: 'ual1Idle' })
 
-export default function PoseStudio({ assets, value, onChange, onPrepare }: {
+export default function PoseStudio({ assets, value, onChange, onPrepare, referenceOnly = false }: {
   assets: Asset[]
   value: PoseDraft
   onChange: (value: PoseDraft) => void
   onPrepare: (board: File, prompt: string, signal: AbortSignal) => Promise<void>
+  referenceOnly?: boolean
 }) {
   const host = useRef<HTMLDivElement>(null)
   const scene = useRef<PoseScene | null>(null)
@@ -88,11 +89,18 @@ export default function PoseStudio({ assets, value, onChange, onPrepare }: {
     change({ presetId: '', angles: mirrored, placement, rotation: rotation ? -rotation : 0 })
   }
   async function prepare() {
-    if (!ready || busy || (!file && !sourceId)) return
+    if (!ready || busy || (!referenceOnly && !file && !sourceId)) return
     const abort = new AbortController()
     controller.current = abort
     setBusy(true); setError('')
     try {
+      if (referenceOnly) {
+        const canvas = scene.current!.capture()
+        const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('无法导出姿势参考图')), 'image/png'))
+        abort.signal.throwIfAborted()
+        await onPrepare(new File([blob], 'pose-reference.png', { type: 'image/png' }), '', abort.signal)
+        return
+      }
       let person: Blob
       if (file) person = file
       else {
@@ -139,6 +147,7 @@ export default function PoseStudio({ assets, value, onChange, onPrepare }: {
     </div>
     </section>
     <div className="pose-fields" hidden={fullscreen}>
+      {!referenceOnly && <>
       <h3>生成参考</h3>
       <div className="pose-source">
         <label>人物参考图<select aria-label="人物参考图" disabled={busy} value={sourceId} onChange={event => { setSourceId(event.target.value); setFile(null); setPreview(''); setError('') }}><option value="">{file ? file.name : '选择项目图片'}</option>{images.map(asset => <option key={asset.id} value={asset.id}>{asset.name}</option>)}</select></label>
@@ -153,8 +162,9 @@ export default function PoseStudio({ assets, value, onChange, onPrepare }: {
       </div>
       {(preview || sourceId) && <img className="pose-person" alt="已选人物参考图" src={preview || `/api/assets/${sourceId}/content?thumbnail=1`} />}
       <label>场景与风格<textarea rows={2} maxLength={2000} placeholder="例如：街头摄影，自然光，保留人物服装" value={prompt} disabled={busy} onChange={event => setPrompt(event.target.value)} /></label>
+      </>}
       {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="pose-submit"><button type="button" className="primary" disabled={!ready || busy || (!file && !sourceId)} onClick={() => void prepare()}>{busy ? <LoaderCircle size={18} className="spin" /> : <ArrowRight size={18} />}{busy ? '正在准备参考板' : '带入生成草稿'}</button>{busy && <button type="button" className="icon-button" title="取消准备" aria-label="取消准备" onClick={() => controller.current?.abort()}><X size={20} /></button>}</div>
+      <div className="pose-submit"><button type="button" className="primary" disabled={!ready || busy || (!referenceOnly && !file && !sourceId)} onClick={() => void prepare()}>{busy ? <LoaderCircle size={18} className="spin" /> : <ArrowRight size={18} />}{busy ? '正在准备参考板' : referenceOnly ? '使用此姿势' : '带入生成草稿'}</button>{busy && <button type="button" className="icon-button" title="取消准备" aria-label="取消准备" onClick={() => controller.current?.abort()}><X size={20} /></button>}</div>
     </div>
   </div>
 }

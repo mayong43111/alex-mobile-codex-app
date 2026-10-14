@@ -81,6 +81,7 @@ test('image management clears conversation text while preserving works and delet
 })
 
 test('historical references can be searched and reused in image forms and chat across projects', async ({ page, request }, testInfo) => {
+  test.setTimeout(60000)
   const original = await (await request.post('/api/projects', { data: { title: '历史参考来源' } })).json()
   const target = await (await request.post('/api/projects', { data: { title: '参考图新作品' } })).json()
   const name = `history-${randomUUID()}.png`
@@ -105,6 +106,25 @@ test('historical references can be searched and reused in image forms and chat a
   await library.getByLabel('搜索参考图').fill(name)
   await library.getByLabel('参考图来源项目').selectOption(target.id)
   await expect(library.getByText('没有匹配的参考图')).toBeVisible()
+  const mobileViewport = page.viewportSize()!
+  for (const viewport of [mobileViewport, { width: 700, height: 607 }]) {
+    await page.setViewportSize(viewport)
+    const panel = (await library.boundingBox())!
+    expect(panel.x).toBe(0)
+    expect(panel.y).toBe(0)
+    expect(panel.width).toBe(viewport.width)
+    expect(Math.abs(panel.height - viewport.height)).toBeLessThan(2)
+    const search = (await library.locator('.search').boundingBox())!
+    const filter = (await library.getByLabel('参考图来源项目').boundingBox())!
+    const refresh = (await library.getByRole('button', { name: '刷新参考图库' }).boundingBox())!
+    expect(filter.y).toBeGreaterThanOrEqual(search.y + search.height)
+    expect(filter.y).toBe(refresh.y)
+    expect(filter.x + filter.width).toBeLessThanOrEqual(refresh.x)
+    expect(refresh.height).toBeGreaterThanOrEqual(44)
+    expect(await library.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false)
+    await page.screenshot({ path: testInfo.outputPath(`reference-empty-${viewport.width}.png`) })
+  }
+  await page.setViewportSize(mobileViewport)
   await library.getByLabel('参考图来源项目').selectOption(original.id)
   const choice = library.getByRole('button', { name: `选用参考图 ${name}`, exact: true })
   await expect(choice.locator('.asset-image-frame')).toHaveAttribute('data-state', 'loaded')
@@ -171,7 +191,10 @@ test('user settings default to Flare, survive reload and isolate accounts', asyn
   await expect(model).toHaveValue('gpt-image-2.5-sunburst')
   await quality.selectOption('high')
   await expect(quality).toHaveValue('high')
+  await page.getByLabel('默认比例', { exact: true }).selectOption('auto')
+  await expect(page.getByLabel('默认比例', { exact: true })).toHaveValue('auto')
   await openSettings()
+  await expect(page.getByLabel('默认比例', { exact: true })).toHaveValue('auto')
   await expect(model).toHaveValue('gpt-image-2.5-sunburst')
   await expect(quality).toHaveValue('high')
   account = 'two'
@@ -190,6 +213,7 @@ test('user settings default to Flare, survive reload and isolate accounts', asyn
 })
 
 test('image forms submit directly with explicit source and reuse failed request IDs', async ({ page, request }, testInfo) => {
+  test.setTimeout(60000)
   const project = await (await request.post('/api/projects', { data: { title: 'Direct image forms' } })).json()
   await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
   let settings = { ...defaultUserSettings }
@@ -207,6 +231,10 @@ test('image forms submit directly with explicit source and reuse failed request 
   await expect(page.getByLabel('创作需求')).toBeEnabled()
   const composer = page.locator('form.composer')
   await expect(composer.getByLabel('当前图片模型')).toContainText('GPT Image 2.5 Flare')
+  await composer.getByLabel('作图比例').selectOption({ label: '由AI决定' })
+  await expect(composer.getByLabel('作图比例')).toHaveValue('auto')
+  expect(await composer.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false)
+  await page.screenshot({ path: testInfo.outputPath('composer-auto-ratio.png') })
   await composer.getByLabel('作图比例').selectOption('3:4')
   await expect(composer.getByLabel('作图比例')).toHaveValue('3:4')
   const composerRestingHeight = (await composer.getByLabel('创作需求').boundingBox())!.height
@@ -284,6 +312,10 @@ test('image forms submit directly with explicit source and reuse failed request 
   const source = snapshot.assets[0]
   await page.getByRole('button', { name: '修改图片', exact: true }).click()
   const editing = page.getByRole('dialog', { name: '修改图片', exact: true })
+  await expect(editing.getByLabel('作图比例')).toHaveValue('16:9')
+  await editing.getByLabel('作图比例').selectOption({ label: '由AI决定' })
+  await expect(editing.getByLabel('作图比例')).toHaveValue('auto')
+  await editing.getByLabel('作图比例').selectOption('16:9')
   await editing.getByLabel('修改要求', { exact: true }).fill('把墙面改为浅灰色')
   await expect(editing.getByRole('button', { name: '修改图片', exact: true })).toBeDisabled()
   await editing.getByLabel('项目原图', { exact: true }).selectOption(source.id)
@@ -298,6 +330,210 @@ test('image forms submit directly with explicit source and reuse failed request 
   await expect.poll(() => submitted.length).toBe(4)
   expect(submitted[3]).toMatchObject({ text: '保留这个聊天草稿', ratio: '16:9', imageModel: 'gpt-image-2.5-flare' })
   expect(submitted[3]).not.toHaveProperty('directImage')
+})
+
+test('model shoot combines three roles, preserves prompt edits and retries the same direct request', async ({ page, request }, testInfo) => {
+  test.setTimeout(90000)
+  const project = await (await request.post('/api/projects', { data: { title: '模特试拍验收' } })).json()
+  const history = await (await request.post('/api/projects', { data: { title: '商品参考来源' } })).json()
+  const photo = await sharp(resolve('public/reference-interior.jpg')).resize(320, 240).png().toBuffer()
+  const pose = await (await request.post(`/api/projects/${project.id}/uploads`, { multipart: { file: { name: 'pose-photo.png', mimeType: 'image/png', buffer: photo } } })).json()
+  const product = await (await request.post(`/api/projects/${history.id}/uploads`, { multipart: { file: { name: `product-${randomUUID()}.png`, mimeType: 'image/png', buffer: photo } } })).json()
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', models: { images: ['gpt-image-2.5-flare', 'qwen-image-2.1'], videos: [] } } }))
+  const submitted: Record<string, unknown>[] = []
+  await page.route('**/api/projects/*/chat', route => {
+    submitted.push(route.request().postDataJSON())
+    return submitted.length === 1 ? route.fulfill({ status: 503, json: { error: '试拍提交暂时失败' } }) : route.fulfill({ status: 202, json: { id: randomUUID() } })
+  })
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  await page.goto('/')
+  await page.getByRole('button', { name: '模特试拍', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '模特试拍', exact: true })
+  await expect(dialog.getByRole('button', { name: '合并参考图', exact: true })).toBeDisabled()
+  await dialog.getByLabel('模特参考图文件', { exact: true }).setInputFiles({ name: 'model-photo.png', mimeType: 'image/png', buffer: photo })
+  await expect(dialog.getByRole('img', { name: '已选模特参考图' })).toBeVisible()
+  await dialog.getByLabel('选择姿势参考图', { exact: true }).selectOption(pose.id)
+  await dialog.getByRole('button', { name: '从图库选择商品参考图', exact: true }).click()
+  const library = page.getByRole('dialog', { name: '参考图库', exact: true })
+  await library.getByLabel('搜索参考图').fill(product.name)
+  await library.getByRole('button', { name: `选用参考图 ${product.name}`, exact: true }).click()
+  await expect(library).toHaveCount(0)
+  const snapshot = await (await request.get(`/api/projects/${project.id}`)).json()
+  const model = snapshot.assets.find((asset: { name: string }) => asset.name === 'model-photo.png')
+  const copy = snapshot.assets.find((asset: { sourceAssetId?: string }) => asset.sourceAssetId === product.id)
+  expect(copy.projectId).toBe(project.id)
+  expect(copy.id).not.toBe(product.id)
+  await dialog.getByRole('button', { name: '合并参考图', exact: true }).click()
+  const preview = dialog.getByRole('img', { name: '模特、姿势和商品合并预览' })
+  await expect(preview).toBeVisible()
+  const board = await preview.evaluate(async (element: HTMLImageElement) => {
+    await element.decode()
+    const canvas = document.createElement('canvas'); canvas.width = element.naturalWidth; canvas.height = element.naturalHeight
+    const context = canvas.getContext('2d')!; context.drawImage(element, 0, 0)
+    return canvas.toDataURL('image/png').split(',')[1]
+  })
+  const boardBytes = Buffer.from(board, 'base64')
+  expect(boardBytes.length).toBeGreaterThan(10000)
+  const dimensions = await sharp(boardBytes).metadata()
+  expect([dimensions.width, dimensions.height]).toEqual([2016, 1024])
+  for (const left of [16, 688, 1360]) {
+    const region = await sharp(boardBytes).extract({ left, top: 60, width: 640, height: 944 }).stats()
+    expect(region.channels[0].stdev).toBeGreaterThan(10)
+  }
+  const prompt = dialog.getByLabel('拍摄提示词', { exact: true })
+  await expect(prompt).toHaveValue(/肤色[\s\S]*关节角度[\s\S]*商品外观/)
+  const modelType = dialog.getByLabel('模特类型', { exact: true })
+  const productType = dialog.getByLabel('商品类别', { exact: true })
+  const templates = new Set<string>()
+  for (const [modelValue, modelDetail] of [['portrait', '五官比例'], ['hands', '手指长度'], ['feet', '足弓']]) {
+    await modelType.selectOption(modelValue)
+    for (const [productValue, productDetail] of [['clothes', '领口'], ['shoes', '鞋底'], ['accessories', '镶嵌'], ['stockings', '织纹'], ['props', '功能结构'], ['other', '实际用途']]) {
+      await productType.selectOption(productValue)
+      const generated = await prompt.inputValue()
+      expect(generated).toContain(modelDetail)
+      expect(generated).toContain(productDetail)
+      expect(generated).toContain('也可以是已有模特穿着、佩戴或持有商品的展示图')
+      expect(generated).toContain('将原模特替换为参考图1的模特')
+      expect(generated).toContain('最终姿势以参考图2为准')
+      if (modelValue !== 'portrait') expect(generated).not.toContain('五官比例')
+      if (modelValue === 'hands' && productValue === 'shoes') expect(generated).toContain('不把鞋穿在手上')
+      if (modelValue === 'feet' && productValue === 'stockings') expect(generated).toContain('袜尖、脚跟和踝部贴合')
+      templates.add(generated)
+    }
+  }
+  expect(templates.size).toBe(18)
+  await productType.selectOption('shoes')
+  let edited = `${await prompt.inputValue()}\n补充要求：白色摄影棚，柔和侧光。`
+  await prompt.fill(edited)
+  page.once('dialog', confirmation => confirmation.dismiss())
+  await modelType.selectOption('hands')
+  await expect(modelType).toHaveValue('feet')
+  await expect(prompt).toHaveValue(edited)
+  page.once('dialog', confirmation => confirmation.accept())
+  await modelType.selectOption('hands')
+  await expect(prompt).toHaveValue(/拍摄类型：手模；商品类别：鞋子/)
+  edited = `${await prompt.inputValue()}\n补充要求：白色摄影棚，柔和侧光。`
+  await prompt.fill(edited)
+  await dialog.getByRole('button', { name: '移除姿势参考图', exact: true }).click()
+  await expect(dialog.getByRole('button', { name: '生成新作品' })).toBeDisabled()
+  await dialog.getByLabel('选择姿势参考图', { exact: true }).selectOption(pose.id)
+  await dialog.getByRole('button', { name: '重新合并参考图', exact: true }).click()
+  await expect(prompt).toHaveValue(edited)
+  await dialog.getByLabel('试拍图片比例').selectOption('auto')
+  await dialog.getByLabel('试拍图片比例').selectOption('3:4')
+  await dialog.getByLabel('试拍图片模型').selectOption('qwen-image-2.1')
+  for (const viewport of [page.viewportSize()!, { width: 700, height: 607 }, { width: 1280, height: 900 }]) {
+    await page.setViewportSize(viewport)
+    await dialog.evaluate(element => { element.scrollTop = 0 })
+    const categoryBounds = (await dialog.locator('.shoot-categories').boundingBox())!
+    const headingBounds = (await dialog.locator('.modal-heading').boundingBox())!
+    expect(categoryBounds.y).toBeGreaterThanOrEqual(headingBounds.y + headingBounds.height)
+    expect(await dialog.locator('.shoot-categories').evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+    expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+    const bounds = (await dialog.boundingBox())!
+    expect(bounds.x).toBeGreaterThanOrEqual(0); expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width)
+    await page.screenshot({ path: testInfo.outputPath(`shoot-references-${viewport.width}.png`) })
+    await preview.scrollIntoViewIfNeeded()
+    await page.screenshot({ path: testInfo.outputPath(`shoot-preview-${viewport.width}.png`) })
+    await dialog.getByRole('button', { name: '生成新作品' }).scrollIntoViewIfNeeded()
+    for (const button of await dialog.locator('.shoot-submit button').all()) {
+      const bounds = (await button.boundingBox())!
+      expect(bounds.height).toBeGreaterThanOrEqual(44)
+      expect(bounds.y + bounds.height).toBeLessThanOrEqual(viewport.height + 1)
+    }
+  }
+  expect(submitted).toHaveLength(0)
+  await dialog.getByRole('button', { name: '生成新作品' }).click()
+  await expect(dialog.getByRole('alert')).toContainText('暂时失败')
+  await dialog.getByRole('button', { name: '生成新作品' }).click()
+  await expect(dialog).toHaveCount(0)
+  expect(submitted).toHaveLength(2)
+  expect(submitted[0]).toEqual(submitted[1])
+  expect(submitted[0]).toMatchObject({ text: edited, mode: 'image', ratio: '3:4', imageModel: 'qwen-image-2.1', assetIds: [model.id, pose.id, copy.id], directImage: { operation: 'edit', sourceAssetId: model.id }, videoModel: 'none' })
+  await expect(page.getByLabel('创作需求')).toBeVisible()
+  expect((await (await request.get(`/api/projects/${project.id}`)).json()).assets).toHaveLength(3)
+  expect(errors).toEqual([])
+})
+
+test('model shoot exports an interactive 3D pose without a person and prepares a new-project draft', async ({ page, request }, testInfo) => {
+  test.setTimeout(90000)
+  let hideProjects = true
+  await page.route('**/api/projects', route => hideProjects && route.request().method() === 'GET' ? route.fulfill({ json: [] }) : route.continue())
+  let submissions = 0
+  page.on('request', entry => { if (entry.method() === 'POST' && /\/(chat|messages)$/.test(new URL(entry.url()).pathname)) submissions++ })
+  await page.goto('/')
+  await page.getByRole('button', { name: '模特试拍', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '模特试拍', exact: true })
+  await dialog.getByRole('button', { name: '使用3D人偶姿势' }).click()
+  const poseDialog = page.getByRole('dialog', { name: '试拍姿势', exact: true })
+  await expect(poseDialog.locator('.pose-viewport')).toHaveAttribute('data-ready', 'true', { timeout: 30000 })
+  await expect(poseDialog.getByLabel('人物参考图', { exact: true })).toHaveCount(0)
+  await expect(poseDialog.getByRole('button', { name: '使用此姿势' })).toBeEnabled()
+  const canvas = poseDialog.locator('canvas')
+  const before = await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())
+  await poseDialog.getByLabel('内置姿势').selectOption('ual1Talking')
+  expect(await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())).not.toBe(before)
+  for (const viewport of [page.viewportSize()!, { width: 1280, height: 900 }]) {
+    await page.setViewportSize(viewport)
+    await poseDialog.locator('.pose-viewport').scrollIntoViewIfNeeded()
+    const frame = await canvas.evaluate((element: HTMLCanvasElement) => {
+      const copy = document.createElement('canvas'); copy.width = element.width; copy.height = element.height
+      const context = copy.getContext('2d')!; context.drawImage(element, 0, 0)
+      const pixels = context.getImageData(0, 0, copy.width, copy.height).data
+      let count = 0, left = copy.width, right = 0, top = copy.height, bottom = 0
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        if (Math.max(...pixels.subarray(offset, offset + 3)) - Math.min(...pixels.subarray(offset, offset + 3)) < 25) continue
+        const horizontal = offset / 4 % copy.width, vertical = Math.floor(offset / 4 / copy.width)
+        count++; left = Math.min(left, horizontal); right = Math.max(right, horizontal); top = Math.min(top, vertical); bottom = Math.max(bottom, vertical)
+      }
+      return { count, left, right, top, bottom, width: copy.width, height: copy.height }
+    })
+    expect(frame.count).toBeGreaterThan(500)
+    expect(frame.left).toBeGreaterThan(1); expect(frame.right).toBeLessThan(frame.width - 1)
+    expect(frame.top).toBeGreaterThan(1); expect(frame.bottom).toBeLessThan(frame.height - 1)
+    expect(await poseDialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
+    await page.screenshot({ path: testInfo.outputPath(`shoot-pose-${viewport.width}.png`) })
+  }
+  expect(await page.evaluate(() => localStorage.getItem('qwen-project'))).toBeNull()
+  hideProjects = false
+  await poseDialog.getByRole('button', { name: '使用此姿势' }).click()
+  await expect(poseDialog).toHaveCount(0)
+  const projectId = await page.evaluate(() => localStorage.getItem('qwen-project'))
+  const snapshot = await (await request.get(`/api/projects/${projectId}`)).json()
+  expect(snapshot.project.title).toBe('模特试拍')
+  expect(snapshot.assets).toHaveLength(1)
+  const poseAsset = snapshot.assets[0]
+  const poseBytes = await (await request.get(`/api/assets/${poseAsset.id}/content`)).body()
+  expect(poseBytes.length).toBeGreaterThan(10000)
+  const posePixels = await sharp(poseBytes).removeAlpha().raw().toBuffer()
+  let mannequinPixels = 0, helperPixels = 0
+  for (let offset = 0; offset < posePixels.length; offset += 3) {
+    const [red, green, blue] = posePixels.subarray(offset, offset + 3)
+    if (red > 130 && green > 80 && blue < green - 35) mannequinPixels++
+    if (red < 40 && green > 85 && green < 160 && blue > 60 && blue < 140) helperPixels++
+  }
+  expect(mannequinPixels).toBeGreaterThan(500)
+  expect(helperPixels).toBe(0)
+  await expect(dialog.getByRole('img', { name: '已选姿势参考图' })).toBeVisible()
+  for (const label of ['模特', '商品']) {
+    await dialog.getByLabel(`${label}参考图文件`, { exact: true }).setInputFiles(resolve('public/reference-interior.jpg'))
+    await expect(dialog.getByRole('img', { name: `已选${label}参考图` })).toBeVisible()
+  }
+  await dialog.getByRole('button', { name: '合并参考图', exact: true }).click()
+  await expect(dialog.getByRole('img', { name: '模特、姿势和商品合并预览' })).toBeVisible()
+  await dialog.getByLabel('试拍图片比例').selectOption('9:16')
+  await dialog.getByRole('button', { name: '带入对话' }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByLabel('创作需求')).toHaveValue(/参考图1[\s\S]*参考图2[\s\S]*参考图3/)
+  await expect(page.locator('.composer').getByLabel('作图比例')).toHaveValue('9:16')
+  await expect(page.getByRole('button', { name: /^移除附件 / })).toHaveCount(3)
+  const latest = await (await request.get(`/api/projects/${projectId}`)).json()
+  expect(latest.assets).toHaveLength(3)
+  expect(latest.messages).toHaveLength(0)
+  expect(latest.runs).toHaveLength(0)
+  expect(submissions).toBe(0)
 })
 
 test('pose studio renders the final mannequin, changes poses and fits mobile and desktop', async ({ page, request }, testInfo) => {
@@ -809,7 +1045,7 @@ test('all modal layouts keep headers, fields and actions inside the mobile viewp
   await page.getByRole('button', { name: '服务未接入', exact: true }).click()
   await inspect('services')
   await close()
-  for (const [title, name] of [['做图片', 'image'], ['修改图片', 'edit'], ['做短镜头', 'video'], ['写脚本分镜', 'script']]) {
+  for (const [title, name] of [['做图片', 'image'], ['修改图片', 'edit'], ['模特试拍', 'model-shoot']]) {
     await page.getByRole('button', { name: '创作引导', exact: true }).click()
     await inspect('guides')
     await page.getByRole('dialog').getByRole('button', { name: title, exact: true }).click()
@@ -827,16 +1063,16 @@ test('creation guide creates a project only on confirmation and stays accessible
   await page.getByRole('button', { name: '关闭', exact: true }).click()
   await expect(page.getByLabel('创作需求')).toBeDisabled()
   hideProjects = false
-  await page.getByRole('button', { name: '写脚本分镜', exact: true }).click()
-  await page.getByRole('textbox', { name: '主题与受众' }).fill('第一次创作脚本')
+  await page.getByRole('button', { name: '做图片', exact: true }).click()
+  await page.getByRole('textbox', { name: '画面内容' }).fill('第一次创作图片')
   await page.getByRole('button', { name: '带入草稿' }).click()
-  await expect(page.getByLabel('创作需求')).toHaveValue(/第一次创作脚本/)
+  await expect(page.getByLabel('创作需求')).toHaveValue(/第一次创作图片/)
   const projectId = await page.evaluate(() => localStorage.getItem('qwen-project'))
   const before = await (await request.get(`/api/projects/${projectId}`)).json()
-  expect(before.project.title).toBe('第一次创作脚本')
+  expect(before.project.title).toBe('第一次创作图片')
   expect(before.messages).toHaveLength(0)
   await page.getByRole('button', { name: '提交需求', exact: true }).click()
-  await expect(page.getByRole('article', { name: '你的消息' })).toContainText('只输出文字方案')
+  await expect(page.getByRole('article', { name: '你的消息' })).toContainText('请生成一张图片')
   await page.getByLabel('创作需求').fill('新草稿保持不变')
   await page.getByRole('button', { name: '项目列表', exact: true }).click()
   await expect(page.getByRole('dialog', { name: '项目列表', exact: true }).getByRole('navigation', { name: '创作入口' })).toHaveCount(0)
@@ -867,13 +1103,35 @@ test('creation guide creates a project only on confirmation and stays accessible
 })
 
 test('four creation entries prepare drafts without submitting or changing models', async ({ page, request }, testInfo) => {
+  test.setTimeout(60000)
   const project = await (await request.post('/api/projects', { data: { title: '创作入口' } })).json()
   await page.addInitScript(id => { localStorage.setItem('qwen-project', id); localStorage.setItem('studio-video-model', 'none') }, project.id)
   let submissions = 0
   page.on('request', request => { if (request.method() === 'POST' && /\/(chat|messages)$/.test(new URL(request.url()).pathname)) submissions++ })
   await page.goto('/')
   const entries = page.getByRole('navigation', { name: '创作入口' })
-  await expect(entries.getByRole('button')).toHaveCount(4)
+  const titles = ['做图片', '修改图片', '姿势生图', '模特试拍']
+  await expect(entries.getByRole('button')).toHaveText(titles)
+  await expect(page.getByRole('button', { name: /^(做短镜头|写脚本分镜)$/ })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '姿势生图', exact: true })).toHaveCount(1)
+  await expect(page.getByRole('button', { name: '模特试拍', exact: true })).toHaveCount(1)
+  async function inspectCards() {
+    const boxes = await entries.getByRole('button').evaluateAll(buttons => buttons.map(button => {
+      const bounds = button.getBoundingClientRect()
+      return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }
+    }))
+    expect(boxes).toHaveLength(4)
+    expect(boxes[0].y).toBe(boxes[1].y)
+    expect(boxes[2].y).toBe(boxes[3].y)
+    expect(boxes[2].y).toBeGreaterThanOrEqual(boxes[0].y + boxes[0].height)
+    expect(boxes[2].x).toBe(boxes[0].x)
+    expect(boxes[3].x).toBe(boxes[1].x)
+    for (const box of boxes) {
+      expect(Math.abs(box.width - boxes[0].width)).toBeLessThan(1)
+      expect(box.height).toBeGreaterThanOrEqual(58)
+    }
+  }
+  await inspectCards()
   expect(await page.locator('.conversation-scroll').evaluate(element => {
     const bounds = element.getBoundingClientRect()
     return bounds.left === 0 && bounds.right === innerWidth
@@ -888,18 +1146,38 @@ test('four creation entries prepare drafts without submitting or changing models
   expect(layout.referenceVisible).toBeGreaterThan(24)
   expect(layout.composerFits).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('creation-entries.png') })
+  const viewport = page.viewportSize()!
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await inspectCards()
+  await page.screenshot({ path: testInfo.outputPath('creation-entries-desktop.png') })
+  await page.setViewportSize(viewport)
   await page.getByLabel('创作需求').fill('保留已有草稿')
-  for (const [title, label, text] of [['做图片', '画面内容', '清晨花束'], ['做短镜头', '镜头内容', '雨后街道'], ['写脚本分镜', '主题与受众', '咖啡新手教程']]) {
+  for (const [title, label, text] of [['做图片', '画面内容', '清晨花束']]) {
     await entries.getByRole('button', { name: title, exact: true }).click()
     const dialog = page.getByRole('dialog', { name: title, exact: true })
     await expect(dialog.getByRole('button', { name: '带入草稿' })).toBeDisabled()
     await dialog.getByRole('textbox', { name: label }).fill(text)
-    if (title === '做短镜头') await expect(dialog.getByRole('status')).toHaveText('MiniMax H3 · 未启用')
     await dialog.getByRole('button', { name: '带入草稿' }).click()
     await expect(page.getByLabel('创作需求')).toHaveValue(new RegExp(text))
     await expect(page.getByLabel('创作需求')).toHaveValue(/保留已有草稿/)
   }
-  await expect(page.getByLabel('创作需求')).toHaveValue(/只输出文字方案，不生成图片、音频或视频/)
+  for (const fromGuide of [false, true]) {
+    for (const title of ['姿势生图', '模特试拍']) {
+      if (fromGuide) {
+        await page.locator('.composer-row').getByRole('button', { name: '创作引导', exact: true }).click()
+        await expect(entries.getByRole('button')).toHaveText(titles)
+        await inspectCards()
+        await expect(page.getByRole('button', { name: /^(做短镜头|写脚本分镜)$/ })).toHaveCount(0)
+        await page.screenshot({ path: testInfo.outputPath('creation-guide-entries.png') })
+      }
+      await entries.getByRole('button', { name: title, exact: true }).click()
+      const panel = page.getByRole('dialog', { name: title, exact: true })
+      await expect(panel).toBeVisible()
+      await expect(page.getByRole('dialog', { name: '创作引导', exact: true })).toHaveCount(0)
+      await panel.getByRole('button', { name: '关闭', exact: true }).click()
+      await expect(page.getByLabel('创作需求')).toHaveValue(/保留已有草稿/)
+    }
+  }
   expect(submissions).toBe(0)
   expect(await page.evaluate(() => localStorage.getItem('studio-video-model'))).toBe('none')
   expect((await (await request.get(`/api/projects/${project.id}`)).json()).messages).toHaveLength(0)

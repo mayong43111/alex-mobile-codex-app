@@ -40,8 +40,11 @@ def t4_workflow(model, prompt, ratio, seed, source=None, size=None):
         })
         graph['8'] = {'class_type': 'SamplerCustom', 'inputs': {'model': ['7', 0], 'add_noise': True, 'noise_seed': seed, 'cfg': 1, 'positive': ['5', 0], 'negative': ['5', 1], 'sampler': ['18', 0], 'sigmas': ['19', 0], 'latent_image': ['6', 0]}}
     if source:
-        graph['12'] = {'class_type': 'LoadImage', 'inputs': {'image': source['filename']}}
-        graph['5']['inputs'].update({'vae': ['4', 0], 'images.image_1': ['12', 0]})
+        graph['5']['inputs']['vae'] = ['4', 0]
+        for index, reference in enumerate(source.get('references', [source])):
+            node_id = '12' if index == 0 else str(20 + index)
+            graph[node_id] = {'class_type': 'LoadImage', 'inputs': {'image': reference['filename']}}
+            graph['5']['inputs'][f'images.image_{index + 1}'] = [node_id, 0]
         if (width, height) == (source['width'], source['height']):
             graph['8']['inputs']['latent_image'] = ['5', 2]
             del graph['6']

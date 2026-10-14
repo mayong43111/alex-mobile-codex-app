@@ -4,9 +4,9 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, ImageOff, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film, Pencil } from 'lucide-react'
+import { ArrowDownToLine, ArrowUp, Check, ChevronRight, CirclePause, Copy, Cpu, Folder, ImagePlus, ImageOff, Images, ListTodo, LoaderCircle, Maximize, MessageSquare, PanelLeft, Plus, RefreshCw, Search, Square, X, ZoomIn, ZoomOut, Aperture, Settings, Trash2, Power, RotateCw, Paperclip, FileText, Film, Pencil, Camera } from 'lucide-react'
 import type { AgentRun, Asset, ImageModel, VideoModel, Job, Message, Project, Ratio, Quality, Snapshot, Submission } from './domain'
-import { assetHasThumbnail, defaultUserSettings, imageModels, imageModelNames } from './domain'
+import { assetHasThumbnail, defaultUserSettings, imageModels, imageModelNames, ratios } from './domain'
 import type { AgentInput, UserSettings } from './domain'
 import type { VmStatus, VmAction, VmProfile, VmProfileInput, VmProfiles } from '../server/vm'
 import './MobileApp.css'
@@ -14,8 +14,14 @@ import { authenticatedFetch } from './auth-client'
 import type { SignedInUser } from './auth-client'
 import { ShareAssetButton } from './ShareAssetButton'
 import type { PoseDraft } from './PoseStudio'
+import ModelShoot from './ModelShoot'
+import type { ShootReferences, ShootRole, ShootSubmission } from './ModelShoot'
 
 const PoseStudio = lazy(() => import('./PoseStudio'))
+
+function RatioOptions() {
+  return ratios.map(value => <option key={value} value={value}>{value === 'auto' ? '由AI决定' : value}</option>)
+}
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await authenticatedFetch(`/api${path}`, options)
@@ -64,8 +70,6 @@ const references = [
 const creationGuides = {
   image: { title: '做图片', icon: Images, subject: '画面内容', placeholder: '例如：窗边的一束白色花，清晨自然光', detail: null, prefix: '请生成一张图片。' },
   edit: { title: '修改图片', icon: ImagePlus, subject: '修改要求', placeholder: '例如：把背景换成浅灰色，保留主体', detail: '需要保留的内容', prefix: '请修改我明确指定的原图，另存结果，不覆盖原图。' },
-  video: { title: '做短镜头', icon: Film, subject: '镜头内容', placeholder: '例如：雨后的街道，镜头缓慢向前推进', detail: '动作与运镜', prefix: '请制作一个约 5 秒的短镜头，使用我已启用的视频模型；未启用或不可用时先告知，不改用其他服务。' },
-  script: { title: '写脚本分镜', icon: FileText, subject: '主题与受众', placeholder: '例如：面向新手的咖啡冲煮介绍', detail: '时长与表达重点', prefix: '请编写脚本和分镜，包含镜号、时长、画面、运镜、旁白及字幕。只输出文字方案，不生成图片、音频或视频。' },
 }
 type CreationGuide = keyof typeof creationGuides
 
@@ -112,8 +116,10 @@ function ReferenceLibrary({ projects, select, remove, revision }: { projects: Pr
   }
   return <section className="reference-library" aria-busy={loading || !!selecting}>
     <div className="reference-toolbar"><label className="search"><Search size={16} /><input aria-label="搜索参考图" placeholder="搜索图片名称" value={query} onChange={event => { setQuery(event.target.value); setLimit(48) }} /></label><select aria-label="参考图来源项目" value={project} onChange={event => { setProject(event.target.value); setLimit(48) }}><option value="">全部项目</option>{projects.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select><IconButton label="刷新参考图库" disabled={loading || !!selecting} onClick={() => setRetry(value => value + 1)}><RefreshCw size={18} /></IconButton></div>
+    <div className="reference-results">
     {error && <p className="form-error" role="alert">{error}</p>}
     {loading ? <div className="empty" role="status"><LoaderCircle className="spin" />正在读取参考图</div> : <><p className="reference-count" role="status">{matching.length} 张参考图{selecting ? ' · 正在选用' : ''}</p>{!matching.length ? <div className="empty"><Images size={28} /><h2>{images.length ? '没有匹配的参考图' : '暂无已上传的参考图'}</h2></div> : <div className="asset-grid reference-grid">{matching.slice(0, limit).map(asset => <div className="image-collection-item" key={asset.id}><button type="button" className="asset" aria-label={`选用参考图 ${asset.name}`} disabled={!!selecting} onClick={() => void choose(asset)}><div className="asset-image"><AssetImage asset={asset} /><span className="asset-kind">{selecting === asset.id ? <LoaderCircle size={15} className="spin" /> : <ImagePlus size={15} />}</span></div><strong title={asset.name}>{asset.name}</strong><small>{projects.find(item => item.id === asset.projectId)?.title ?? '历史上传'}</small><small>{assetDetails(asset)}</small></button><IconButton label={`删除参考图 ${asset.name}`} disabled={!!selecting} onClick={() => remove(asset)}><Trash2 size={17} /></IconButton></div>)}</div>}{matching.length > limit && <button type="button" className="reference-more" onClick={() => setLimit(value => value + 48)}>加载更多</button>}</>}
+    </div>
   </section>
 }
 
@@ -397,12 +403,17 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   const [guidesOpen, setGuidesOpen] = useState(false)
   const [poseOpen, setPoseOpen] = useState(false)
   const [poseDraft, setPoseDraft] = useState<PoseDraft>({ angles: null, presetId: 'ual1Idle' })
+  const [shootOpen, setShootOpen] = useState(false)
+  const [shootBusy, setShootBusy] = useState(false)
+  const [shootPoseOpen, setShootPoseOpen] = useState(false)
+  const [shootReferences, setShootReferences] = useState<ShootReferences>({ model: null, pose: null, product: null })
+  const shootRequest = useRef<{ signature: string; projectId: string; body: AgentInput } | null>(null)
   const [brief, setBrief] = useState('')
   const [briefExpanded, setBriefExpanded] = useState(false)
   const [briefDetail, setBriefDetail] = useState('')
   const [sourceId, setSourceId] = useState('')
   const [sourceFile, setSourceFile] = useState<File | null>(null)
-  const [referenceTarget, setReferenceTarget] = useState<'chat' | 'creation' | null>(null)
+  const [referenceTarget, setReferenceTarget] = useState<'chat' | 'creation' | `shoot-${ShootRole}` | null>(null)
   const creationRequest = useRef<{ signature: string; projectId: string; body: AgentInput } | null>(null)
   const [deleting, setDeleting] = useState<Project | null>(null)
   const [deletingAsset, setDeletingAsset] = useState<Asset | null>(null)
@@ -473,6 +484,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     setDeletingAsset(null); setClearingConversation(null)
     setGuidesOpen(false)
     setPoseOpen(false)
+    setShootOpen(false); setShootPoseOpen(false)
+    setShootReferences({ model: null, pose: null, product: null }); shootRequest.current = null
     setPoseDraft({ angles: null, presetId: 'ual1Idle' })
     setProjectId(id); setSnapshot(null); setAttachments([]); setDraft(''); setSidebarOpen(false); setView('chat'); setConnected(false)
     setResending(null)
@@ -711,6 +724,55 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
   function requestDeleteImage(asset: Asset) {
     setError(''); setDeletingAsset(asset)
   }
+  async function ensureShootProject() {
+    if (currentProject.current) return currentProject.current
+    const project = await api<Project>('/projects', json('POST', { title: '模特试拍' }))
+    currentProject.current = project.id; setProjectId(project.id)
+    await loadProjects()
+    return project.id
+  }
+  function changeShootReference(role: ShootRole, asset: Asset | null) {
+    setShootReferences(previous => ({ ...previous, [role]: asset }))
+  }
+  async function uploadShootReference(file: File, signal: AbortSignal) {
+    const id = await ensureShootProject()
+    signal.throwIfAborted()
+    const asset = await upload(file, id, signal)
+    signal.throwIfAborted()
+    if (currentProject.current !== id) throw new Error('项目已切换，请重新选择参考图')
+    if ((asset.mediaType ?? 'image') !== 'image') throw new Error('请选择有效图片')
+    await refresh(id)
+    return asset
+  }
+  async function prepareShootPose(file: File, _detail: string, signal: AbortSignal) {
+    setShootBusy(true)
+    try {
+      changeShootReference('pose', await uploadShootReference(file, signal))
+      setShootPoseOpen(false)
+    } finally { setShootBusy(false) }
+  }
+  async function submitShoot(input: ShootSubmission, draftOnly = false) {
+    if (!settingsReady || savingSettings) throw new Error('设置尚未就绪，请稍后重试')
+    if (!draftOnly && (!health?.agentConfigured || !health.models?.images.includes(input.imageModel))) throw new Error('所选图片模型尚未就绪，未提交生成')
+    const id = await ensureShootProject()
+    const references = input.assetIds.map(assetId => assets.find(asset => asset.id === assetId && asset.projectId === id && (asset.mediaType ?? 'image') === 'image'))
+    if (references.length !== 3 || references.some(asset => !asset) || new Set(input.assetIds).size !== 3) throw new Error('三张参考图已变化，请重新选择并合并')
+    if (draftOnly) {
+      setAttachments(references as Asset[]); editDraft(input.text)
+      setRatio(input.ratio); setImageModel(input.imageModel)
+      setView('chat'); setShootOpen(false)
+      requestAnimationFrame(() => draftInput.current?.focus())
+      return
+    }
+    const signature = JSON.stringify({ ...input, quality, projectId: id })
+    if (shootRequest.current?.signature !== signature) {
+      shootRequest.current = { signature, projectId: id, body: { requestId: crypto.randomUUID(), text: input.text, assetIds: input.assetIds, mode: 'image', ratio: input.ratio, imageModel: input.imageModel, quality, videoModel: 'none', directImage: { operation: 'edit', sourceAssetId: input.assetIds[0] } } }
+    }
+    await api<AgentRun>(`/projects/${id}/chat`, json('POST', shootRequest.current.body))
+    shootRequest.current = null
+    setView('chat'); setShootOpen(false)
+    await refresh(id)
+  }
   async function deleteSelectedImage() {
     if (!deletingAsset || busy) return
     const asset = deletingAsset
@@ -865,7 +927,8 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       }
       const copy = await api<Asset>(`/projects/${id}/references`, json('POST', { assetId: asset.id }))
       await refresh(id)
-      if (target === 'creation') { setSourceId(copy.id); setSourceFile(null) }
+      if (target?.startsWith('shoot-')) changeShootReference(target.slice(6) as ShootRole, copy)
+      else if (target === 'creation') { setSourceId(copy.id); setSourceFile(null) }
       else { attachReference(copy) }
       setReferenceTarget(null)
     } finally { setBusy(false) }
@@ -908,8 +971,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </div>
   </>
   const sampleSection = <section className="reference-section"><div className="section-heading"><h3>参考起点</h3><span>摄影参考 · 非生成结果</span></div><div className="sample-grid">{references.map(sample => <button key={sample.name} className="sample" disabled={busy || attachments.length >= 10} onClick={() => void selectSample(sample)}><img src={sample.file} alt={sample.name} /><span>{sample.name}<Plus size={17} /></span></button>)}</div><small className="source">摄影来源：Unsplash</small></section>
-  const poseEntry = <><button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setPoseOpen(true) }}><Aperture size={18} /><span>姿势生图</span><ChevronRight size={16} /></button><button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setReferenceTarget('chat') }}><ImagePlus size={18} /><span>参考图库</span><ChevronRight size={16} /></button></>
-  const creationEntries = <><nav className="creation-entries" aria-label="创作入口">{(Object.keys(creationGuides) as CreationGuide[]).map(kind => { const entry = creationGuides[kind]; const Icon = entry.icon; return <button type="button" key={kind} disabled={busy} onClick={() => openGuide(kind)}><Icon size={21} /><span>{entry.title}</span><ChevronRight size={15} /></button> })}</nav>{poseEntry}</>
+  const creationEntries = <><nav className="creation-entries" aria-label="创作入口">{(Object.keys(creationGuides) as CreationGuide[]).map(kind => { const entry = creationGuides[kind]; const Icon = entry.icon; return <button type="button" key={kind} disabled={busy} onClick={() => openGuide(kind)}><Icon size={21} /><span>{entry.title}</span><ChevronRight size={15} /></button> })}<button type="button" disabled={busy} onClick={() => { setGuidesOpen(false); setPoseOpen(true) }}><Aperture size={21} /><span>姿势生图</span><ChevronRight size={15} /></button><button type="button" disabled={busy} onClick={() => { setGuidesOpen(false); setShootOpen(true) }}><Camera size={21} /><span>模特试拍</span><ChevronRight size={15} /></button></nav><button type="button" className="welcome-secondary" disabled={busy} onClick={() => { setGuidesOpen(false); setReferenceTarget('chat') }}><ImagePlus size={18} /><span>参考图库</span><ChevronRight size={16} /></button></>
 
   const uploadStatus = uploading && <div className="upload-status" role="status"><LoaderCircle size={16} className="spin" /><span>正在上传 {uploading}</span><IconButton label="取消上传" onClick={() => uploadController.current?.abort()}><X size={18} /></IconButton></div>
 
@@ -954,7 +1016,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
             {settingsError && <p role="alert" className="form-error">{settingsError}</p>}
             {attachments.length > 0 && <div className="attachments">{attachments.map(asset => <div key={asset.id}><button type="button" className="attachment-preview" aria-label={`查看附件 ${asset.name}`} onClick={() => setSelectedAsset(asset)}><AssetPreview asset={asset} /><span>{asset.name}</span></button><IconButton label={`移除附件 ${asset.name}`} disabled={busy} onClick={() => { setAttachments(previous => previous.filter(item => item.id !== asset.id)); submitRequest.current = null }}><X size={13} /></IconButton></div>)}</div>}
             <div className="composer-input"><textarea ref={draftInput} aria-label="创作需求" placeholder={projectId ? '说说你的想法…' : '先创建一个项目'} value={draft} disabled={!projectId || busy} maxLength={6000} onFocus={() => setExpandedDraftProject(projectId)} onChange={event => editDraft(event.target.value)} onKeyDown={handleDraftKeyDown} rows={2} /></div>
-            <div className="composer-row"><IconButton label="历史参考图" disabled={busy || attachments.length >= 10} onClick={() => setReferenceTarget('chat')}><Images size={16} /></IconButton><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={16} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={16} /></IconButton><div className="composer-model" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><span>{qualityNames[quality]}质量</span></div><select className="composer-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={16} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={16} />}</button></div></div>
+            <div className="composer-row"><IconButton label="历史参考图" disabled={busy || attachments.length >= 10} onClick={() => setReferenceTarget('chat')}><Images size={16} /></IconButton><IconButton label="上传文件" disabled={!projectId || busy || attachments.length >= 10} onClick={() => fileInput.current?.click()}><Paperclip size={16} /></IconButton><IconButton label="创作引导" aria-haspopup="dialog" aria-expanded={guidesOpen} disabled={busy} onClick={() => setGuidesOpen(true)}><Aperture size={16} /></IconButton><div className="composer-model" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><span>{qualityNames[quality]}质量</span></div><select className="composer-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}><RatioOptions /></select><div className="composer-submit">{activeRuns.length > 0 && <IconButton label="停止当前回复" disabled={busy || activeRuns[0].narration?.stopRequested || activeRuns[0].story?.stopRequested} onClick={() => void stopRun(activeRuns[0])}><Square size={16} /></IconButton>}<button className="send" type="submit" aria-label="提交需求" title="提交需求" disabled={!projectId || (!draft.trim() && !attachments.length) || busy || !health}>{busy ? <LoaderCircle size={16} className="spin" /> : <ArrowUp size={16} />}</button></div></div>
           </form></section>
         <Modal open={view !== 'chat'} onOpenChange={open => { if (!open) setView('chat') }} title={view === 'images' ? '素材库' : view === 'works' ? '作品集合' : '任务记录'} className={`project-panel${view === 'works' ? ' reference-panel' : ''}`}>
         {uploadStatus}
@@ -968,17 +1030,18 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
     <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
     <Modal open={poseOpen} onOpenChange={setPoseOpen} title="姿势生图" className="pose-modal"><Suspense fallback={<p role="status">加载姿势工作台</p>}><PoseStudio assets={assets} value={poseDraft} onChange={setPoseDraft} onPrepare={preparePose} /></Suspense></Modal>
+    <Modal open={shootOpen} onOpenChange={open => { if (!shootBusy && !busy) setShootOpen(open) }} title="模特试拍" className="model-shoot-panel"><ModelShoot assets={assets} references={shootReferences} onChange={changeShootReference} onUpload={uploadShootReference} onLibrary={role => setReferenceTarget(`shoot-${role}`)} onPose={() => setShootPoseOpen(true)} onGenerate={input => submitShoot(input)} onDraft={input => submitShoot(input, true)} onBusyChange={setShootBusy} initialRatio={ratio} initialModel={imageModel} availableModels={health?.models?.images ?? []} disabled={busy || !settingsReady || savingSettings} /></Modal>
+    <Modal open={shootPoseOpen} onOpenChange={open => { if (!shootBusy) setShootPoseOpen(open) }} title="试拍姿势" className="pose-modal"><Suspense fallback={<p role="status">加载姿势工作台</p>}><PoseStudio assets={assets} value={poseDraft} onChange={setPoseDraft} onPrepare={prepareShootPose} referenceOnly /></Suspense></Modal>
     <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'} className={guide === 'image' ? 'image-create-sheet' : undefined}>
       {guide && <form className="creation-brief" onSubmit={event => void prepareCreation(event)}>
         {uploadStatus}
         {(guide === 'image' || guide === 'edit') && <div className="creation-image-parameters">
-          {guide === 'image' && <select className="creation-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const).map(value => <option key={value}>{value}</option>)}</select>}
+          <select className="creation-ratio" aria-label="作图比例" title="作图比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}><RatioOptions /></select>
           <div className="creation-model-info" aria-label="当前图片模型" title={`${imageModelNames[imageModel]} · ${qualityNames[quality]}质量`}><strong>{imageModelNames[imageModel]}</strong><small>{qualityNames[quality]}质量</small></div>
         </div>}
         {guide === 'edit' && <><label>项目原图<select aria-label="项目原图" value={sourceId} disabled={busy} onChange={event => { setSourceId(event.target.value); setSourceFile(null) }}><option value="">选择原图</option>{assets.filter(asset => (asset.mediaType ?? 'image') === 'image').map(asset => <option key={asset.id} value={asset.id}>{asset.name} · {asset.id.slice(0, 8)}</option>)}</select></label><label>上传原图<input key={sourceId} aria-label="上传原图" type="file" accept="image/png,image/jpeg,image/webp" disabled={busy} onChange={event => { setSourceFile(event.target.files?.[0] ?? null); setSourceId('') }} /></label>{sourceFile && <span className="brief-source">{sourceFile.name}</span>}</>}
         <label className="creation-subject">{creationGuides[guide].subject}<textarea className={guide === 'image' || guide === 'edit' ? `image-brief-input${briefExpanded ? ' is-expanded' : ''}` : undefined} onFocus={() => setBriefExpanded(true)} required aria-label={creationGuides[guide].subject} maxLength={1600} rows={3} placeholder={creationGuides[guide].placeholder} value={brief} disabled={busy} onChange={event => setBrief(event.target.value)} /></label>
         {creationGuides[guide].detail && <label>{creationGuides[guide].detail}<textarea aria-label={creationGuides[guide].detail ?? undefined} maxLength={1200} rows={2} value={briefDetail} disabled={busy} onChange={event => setBriefDetail(event.target.value)} /></label>}
-        {guide === 'video' && <><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ videoModel: event.target.value as VideoModel })}><option value="none">不启用</option><option value="minimax-h3" disabled={!health?.models?.videos.includes('minimax-h3')}>MiniMax H3{health?.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label><p className="muted" role="status">MiniMax H3 · {videoModel === 'none' ? '未启用' : health?.models?.videos.includes('minimax-h3') ? '已启用' : '服务未就绪'}</p>{settingsError && <p role="alert" className="form-error">{settingsError}</p>}</>}
         {(guide === 'image' || guide === 'edit') && <div className="creation-reference"><button type="button" disabled={busy} onClick={() => setReferenceTarget('creation')}><Images size={17} />历史参考图</button>{sourceId && <div className="selected-reference"><img src={`/api/assets/${sourceId}/content?thumbnail=1`} alt="已选参考图" /><span>{assets.find(asset => asset.id === sourceId)?.name}</span><IconButton label="移除参考图" disabled={busy} onClick={() => setSourceId('')}><X size={16} /></IconButton></div>}</div>}
         <div className="creation-actions">
           {(guide === 'image' || guide === 'edit') && <button type="submit" name="direct" className="primary" disabled={busy || !settingsReady || savingSettings || !health?.models?.images.includes(imageModel) || !brief.trim() || (guide === 'edit' && !sourceId && !sourceFile)}>{busy ? <LoaderCircle size={17} className="spin" /> : <Images size={17} />}{guide === 'edit' ? '修改图片' : '生成图片'}</button>}
@@ -991,7 +1054,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     <Modal open={optionsOpen} onOpenChange={setOptionsOpen} title="设置">
       {user && <div className="account-settings"><span>{user.name}</span><small>{user.provider === 'entra' ? 'Microsoft Entra ID' : '本地账号'}</small><button type="button" onClick={() => void perform(async () => { await onLogout?.() })}>退出登录</button></div>}
       {user?.admin && <LocalAccounts />}
-      <div className="creation-options"><label className="ratio-control">默认比例<select aria-label="默认比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}>{(health?.agentConfigured ? ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] : ['1:1', '4:3', '3:4', '16:9']).map(value => <option key={value}>{value}</option>)}</select></label>{health?.agentConfigured && <label className="ratio-control">默认质量<select aria-label="默认质量" value={quality} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ quality: event.target.value as Quality })}>{(['low', 'medium', 'high'] as const).map(value => <option key={value} value={value}>{qualityNames[value]}</option>)}</select></label>}</div>
+      <div className="creation-options"><label className="ratio-control">默认比例<select aria-label="默认比例" value={ratio} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ ratio: event.target.value as Ratio })}><RatioOptions /></select></label>{health?.agentConfigured && <label className="ratio-control">默认质量<select aria-label="默认质量" value={quality} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ quality: event.target.value as Quality })}>{(['low', 'medium', 'high'] as const).map(value => <option key={value} value={value}>{qualityNames[value]}</option>)}</select></label>}</div>
       {health?.agentConfigured && <div className="model-options"><label>图片模型<select aria-label="图片模型" value={imageModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ imageModel: event.target.value as ImageModel })}>{imageModels.map(model => <option key={model} value={model} disabled={!health.models?.images.includes(model)}>{imageModelNames[model]}{!health.models?.images.includes(model) ? ' · 未就绪' : ''}</option>)}</select></label><label>视频模型<select aria-label="视频模型" value={videoModel} disabled={busy || !settingsReady || savingSettings} onChange={event => void saveSettings({ videoModel: event.target.value as VideoModel })}><option value="none">不启用</option><option value="minimax-h3" disabled={!health.models?.videos.includes('minimax-h3')}>MiniMax H3{health.models?.videos.includes('minimax-h3') ? '' : ' · 未就绪'}</option></select></label></div>}
       {savingSettings && <p role="status">正在保存设置</p>}
       {settingsError && <div role="alert" className="form-error">{settingsError}<IconButton label="重新读取设置" disabled={savingSettings} onClick={() => { setSettingsReady(false); setSettingsLoadAttempt(attempt => attempt + 1) }}><RefreshCw size={18} /></IconButton></div>}
@@ -1002,7 +1065,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </Modal>
     <Modal open={!!projectDialog} onOpenChange={open => { if (!open && !busy) setProjectDialog(null) }} title={projectDialog === 'rename' ? '重命名项目' : '新建项目'}><form className="project-form" onSubmit={event => void saveProject(event)}><label htmlFor="project-title">项目名称</label><input id="project-title" autoFocus required maxLength={80} value={projectName} placeholder="为这次创作命名" onChange={event => setProjectName(event.target.value)} /><button className="primary" disabled={busy || !projectName.trim()} type="submit">{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}保存项目</button>{error && <p role="alert" className="form-error">{error}</p>}</form></Modal>
     <Modal open={servicesOpen} onOpenChange={setServicesOpen} title="服务状态"><div className="service-list"><p>{storageStatus === 'ready' ? <Check size={18} /> : <CirclePause size={18} />}<strong>本地数据</strong><span>{storageStatus === 'ready' ? 'SQLite 已连接' : storageStatus === 'checking' ? '检查中' : '连接失败'}</span></p><p><CirclePause size={18} /><strong>Codex / GPT-5.4</strong><span>{storageStatus === 'ready' && health?.agent === 'configured' ? '容器已配置' : '未连接'}</span></p><p><Cpu size={18} /><strong>OpenMontage</strong><span>{storageStatus === 'ready' && health?.openmontage === 'installed' ? '已安装' : '未连接'}</span></p><p><Images size={18} /><strong>Azure 图片</strong><span>{storageStatus === 'ready' && health?.renderer === 'azure_image2' ? '已配置 · 按量计费' : '未连接'}</span></p><p><Cpu size={18} /><strong>ComfyUI / GPU</strong><span>{storageStatus === 'ready' && (health?.models?.images.some(model => model.startsWith('qwen-image-')) || health?.models?.videos.includes('minimax-h3')) ? '已连接 · GPU 计费' : '未就绪'}</span></p></div></Modal>
-    <Modal open={referenceTarget !== null} onOpenChange={open => { if (!open && !busy) setReferenceTarget(null) }} title="参考图库" className="project-panel reference-panel"><ReferenceLibrary projects={projects} select={chooseHistoricalReference} remove={requestDeleteImage} revision={referenceRevision} /></Modal>
+    <Modal open={referenceTarget !== null} onOpenChange={open => { if (!open && !busy) setReferenceTarget(null) }} title="参考图库" className="project-panel reference-panel reference-library-panel"><ReferenceLibrary projects={projects} select={chooseHistoricalReference} remove={requestDeleteImage} revision={referenceRevision} /></Modal>
     <Viewer asset={selectedAsset} close={() => setSelectedAsset(null)} reference={attachReference} remove={requestDeleteImage} deletingDisabled={busy || activeRuns.length > 0} />
     <Modal open={vmOpen} onOpenChange={setVmOpen} title="VM 管理"><VmPanel /></Modal>
     <Modal open={!!clearingConversation} onOpenChange={open => { if (!open && !busy) setClearingConversation(null) }} title="清空会话？"><div className="resend-confirmation"><strong>{clearingConversation?.title}</strong><p>将清空当前项目的全部历史消息及任务文字记录，无法撤销。已生成的图片、参考图和其他素材保留，作品集合不受影响。</p><div className="actions"><button type="button" disabled={busy} onClick={() => setClearingConversation(null)}>取消</button><button type="button" className="primary danger" disabled={busy} onClick={() => void clearConversation()}><Trash2 size={18} />确认清空</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div></Modal>

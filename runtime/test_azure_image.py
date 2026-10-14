@@ -102,6 +102,29 @@ class AzureImageTest(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["data"]["n"], 1)
 
     @patch("azure_image.requests.post")
+    def test_multiple_references_upload_all_originals_in_order(self, post):
+        post.return_value = self.response
+        second_buffer = io.BytesIO()
+        Image.new('RGB', (960, 1280), 'red').save(second_buffer, format='PNG')
+        second_bytes = second_buffer.getvalue()
+        second = {'assetId': 'second-image', 'png': base64.b64encode(second_bytes).decode(),
+            'hash': hashlib.sha256(second_bytes).hexdigest(), 'width': 960, 'height': 1280}
+        request = {'prompt': 'combine references', 'size': '1024x1024', 'operation': 'edit', 'sourceImage': self.source, 'sourceImages': [self.source, second]}
+        result = AzureImage('test-token').execute(request)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(post.call_args.kwargs['files'], [
+            ('image[]', ('source-1.png', self.original, 'image/png')),
+            ('image[]', ('source-2.png', second_bytes, 'image/png')),
+        ])
+        self.assertEqual(result.data['sourceAssetId'], self.source['assetId'])
+        post.assert_called_once()
+        post.reset_mock()
+        for invalid in [{**second, 'hash': '0' * 64}, {**second, 'width': 32}]:
+            result = AzureImage('test-token').execute({**request, 'sourceImages': [self.source, invalid]})
+            self.assertFalse(result.success)
+        post.assert_not_called()
+
+    @patch("azure_image.requests.post")
     def test_generation_still_uses_json_without_reference(self, post):
         post.return_value = self.response
         result = AzureImage("test-token").execute({"prompt": "White mug", "size": "1024x1024"})

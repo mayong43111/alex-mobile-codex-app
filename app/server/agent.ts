@@ -22,6 +22,8 @@ const remoteSchema = z.object({
   stage: z.enum(['codex', 'image', 'video']), reply: z.string().max(20000), error: z.string().optional(),
   imageOperation: z.enum(['generate', 'edit']).optional(),
   sourceAssetId: z.string().uuid().optional(), needsSource: z.boolean().optional(),
+  requestedSourceAssetId: z.string().uuid().optional(),
+  sourceAssetIds: z.array(z.string().uuid()).min(1).max(10).refine(ids => new Set(ids).size === ids.length).optional(),
   avatarPlan: narrationPlanSchema.optional(),
   story: z.object({ title: z.string().min(1).max(80), segments: z.array(z.object({ text: z.string().min(1).max(300), prompt: z.string().min(1).max(6000) })).min(2).max(12), clipIds: z.array(z.string().uuid()).min(2).max(12), phase: z.enum(['script', 'rendering', 'stitching', 'completed', 'stopped']), segment: z.number().int().min(0).max(12), stopRequested: z.boolean() }).optional(),
   processedVideos: z.array(videoSchema.extend({ assetId: z.string().uuid(), duration: z.number().positive().max(15) })).max(12).optional(),
@@ -94,7 +96,7 @@ export async function loadAgentTransport(file: string): Promise<AgentTransport |
     async submit(run, threadId, history = [], imageCandidates = [], attachments = [], readableAttachments = [], avatarEnabled = false, projectContext) {
       let codexToken: string | undefined
       let imageToken: string | undefined
-      if (run.input.directImage) {
+      if (run.input.directImage && run.input.ratio !== 'auto') {
         if (isAzureImageModel(run.input.imageModel ?? 'azure-image2')) imageToken = process.env.HOSTING_MODE === 'appservice' ? await managedModelToken() : await localModelToken(config.image.subscription)
       } else if (config.codex?.auth === 'entra') {
         codexToken = process.env.HOSTING_MODE === 'appservice' ? await managedModelToken() : await localModelToken(config.image.subscription)
@@ -192,7 +194,7 @@ export class AgentWorker {
           assets: snapshot.assets.slice(-100).map(attachmentNotice),
         }
         const direct = run.input.directImage
-        const candidates = this.imageCandidates(run).filter(candidate => !direct || (direct.operation === 'edit' && candidate.assetId === direct.sourceAssetId))
+        const candidates = this.imageCandidates(run).filter(candidate => !direct || (direct.operation === 'edit' && (candidate.assetId === direct.sourceAssetId || run.input.assetIds?.includes(candidate.assetId))))
         await this.transport.submit(run, threadId, direct ? [] : history, candidates, attachments, readableAttachments, direct ? false : !!this.avatars, direct ? undefined : projectContext)
       }
       catch {
@@ -242,8 +244,14 @@ export class AgentWorker {
       if (remote.needsSource) {
         if (local.input.directImage && (local.input.directImage.operation !== 'edit' || local.input.directImage.sourceAssetId !== remote.sourceAssetId)) throw new Error('Direct image source mismatch')
         if (remote.status !== 'running' || remote.imageOperation !== 'edit' || local.input.mode === 'chat' || !this.transport.provideSource) throw new Error('Unexpected source request')
-        const candidate = this.imageCandidates(local).find(candidate => candidate.assetId === remote.sourceAssetId) ?? (local.processedAssetIds?.includes(remote.sourceAssetId ?? '') ? { assetId: remote.sourceAssetId! } : undefined)
-        if (!candidate || (local.sourceAssetId && local.sourceAssetId !== candidate.assetId)) throw new Error('Source outside run candidates')
+        const requestedId = remote.requestedSourceAssetId ?? remote.sourceAssetId
+        if (remote.sourceAssetIds) {
+          const attachedIds = (local.input.assetIds ?? []).filter(id => (this.store.asset(id).mediaType ?? 'image') === 'image')
+          const expected = attachedIds.length ? attachedIds : [remote.sourceAssetId]
+          if (JSON.stringify(remote.sourceAssetIds) !== JSON.stringify(expected) || remote.sourceAssetIds[0] !== remote.sourceAssetId || !remote.sourceAssetIds.includes(requestedId!)) throw new Error('Source reference set mismatch')
+        } else if (requestedId !== remote.sourceAssetId) throw new Error('Unexpected additional source')
+        const candidate = this.imageCandidates(local).find(candidate => candidate.assetId === requestedId) ?? (local.processedAssetIds?.includes(requestedId ?? '') ? { assetId: requestedId! } : undefined)
+        if (!candidate || (local.sourceAssetId && local.sourceAssetId !== remote.sourceAssetId)) throw new Error('Source outside run candidates')
         const source = this.store.asset(candidate.assetId)
         const azure = isAzureImageModel(local.input.imageModel ?? 'azure-image2')
         if (azure ? source.bytes >= 50_000_000 : source.bytes > 32 * 1024 * 1024) {
@@ -254,7 +262,7 @@ export class AgentWorker {
         }
         const bytes = await this.assetStorage.read(`${source.id}.${assetExtension(source)}`)
         if (bytes.length !== source.bytes || createHash('sha256').update(bytes).digest('hex') !== source.hash) throw new Error('Invalid source image')
-        this.store.updateAgent(id, { sourceAssetId: source.id, imageOperation: 'edit', reply: remote.reply, threadId: remote.threadId, progress })
+        this.store.updateAgent(id, { sourceAssetId: remote.sourceAssetId, imageOperation: 'edit', reply: remote.reply, threadId: remote.threadId, progress })
         await this.transport.provideSource(id, { assetId: source.id, png: bytes.toString('base64'), hash: source.hash, width: source.width, height: source.height })
         return
       }

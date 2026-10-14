@@ -1,4 +1,5 @@
-export type Ratio = '1:1' | '4:3' | '3:4' | '16:9' | '9:16' | '3:2' | '2:3'
+export const ratios = ['auto', '1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16'] as const
+export type Ratio = typeof ratios[number]
 export type Quality = 'low' | 'medium' | 'high'
 export const imageModels = ['azure-image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'qwen-image-2.1', 'qwen-image-2.1-t4', 'qwen-image-2.1-t4-turbo'] as const
 export type ImageModel = typeof imageModels[number]

@@ -49,7 +49,7 @@ export const avatarPlanSchema = z.object({
   segments: z.array(z.object({ text: z.string().trim().min(1).max(100), continueFromPrevious: z.boolean() }).strict()).min(1).max(12),
 }).strict().refine(plan => !plan.segments[0].continueFromPrevious && plan.segments.reduce((count, segment) => count + segment.text.length, 0) <= 500, 'Invalid first source or total narration length')
 
-export function parseDecision(text, mode, candidateIds = [], videoEnabled = false, avatarEnabled = false) {
+export function parseDecision(text, mode, candidateIds = [], videoEnabled = false, avatarEnabled = false, currentImageIds = []) {
   const decision = z.object({ reply: z.string().min(1).max(20000), action: z.enum(['chat', 'image', 'edit', 'video', 'avatar']), sourceAssetId: z.string().uuid().nullable().default(null), imagePrompt: z.string().min(1).max(6000).nullable(), videoPrompt: z.string().min(1).max(6000).nullable().default(null), avatarPlan: avatarPlanSchema.nullable().default(null), storyPlan: storyPlanSchema.nullable().default(null), size: z.string().regex(/^[1-9][0-9]{0,4}x[1-9][0-9]{0,4}$/).nullable().optional(), ratio: z.enum(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']).nullable().optional(), quality: z.enum(['low', 'medium', 'high']).nullable().optional() }).strict().parse(JSON.parse(text))
   if (mode === 'chat' || decision.action === 'chat') return { ...decision, action: 'chat', imagePrompt: null, videoPrompt: null, sourceAssetId: null, avatarPlan: null, storyPlan: null }
   if (decision.storyPlan && decision.action !== 'video') throw new Error('Story plan requires video action')
@@ -60,6 +60,7 @@ export function parseDecision(text, mode, candidateIds = [], videoEnabled = fals
     return { ...decision, imagePrompt: null, videoPrompt: null }
   }
   decision.avatarPlan = null
+  applyCurrentImageReferences(decision, currentImageIds, candidateIds)
   if (decision.action === 'edit') {
     if (!decision.sourceAssetId || !candidateIds.includes(decision.sourceAssetId)) throw new Error('Codex must select an allowed sourceAssetId for editing; no fallback image was selected')
   } else if (decision.sourceAssetId !== null) throw new Error('Only edit decisions may select a sourceAssetId')
@@ -74,13 +75,23 @@ export function parseDecision(text, mode, candidateIds = [], videoEnabled = fals
 }
 
 export function renderSettings(decision, defaults) {
-  const ratio = decision.ratio ?? defaults.ratio
+  const ratio = defaults.ratio && defaults.ratio !== 'auto' ? defaults.ratio : decision.ratio ?? '1:1'
   const quality = decision.quality ?? defaults.quality ?? 'low'
   return { ratio, quality }
 }
 
 export const azureImageModels = ['azure-image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst']
 export const isAzureImageModel = model => azureImageModels.includes(model)
+
+export function applyCurrentImageReferences(decision, currentImageIds, candidateIds) {
+  if (!['image', 'edit'].includes(decision.action) || !currentImageIds.length) return decision
+  const sourceAssetIds = [...new Set(currentImageIds)]
+  if (sourceAssetIds.some(id => !candidateIds.includes(id))) throw new Error('Current reference outside allowed image candidates')
+  decision.action = 'edit'
+  decision.sourceAssetId = sourceAssetIds[0]
+  decision.sourceAssetIds = sourceAssetIds
+  return decision
+}
 
 export const directImageSchema = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('generate') }).strict(),
@@ -99,7 +110,7 @@ export function directImageDecision(input) {
   if (ratios.length > 1) throw new Error('需求中有多个不同的图片比例，请只保留本次要生成的比例。')
   if (ratios.length && !supportedRatios.includes(ratios[0])) throw new Error('直接生图不支持指定的比例，请使用表单中的比例选项。')
   return { action: request.operation === 'edit' ? 'edit' : 'image', imagePrompt: input.text,
-    sourceAssetId, ratio: ratios[0] ?? input.ratio, quality: input.quality,
+    sourceAssetId, ratio: ratios[0] ?? (input.ratio === 'auto' ? null : input.ratio), quality: input.quality,
     size: null, reply: '', videoPrompt: null, avatarPlan: null, storyPlan: null }
 }
 
@@ -116,13 +127,14 @@ export function editOutputSize(source, model) {
 }
 
 export function imageOutputSize(decision, defaults, source) {
-  if (decision.action === 'edit' && !decision.size && !decision.ratio) return editOutputSize(source, defaults.imageModel)
-  const ratio = decision.ratio ?? defaults.ratio
+  const forcedRatio = defaults.ratio && defaults.ratio !== 'auto' ? defaults.ratio : null
+  if (!forcedRatio && decision.action === 'edit' && !decision.size && !decision.ratio) return editOutputSize(source, defaults.imageModel)
+  const ratio = renderSettings(decision, defaults).ratio
   const size = decision.size ?? ({ '1:1': '1024x1024', '3:2': '1536x1024', '2:3': '1024x1536', '4:3': '1280x960', '3:4': '960x1280', '16:9': '1536x864', '9:16': '864x1536' })[ratio]
   if (!validImageSize(size, defaults.imageModel)) throw new Error(`当前模型不支持输出尺寸 ${size}；未发送图片请求，不会替换为默认尺寸。`)
-  if (decision.size && decision.ratio) {
+  if (decision.size && (forcedRatio || decision.ratio)) {
     const [width, height] = size.split('x').map(Number)
-    const [horizontal, vertical] = decision.ratio.split(':').map(Number)
+    const [horizontal, vertical] = ratio.split(':').map(Number)
     if (width * vertical !== height * horizontal) throw new Error('指定像素尺寸与比例冲突；未发送图片请求，请确认尺寸。')
   }
   return size

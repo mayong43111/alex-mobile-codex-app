@@ -7,7 +7,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Store, HttpError } from './store.ts'
 import type { Asset } from '../src/domain.ts'
-import { assetExtension, assetHasThumbnail, assetContentType, imageModels } from '../src/domain.ts'
+import { assetExtension, assetHasThumbnail, assetContentType, imageModels, ratios } from '../src/domain.ts'
 import { AgentWorker } from './agent.ts'
 import type { AgentTransport } from './agent.ts'
 import { BlobAssetStorage, LocalAssetStorage, prepareUpload } from './assets.ts'
@@ -22,7 +22,7 @@ import type { AvatarProvider } from './avatar-provider.ts'
 
 const titleSchema = z.object({ title: z.string().trim().min(1).max(80) }).strict()
 const settingsSchema = z.object({
-  ratio: z.enum(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']),
+  ratio: z.enum(ratios),
   quality: z.enum(['low', 'medium', 'high']),
   imageModel: z.enum(imageModels),
   videoModel: z.enum(['none', 'minimax-h3']),
@@ -30,7 +30,7 @@ const settingsSchema = z.object({
 const submissionSchema = z.object({
   requestId: z.string().uuid(), text: z.string().trim().min(1).max(6000),
   assetIds: z.array(z.string().uuid()).max(10).refine(ids => new Set(ids).size === ids.length),
-  ratio: z.enum(['1:1', '4:3', '3:4', '16:9']),
+  ratio: z.enum(ratios),
 }).strict()
 
 export async function buildApp(options: { dataDir: string; origins?: string[]; agent?: AgentTransport; hosts?: string[]; staticRoot?: string; auth?: AuthOptions; journalMode?: 'WAL' | 'DELETE'; assetStorage?: AssetStorage; vm?: VmControl; avatar?: AvatarProvider; nativeAvatar?: AvatarProvider }) {
@@ -166,7 +166,7 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     const defaults = store.userSettings(authentication ? request.studioSession!.user.id : 'local')
     const input = z.object({ requestId: z.string().uuid(), text: z.string().trim().min(1).max(6000),
       assetIds: z.array(z.string().uuid()).max(10).refine(ids => new Set(ids).size === ids.length).default([]),
-      mode: z.enum(['auto', 'chat', 'image']), ratio: z.enum(['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16']).default(defaults.ratio), quality: z.enum(['low', 'medium', 'high']).default(defaults.quality),
+      mode: z.enum(['auto', 'chat', 'image']), ratio: z.enum(ratios).default(defaults.ratio), quality: z.enum(['low', 'medium', 'high']).default(defaults.quality),
       imageModel: z.enum(imageModels).default(defaults.imageModel), videoModel: z.enum(['none', 'minimax-h3']).default(defaults.videoModel),
       directImage: z.discriminatedUnion('operation', [z.object({ operation: z.literal('generate') }).strict(), z.object({ operation: z.literal('edit'), sourceAssetId: z.string().uuid() }).strict()]).optional(),
     }).strict().refine(input => !input.directImage || (input.mode === 'image' && input.videoModel === 'none')).parse(request.body)

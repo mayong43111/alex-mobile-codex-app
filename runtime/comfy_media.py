@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import subprocess
 from fractions import Fraction
@@ -10,7 +11,7 @@ import time
 from uuid import UUID
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 from tools.base_tool import BaseTool, ToolResult, ToolTier, ToolRuntime
 from tools._comfyui.client import ComfyUIClient
 from lib.checkpoint import write_checkpoint
@@ -52,8 +53,11 @@ def workflow(model, prompt, ratio, seed, source=None, quality='low', size=None):
             '8': {'class_type': 'SaveImage', 'inputs': {'images': ['7', 0], 'filename_prefix': f'studio/{seed}'}},
         })
         if source:
-            graph['9'] = {'class_type': 'LoadImage', 'inputs': {'image': source['filename']}}
-            graph['4']['inputs'].update({'vae': ['3', 0], 'images.image_1': ['9', 0]})
+            graph['4']['inputs']['vae'] = ['3', 0]
+            for index, reference in enumerate(source.get('references', [source])):
+                node_id = str(9 + index)
+                graph[node_id] = {'class_type': 'LoadImage', 'inputs': {'image': reference['filename']}}
+                graph['4']['inputs'][f'images.image_{index + 1}'] = [node_id, 0]
             if (width, height) == (source['width'], source['height']):
                 graph['6']['inputs']['latent_image'] = ['4', 2]
     else:
@@ -82,6 +86,43 @@ def checked_source(source):
             raise ValueError('Invalid source image dimensions')
         image.load()
     return raw
+
+
+def supports_references(nodes, count):
+    inputs = nodes.get('TextEncodeQwenImage21', {}).get('input', {})
+    fields = {**inputs.get('required', {}), **inputs.get('optional', {})}
+    images = fields.get('images', [])
+    names = []
+    if len(images) == 2 and images[0] == 'COMFY_AUTOGROW_V3':
+        names = images[1].get('template', {}).get('names', [])
+    return all(f'image_{index}' in names or fields.get(f'images.image_{index}', [None])[0] == 'IMAGE' for index in range(1, count + 1))
+
+
+def prepare_references(sources, nodes):
+    if not 1 <= len(sources) <= 10 or len({source['assetId'] for source in sources}) != len(sources):
+        raise ValueError('Invalid reference set')
+    originals = [checked_source(source) for source in sources]
+    if len(sources) == 1 or supports_references(nodes, len(sources)):
+        return sources, originals, False
+    columns = math.ceil(math.sqrt(len(sources)))
+    rows = math.ceil(len(sources) / columns)
+    cell = 2048 // max(columns, rows) // 32 * 32
+    canvas = Image.new('RGB', (columns * cell, rows * cell), 'white')
+    draw = ImageDraw.Draw(canvas)
+    for index, raw in enumerate(originals):
+        with Image.open(io.BytesIO(raw)) as image:
+            thumbnail = image.convert('RGBA')
+            thumbnail.thumbnail((cell - 16, cell - 40), Image.Resampling.LANCZOS)
+            left = (index % columns) * cell
+            top = (index // columns) * cell
+            canvas.paste(thumbnail, (left + (cell - thumbnail.width) // 2, top + 32 + (cell - 40 - thumbnail.height) // 2), thumbnail)
+            draw.text((left + 8, top + 8), f'Reference {index + 1}', fill='black')
+    output = io.BytesIO()
+    canvas.save(output, format='PNG')
+    raw = output.getvalue()
+    combined = {**sources[0], 'width': canvas.width, 'height': canvas.height,
+        'png': base64.b64encode(raw).decode(), 'hash': hashlib.sha256(raw).hexdigest()}
+    return [combined], [raw], True
 
 
 def validate_media(raw, video, width, height):
@@ -135,7 +176,10 @@ class ComfyMedia(BaseTool):
         ledger = project / 'comfy-job.json'
         model = inputs['model']
         video = model == 'minimax-h3'
-        source = inputs.get('sourceImage')
+        sources = inputs.get('sourceImages', [inputs['sourceImage']] if inputs.get('sourceImage') else [])
+        source = sources[0] if sources else None
+        if inputs.get('sourceImage') and inputs['sourceImage'] != source:
+            raise ValueError('Primary source mismatch')
         operation = inputs.get('operation', 'generate')
         t4 = model in T4_MODELS
         if (model not in MODELS and not t4) or not 1 <= len(inputs['prompt']) <= 6000:
@@ -162,16 +206,29 @@ class ComfyMedia(BaseTool):
             queue = response.json()
             if queue.get('queue_running') or queue.get('queue_pending'):
                 raise ValueError('GPU is busy; no request submitted')
+            graph_source = None
+            prompt = inputs['prompt']
+            combined = False
             if source:
-                raw = checked_source(source)
-                response = transport.post(f'{client.server_url}/upload/image', files={'image': (f'{run_id}.png', raw, 'image/png')}, data={'type': 'input', 'subfolder': 'studio'}, timeout=30)
-                response.raise_for_status()
-                uploaded = response.json()
-                source = {**source, 'filename': '/'.join(filter(None, [uploaded.get('subfolder'), uploaded['name']]))}
+                nodes = {}
+                if len(sources) > 1:
+                    response = transport.get(f'{client.server_url}/object_info/TextEncodeQwenImage21', timeout=15)
+                    response.raise_for_status()
+                    nodes = response.json()
+                references, originals, combined = prepare_references(sources, nodes)
+                uploaded_references = []
+                for index, (reference, raw) in enumerate(zip(references, originals)):
+                    response = transport.post(f'{client.server_url}/upload/image', files={'image': (f'{run_id}-{index + 1}.png', raw, 'image/png')}, data={'type': 'input', 'subfolder': 'studio'}, timeout=30)
+                    response.raise_for_status()
+                    uploaded = response.json()
+                    uploaded_references.append({**reference, 'filename': '/'.join(filter(None, [uploaded.get('subfolder'), uploaded['name']]))})
+                graph_source = {**uploaded_references[0], 'references': uploaded_references}
+                if combined:
+                    prompt = f'The input is a contact sheet of {len(sources)} references, numbered in row-major order. Use every reference for the requested edit; do not reproduce the grid or labels unless requested.\n{prompt}'
             seed = int(UUID(run_id)) % (2**53)
-            graph, width, height, output_node = workflow(model, inputs['prompt'], inputs['ratio'], seed, source, inputs.get('quality', 'low'), inputs.get('size'))
+            graph, width, height, output_node = workflow(model, prompt, inputs['ratio'], seed, graph_source, inputs.get('quality', 'low'), inputs.get('size') or (f"{source['width']}x{source['height']}" if source else None))
             workflow_hash = hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
-            record = {'run_id': run_id, 'model': model, 'seed': seed, 'workflow_hash': workflow_hash, 'ratio': inputs['ratio'], 'quality': inputs.get('quality', 'low'), 'status': 'submitting'}
+            record = {'run_id': run_id, 'model': model, 'seed': seed, 'workflow_hash': workflow_hash, 'ratio': inputs['ratio'], 'quality': inputs.get('quality', 'low'), 'status': 'submitting', 'source_asset_ids': [reference['assetId'] for reference in sources], 'reference_mode': 'contact-sheet' if combined else 'native'}
             ledger.write_text(json.dumps(record))
             (project / 'workflow.json').write_text(json.dumps(graph, indent=2))
             prompt_id = client.submit(graph)

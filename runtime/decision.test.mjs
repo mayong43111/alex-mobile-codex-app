@@ -9,7 +9,8 @@ test('direct image edits use the selected ratio instead of the source aspect rat
   assert.equal(decision.ratio, '3:4')
   assert.equal(imageOutputSize(decision, input, source), '960x1280')
   const explicit = directImageDecision({ ...input, text: '换成沙滩背景，比例 16:9' })
-  assert.equal(imageOutputSize(explicit, input, source), '1536x864')
+  assert.equal(imageOutputSize(explicit, input, source), '960x1280')
+  assert.equal(imageOutputSize(explicit, { ...input, ratio: 'auto' }, source), '1536x864')
 })
 import { ImageSourceRequest, sourceBodyLimit } from './image-source.mjs'
 import Fastify from 'fastify'
@@ -30,7 +31,7 @@ test('T4 readiness requires exact INT8 models, cache and separate Turbo dependen
   delete nodes.QwenImage21Cache
   assert.deepEqual(availableT4Models(nodes), [])
   for (const imageModel of t4Models) {
-    assert.equal(imageOutputSize({ action: 'image', size: '2048x1152' }, { imageModel, ratio: '1:1' }), '2048x1152')
+    assert.equal(imageOutputSize({ action: 'image', size: '2048x1152' }, { imageModel, ratio: 'auto' }), '2048x1152')
     assert.throws(() => imageOutputSize({ action: 'image', size: '1040x1040' }, { imageModel, ratio: '1:1' }), /不支持输出尺寸/)
   }
 })
@@ -38,7 +39,7 @@ test('T4 readiness requires exact INT8 models, cache and separate Turbo dependen
 test('Azure 2.5 models use Azure dimensions and never GPU rounding', () => {
   for (const imageModel of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst']) {
     assert.equal(imageOutputSize({ action: 'image' }, { imageModel, ratio: '16:9' }), '1536x864')
-    assert.equal(imageOutputSize({ action: 'image', size: '2048x1152' }, { imageModel, ratio: '1:1' }), '2048x1152')
+    assert.equal(imageOutputSize({ action: 'image', size: '2048x1152' }, { imageModel, ratio: 'auto' }), '2048x1152')
     assert.equal(editOutputSize({ width: 3024, height: 4032 }, imageModel), 'auto')
     assert.equal(editOutputSize({ width: 960, height: 1280 }, imageModel), '960x1280')
     assert.throws(() => imageOutputSize({ action: 'image', size: '1920x1080' }, { imageModel, ratio: '1:1' }), /不支持输出尺寸/)
@@ -160,16 +161,19 @@ test('source delivery refuses the 50 MB boundary before resolving', async () => 
   await assert.rejects(request.promise, /stopped/)
 })
 
-test('conversation settings override defaults without provider substitution', () => {
+test('selected ratios are mandatory while automatic ratios follow AI decisions', () => {
   const defaults = { ratio: '1:1', quality: 'low', imageModel: 'qwen-image-2.1' }
   const decision = parseDecision(JSON.stringify({ action: 'image', reply: '准备', imagePrompt: 'wide scene', ratio: '16:9', quality: 'high' }), 'auto')
-  assert.deepEqual(renderSettings(decision, defaults), { ratio: '16:9', quality: 'high' })
+  assert.deepEqual(renderSettings(decision, defaults), { ratio: '1:1', quality: 'high' })
   assert.deepEqual(renderSettings({ action: 'image', ratio: null, quality: null }, defaults), { ratio: '1:1', quality: 'low' })
-  assert.equal(imageOutputSize(decision, { ...defaults, imageModel: 'azure-image2' }), '1536x864')
+  assert.equal(imageOutputSize(decision, { ...defaults, imageModel: 'azure-image2' }), '1024x1024')
+  assert.deepEqual(renderSettings(decision, { ...defaults, ratio: 'auto' }), { ratio: '16:9', quality: 'high' })
+  assert.equal(imageOutputSize({ action: 'edit' }, defaults, { width: 1536, height: 864 }), '1024x1024')
+  assert.throws(() => imageOutputSize({ action: 'image', size: '2048x1152' }, defaults), /冲突/)
 })
 
-test('explicit conversational pixels and edit aspect override default and source dimensions', () => {
-  const defaults = { ratio: '1:1', imageModel: 'azure-image2' }
+test('automatic ratio allows conversational pixels and source dimensions', () => {
+  const defaults = { ratio: 'auto', imageModel: 'azure-image2' }
   const source = { width: 1024, height: 1024 }
   for (const action of ['image', 'edit']) {
     const decision = parseDecision(JSON.stringify({ action, reply: '准备', imagePrompt: 'test', size: '2048x1152', ratio: '16:9', sourceAssetId: action === 'edit' ? '00000000-0000-4000-8000-000000000001' : null }), 'auto', ['00000000-0000-4000-8000-000000000001'])
@@ -214,6 +218,23 @@ test('editing requires a source and never silently falls back to generation', ()
   assert.throws(() => parseDecision(JSON.stringify({ ...decision, imagePrompt: null }), 'auto', [older]))
   assert.throws(() => parseDecision(JSON.stringify({ ...decision, action: 'image' }), 'auto', [older]), /Only edit/)
   assert.equal(parseDecision(JSON.stringify({ ...decision, action: 'image', sourceAssetId: null }), 'auto', [older, latest]).sourceAssetId, null)
+})
+
+test('current images force editing with every reference but history and chat do not', () => {
+  const current = [randomUUID(), randomUUID()]
+  const historical = randomUUID()
+  const candidates = [historical, ...current]
+  const input = { action: 'image', reply: '准备', imagePrompt: 'combine the references' }
+  const parse = (decision, mode = 'auto', ids = current) => parseDecision(JSON.stringify(decision), mode, candidates, false, false, ids)
+  for (const decision of [input, { ...input, action: 'edit', sourceAssetId: historical }, { ...input, action: 'edit', sourceAssetId: null }]) {
+    assert.equal(parse(decision).action, 'edit')
+    assert.equal(parse(decision).sourceAssetId, current[0])
+    assert.deepEqual(parse(decision).sourceAssetIds, current)
+  }
+  assert.equal(parse(input, 'auto', []).action, 'image')
+  assert.equal(parse(input, 'chat').action, 'chat')
+  assert.equal(parse({ ...input, action: 'chat' }).action, 'chat')
+  assert.throws(() => parse(input, 'auto', [randomUUID()]), /outside allowed/)
 })
 
 test('enabled video uses its own prompt and chat mode cannot render', () => {
