@@ -6,7 +6,7 @@
 
 `.github/workflows/webapp.yml` 仅在推送 tag 或手动运行时触发，普通分支推送和 PR 不触发。手动发布选择 `main`；tag 发布使用该 tag 对应的提交。生产任务串行执行，不自动取消正在发布的任务。
 
-GitHub `production` Environment 配置以下 Variables，不使用发布密码：`AZURE_CLIENT_ID`、`AZURE_TENANT_ID`、`AZURE_SUBSCRIPTION_ID`、`AZURE_RESOURCE_GROUP`、`AZURE_WEBAPP_NAME`、`ACR_NAME`。环境部署规则允许 `main` 分支和发布 tag。Azure 独立用户分配托管身份的联邦凭据使用 issuer `https://token.actions.githubusercontent.com`、audience `api://AzureADTokenExchange`、subject `repo:OWNER/REPOSITORY:environment:production`。仅给该身份目标 Web App 范围的 Website Contributor，以及目标 ACR 范围的 AcrPush 和 Reader，不更改应用运行时身份及其模型权限。
+GitHub `production` Environment 配置以下 Variables，不使用发布密码：`AZURE_CLIENT_ID`、`AZURE_TENANT_ID`、`AZURE_SUBSCRIPTION_ID`、`AZURE_RESOURCE_GROUP`、`AZURE_WEBAPP_NAME`、`ACR_NAME`。环境部署规则允许 `main` 分支和发布 tag。Azure 独立用户分配托管身份的联邦凭据使用 issuer `https://token.actions.githubusercontent.com`、audience `api://AzureADTokenExchange`。subject 必须与 GitHub 实际签发值逐字匹配：当前仓库使用带不可变 ID 的 `repo:OWNER@OWNER_ID/REPOSITORY@REPOSITORY_ID:environment:production` 格式，不可直接套用旧的纯名称格式；登录日志只需读取 subject，不输出完整令牌。仅给该身份目标 Web App 范围的 Website Contributor，以及目标 ACR 范围的 AcrPush 和 Reader，不更改应用运行时身份及其模型权限。
 
 流水线先执行 lint、构建、后端测试及发布脚本测试，再构建 `runtime/Dockerfile` 的 `webapp` 阶段。实际生产镜像在禁用网络的容器中执行 Node/Python 回归；通过后推送独立版本标签，使用镜像摘要部署，防止可变标签指向其他内容。
 
