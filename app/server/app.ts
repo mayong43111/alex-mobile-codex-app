@@ -218,18 +218,30 @@ export async function buildApp(options: { dataDir: string; origins?: string[]; a
     store.deleteImage(asset.id, input.expectedHash)
     return { deleted: true, pendingCleanup: await cleanupAssets() }
   })
-  app.get('/api/references', async request => store.referenceImages(request.studioSession?.user.id))
+  app.patch<{ Params: { id: string } }>('/api/assets/:id', async request => {
+    const input = z.object({ name: z.string().trim().min(1).max(160).refine(value => !/[\\/\p{Cc}]/u.test(value)), expectedName: z.string().min(1).max(160) }).strict().parse(request.body)
+    return store.renameImage(request.params.id, input.name, input.expectedName)
+  })
+  app.get('/api/references', async request => {
+    const { projectId } = z.object({ projectId: z.string().uuid().optional() }).strict().parse(request.query)
+    if (projectId) {
+      store.project(projectId)
+      if (authentication) store.requireOwner(projectId, request.studioSession!.user.id)
+    }
+    return store.referenceImages(request.studioSession?.user.id, projectId)
+  })
   app.post<{ Params: { id: string } }>('/api/projects/:id/references', async (request, reply) => {
     store.project(request.params.id)
     const input = z.object({ assetId: z.string().uuid() }).strict().parse(request.body)
     const source = store.asset(input.assetId)
     if (authentication) store.requireOwner(source.projectId, request.studioSession!.user.id)
-    if (source.kind !== 'reference' || (source.mediaType ?? 'image') !== 'image') throw new HttpError(400, '请选择已上传的参考图片')
-    const sourceId = source.sourceAssetId ?? source.id
+    if ((source.mediaType ?? 'image') !== 'image') throw new HttpError(400, '请选择上传或生成的图片')
+    if (source.projectId === request.params.id) return source
+    const sourceId = source.kind === 'generated' ? source.id : source.sourceAssetId ?? source.id
     const existing = store.referenceCopy(request.params.id, sourceId)
     if (existing) return existing
     const id = randomUUID()
-    const asset: Asset = { ...source, id, projectId: request.params.id, sourceAssetId: sourceId, sourceHash: source.hash, createdAt: new Date().toISOString() }
+    const asset: Asset = { ...source, id, kind: 'reference', runId: undefined, projectId: request.params.id, sourceAssetId: sourceId, sourceHash: source.hash, createdAt: new Date().toISOString() }
     const extensions = [assetExtension(source), ...(assetHasThumbnail(source) ? ['webp'] : [])]
     try {
       for (const extension of extensions) await assetStorage.put(`${id}.${extension}`, await assetStorage.read(`${source.id}.${extension}`))

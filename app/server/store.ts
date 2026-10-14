@@ -136,7 +136,7 @@ export class Store {
       this.requireIdleProject(asset.projectId)
       if ((asset.mediaType ?? 'image') !== 'image') throw new HttpError(400, '此操作仅支持删除图片。')
       if (asset.hash !== expectedHash) throw new HttpError(409, '图片已更新，请重新确认删除。')
-      if (asset.kind === 'reference') this.db.prepare('INSERT OR IGNORE INTO hidden_references VALUES (?)').run(asset.sourceAssetId ?? asset.id)
+      this.db.prepare('INSERT OR IGNORE INTO hidden_references VALUES (?)').run(asset.kind === 'generated' ? asset.id : asset.sourceAssetId ?? asset.id)
       for (const extension of [assetExtension(asset), ...(assetHasThumbnail(asset) ? ['webp'] : [])]) this.db.prepare('INSERT OR IGNORE INTO asset_cleanup VALUES (?)').run(`${asset.id}.${extension}`)
       const messages = this.db.prepare('SELECT id, data FROM messages WHERE project_id = ?').all(asset.projectId)
       for (const row of messages) {
@@ -377,17 +377,29 @@ export class Store {
     return JSON.parse(row.data as string)
   }
 
-  referenceImages(userId?: string): Asset[] {
+  renameImage(id: string, name: string, expectedName: string): Asset {
+    return this.transaction(() => {
+      const asset = this.asset(id)
+      if ((asset.mediaType ?? 'image') !== 'image') throw new HttpError(400, '此操作仅支持图片。')
+      if (asset.name !== expectedName) throw new HttpError(409, '图片名称已更新，请刷新后重试。')
+      const updated = { ...asset, name }
+      this.db.prepare('UPDATE assets SET data = ? WHERE id = ?').run(JSON.stringify(updated), id)
+      this.event(asset.projectId, 'asset.renamed')
+      return updated
+    })
+  }
+
+  referenceImages(userId?: string, projectId?: string): Asset[] {
     const rows = this.db.prepare(`SELECT assets.data FROM assets
-      WHERE json_extract(assets.data, '$.kind') = 'reference'
+      WHERE json_extract(assets.data, '$.kind') IN ('reference', 'generated')
       AND COALESCE(json_extract(assets.data, '$.mediaType'), 'image') = 'image'
-      AND NOT EXISTS (SELECT 1 FROM hidden_references WHERE source_id = COALESCE(json_extract(assets.data, '$.sourceAssetId'), assets.id))
+      ${projectId === undefined ? "AND NOT EXISTS (SELECT 1 FROM hidden_references WHERE source_id = CASE WHEN json_extract(assets.data, '$.kind') = 'generated' THEN assets.id ELSE COALESCE(json_extract(assets.data, '$.sourceAssetId'), assets.id) END)" : 'AND assets.project_id = ?'}
       ${userId === undefined ? '' : 'AND EXISTS (SELECT 1 FROM project_owners WHERE project_id = assets.project_id AND user_id = ?)'}
-      ORDER BY assets.rowid`).all(...(userId === undefined ? [] : [userId]))
+      ORDER BY assets.rowid`).all(...(projectId === undefined ? [] : [projectId]), ...(userId === undefined ? [] : [userId]))
     const images = new Map<string, Asset>()
     for (const row of rows) {
       const asset: Asset = JSON.parse(row.data as string)
-      const sourceId = asset.sourceAssetId ?? asset.id
+      const sourceId = asset.kind === 'generated' ? asset.id : asset.sourceAssetId ?? asset.id
       if (!images.has(sourceId)) images.set(sourceId, asset)
     }
     return [...images.values()].reverse()

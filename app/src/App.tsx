@@ -89,23 +89,27 @@ function Modal({ open, onOpenChange, title, children, className = '' }: { open: 
   </Dialog.Portal></Dialog.Root>
 }
 
-function ReferenceLibrary({ projects, select, remove, revision }: { projects: Project[]; select: (asset: Asset) => Promise<void>; remove: (asset: Asset) => void; revision: number }) {
+function ReferenceLibrary({ projects, currentProjectId, select, remove, rename, revision }: { projects: Project[]; currentProjectId: string; select: (asset: Asset) => Promise<void>; remove: (asset: Asset) => void; rename: (asset: Asset, name: string) => Promise<void>; revision: number }) {
   const [images, setImages] = useState<Asset[]>([])
   const [loadedRequest, setLoadedRequest] = useState('')
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
-  const [project, setProject] = useState('')
+  const [project, setProject] = useState(currentProjectId)
   const [limit, setLimit] = useState(48)
   const [retry, setRetry] = useState(0)
   const [selecting, setSelecting] = useState('')
-  const loading = loadedRequest !== `${revision}:${retry}`
+  const [editing, setEditing] = useState<Asset | null>(null)
+  const [name, setName] = useState('')
+  const [renameError, setRenameError] = useState('')
+  const requestKey = `${project}:${revision}:${retry}`
+  const loading = loadedRequest !== requestKey
   useEffect(() => {
     const controller = new AbortController()
-    void api<Asset[]>('/references', { signal: controller.signal }).then(result => { if (!controller.signal.aborted) { setImages(result); setError('') } }).catch(failure => {
+    void api<Asset[]>(`/references${project ? `?${new URLSearchParams({ projectId: project })}` : ''}`, { signal: controller.signal }).then(result => { if (!controller.signal.aborted) { setImages(result); setError('') } }).catch(failure => {
       if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : '参考图加载失败')
-    }).finally(() => { if (!controller.signal.aborted) setLoadedRequest(`${revision}:${retry}`) })
+    }).finally(() => { if (!controller.signal.aborted) setLoadedRequest(requestKey) })
     return () => controller.abort()
-  }, [retry, revision])
+  }, [retry, revision, project, requestKey])
   const matching = images.filter(asset => (!project || asset.projectId === project) && asset.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
   async function choose(asset: Asset) {
     if (selecting) return
@@ -114,13 +118,21 @@ function ReferenceLibrary({ projects, select, remove, revision }: { projects: Pr
     catch (failure) { setError(failure instanceof Error ? failure.message : '参考图选用失败') }
     finally { setSelecting('') }
   }
-  return <section className="reference-library" aria-busy={loading || !!selecting}>
+  async function saveName(event: FormEvent) {
+    event.preventDefault()
+    if (!editing || selecting || !name.trim()) return
+    setSelecting(editing.id); setRenameError('')
+    try { await rename(editing, name.trim()); setEditing(null) }
+    catch (failure) { setRenameError(failure instanceof Error ? failure.message : '名称修改失败') }
+    finally { setSelecting('') }
+  }
+  return <><section className="reference-library" aria-busy={loading || !!selecting}>
     <div className="reference-toolbar"><label className="search"><Search size={16} /><input aria-label="搜索参考图" placeholder="搜索图片名称" value={query} onChange={event => { setQuery(event.target.value); setLimit(48) }} /></label><select aria-label="参考图来源项目" value={project} onChange={event => { setProject(event.target.value); setLimit(48) }}><option value="">全部项目</option>{projects.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select><IconButton label="刷新参考图库" disabled={loading || !!selecting} onClick={() => setRetry(value => value + 1)}><RefreshCw size={18} /></IconButton></div>
     <div className="reference-results">
     {error && <p className="form-error" role="alert">{error}</p>}
-    {loading ? <div className="empty" role="status"><LoaderCircle className="spin" />正在读取参考图</div> : <><p className="reference-count" role="status">{matching.length} 张参考图{selecting ? ' · 正在选用' : ''}</p>{!matching.length ? <div className="empty"><Images size={28} /><h2>{images.length ? '没有匹配的参考图' : '暂无已上传的参考图'}</h2></div> : <div className="asset-grid reference-grid">{matching.slice(0, limit).map(asset => <div className="image-collection-item" key={asset.id}><button type="button" className="asset" aria-label={`选用参考图 ${asset.name}`} disabled={!!selecting} onClick={() => void choose(asset)}><div className="asset-image"><AssetImage asset={asset} /><span className="asset-kind">{selecting === asset.id ? <LoaderCircle size={15} className="spin" /> : <ImagePlus size={15} />}</span></div><strong title={asset.name}>{asset.name}</strong><small>{projects.find(item => item.id === asset.projectId)?.title ?? '历史上传'}</small><small>{assetDetails(asset)}</small></button><IconButton label={`删除参考图 ${asset.name}`} disabled={!!selecting} onClick={() => remove(asset)}><Trash2 size={17} /></IconButton></div>)}</div>}{matching.length > limit && <button type="button" className="reference-more" onClick={() => setLimit(value => value + 48)}>加载更多</button>}</>}
+    {loading ? <div className="empty" role="status"><LoaderCircle className="spin" />正在读取参考图</div> : <><p className="reference-count" role="status">{matching.length} 张参考图{selecting ? ' · 正在处理' : ''}</p>{!matching.length ? <div className="empty"><Images size={28} /><h2>{images.length || query.trim() ? '没有匹配的参考图' : '暂无图片'}</h2></div> : <div className="asset-grid reference-grid">{matching.slice(0, limit).map(asset => <div className="image-collection-item" key={asset.id}><button type="button" className="asset" aria-label={`选用参考图 ${asset.name}`} disabled={!!selecting} onClick={() => void choose(asset)}><div className="asset-image"><AssetImage asset={asset} /><span className="asset-kind">{selecting === asset.id ? <LoaderCircle size={15} className="spin" /> : <ImagePlus size={15} />}</span></div><strong title={asset.name}>{asset.name}</strong><small>{asset.kind === 'generated' ? '生成' : '上传'} · {projects.find(item => item.id === asset.projectId)?.title ?? '历史项目'}</small><small>{assetDetails(asset)}</small></button><div className="reference-item-actions"><IconButton label={`修改图片名称 ${asset.name}`} disabled={!!selecting} onClick={() => { setEditing(asset); setName(asset.name); setRenameError('') }}><Pencil size={17} /></IconButton><IconButton label={`删除参考图 ${asset.name}`} disabled={!!selecting} onClick={() => remove(asset)}><Trash2 size={17} /></IconButton></div></div>)}</div>}{matching.length > limit && <button type="button" className="reference-more" onClick={() => setLimit(value => value + 48)}>加载更多</button>}</>}
     </div>
-  </section>
+  </section><Modal open={!!editing} onOpenChange={open => { if (!open && !selecting) setEditing(null) }} title="修改图片名称"><form className="project-form" onSubmit={event => void saveName(event)}><label htmlFor="reference-name">图片名称</label><input id="reference-name" autoFocus required maxLength={160} value={name} disabled={!!selecting} onChange={event => setName(event.target.value)} /><div className="actions"><button type="button" disabled={!!selecting} onClick={() => setEditing(null)}>取消</button><button className="primary" type="submit" disabled={!!selecting || !name.trim()}>{selecting ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}保存名称</button></div>{renameError && <p role="alert" className="form-error">{renameError}</p>}</form></Modal></>
 }
 
 function RunProgress({ run }: { run: AgentRun }) {
@@ -756,7 +768,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     if (!draftOnly && (!health?.agentConfigured || !health.models?.images.includes(input.imageModel))) throw new Error('所选图片模型尚未就绪，未提交生成')
     const id = await ensureShootProject()
     const references = input.assetIds.map(assetId => assets.find(asset => asset.id === assetId && asset.projectId === id && (asset.mediaType ?? 'image') === 'image'))
-    if (references.length !== 3 || references.some(asset => !asset) || new Set(input.assetIds).size !== 3) throw new Error('三张参考图已变化，请重新选择并合并')
+    if (!references.length || references.length > 3 || references.some(asset => !asset) || new Set(input.assetIds).size !== input.assetIds.length) throw new Error('参考图已变化，请重新选择并合并')
     if (draftOnly) {
       setAttachments(references as Asset[]); editDraft(input.text)
       setRatio(input.ratio); setImageModel(input.imageModel)
@@ -781,6 +793,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       setDeletingAsset(null)
       setSelectedAsset(previous => previous?.id === asset.id ? null : previous)
       setAttachments(previous => previous.filter(item => item.id !== asset.id))
+      setShootReferences(previous => Object.fromEntries(Object.entries(previous).map(([role, item]) => [role, item?.id === asset.id ? null : item])) as ShootReferences)
       if (sourceId === asset.id) setSourceId('')
       submitRequest.current = null; creationRequest.current = null
       setReferenceRevision(value => value + 1)
@@ -913,6 +926,19 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
       await refresh(selected.message.projectId)
     })
   }
+  async function renameReference(asset: Asset, name: string) {
+    if (busy) throw new Error('请等待当前操作完成')
+    setBusy(true)
+    try {
+      const updated = await api<Asset>(`/assets/${asset.id}`, json('PATCH', { name, expectedName: asset.name }))
+      setAttachments(previous => previous.map(item => item.id === updated.id ? updated : item))
+      setSelectedAsset(previous => previous?.id === updated.id ? updated : previous)
+      setShootReferences(previous => Object.fromEntries(Object.entries(previous).map(([role, item]) => [role, item?.id === updated.id ? updated : item])) as ShootReferences)
+      setReferenceRevision(value => value + 1)
+      if (projectId) await refresh(projectId)
+      await loadProjects()
+    } finally { setBusy(false) }
+  }
   async function chooseHistoricalReference(asset: Asset) {
     if (busy) throw new Error('请等待当前操作完成')
     const target = referenceTarget
@@ -1030,7 +1056,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     <input ref={fileInput} type="file" multiple hidden onChange={event => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void perform(() => uploadFiles(files)) }} />
     <Modal open={guidesOpen} onOpenChange={setGuidesOpen} title="创作引导">{creationEntries}<button type="button" className="welcome-secondary" disabled={!projectId || busy} onClick={openAvatarConversation}><Film size={18} /><span>数字人口播</span><ChevronRight size={16} /></button></Modal>
     <Modal open={poseOpen} onOpenChange={setPoseOpen} title="姿势生图" className="pose-modal"><Suspense fallback={<p role="status">加载姿势工作台</p>}><PoseStudio assets={assets} value={poseDraft} onChange={setPoseDraft} onPrepare={preparePose} /></Suspense></Modal>
-    <Modal open={shootOpen} onOpenChange={open => { if (!shootBusy && !busy) setShootOpen(open) }} title="模特试拍" className="model-shoot-panel"><ModelShoot assets={assets} references={shootReferences} onChange={changeShootReference} onUpload={uploadShootReference} onLibrary={role => setReferenceTarget(`shoot-${role}`)} onPose={() => setShootPoseOpen(true)} onGenerate={input => submitShoot(input)} onDraft={input => submitShoot(input, true)} onBusyChange={setShootBusy} initialRatio={ratio} initialModel={imageModel} availableModels={health?.models?.images ?? []} disabled={busy || !settingsReady || savingSettings} /></Modal>
+    <Modal open={shootOpen} onOpenChange={open => { if (!shootBusy && !busy) setShootOpen(open) }} title="模特试拍" className="model-shoot-panel"><ModelShoot assets={assets} references={shootReferences} onChange={changeShootReference} onUpload={uploadShootReference} onLibrary={role => setReferenceTarget(`shoot-${role}`)} onPose={() => setShootPoseOpen(true)} onGenerate={input => submitShoot(input)} onDraft={input => submitShoot(input, true)} onBusyChange={setShootBusy} initialRatio={ratio} initialModel={imageModel} availableModels={health?.models?.images ?? []} disabled={busy || !settingsReady || savingSettings} preferencesKey={`studio.shoot-categories:${user?.id ?? 'local'}`} /></Modal>
     <Modal open={shootPoseOpen} onOpenChange={open => { if (!shootBusy) setShootPoseOpen(open) }} title="试拍姿势" className="pose-modal"><Suspense fallback={<p role="status">加载姿势工作台</p>}><PoseStudio assets={assets} value={poseDraft} onChange={setPoseDraft} onPrepare={prepareShootPose} referenceOnly /></Suspense></Modal>
     <Modal open={!!guide} onOpenChange={open => { if (!open && !busy) { setGuide(null); setSourceFile(null) } }} title={guide ? creationGuides[guide].title : '创作需求'} className={guide === 'image' ? 'image-create-sheet' : undefined}>
       {guide && <form className="creation-brief" onSubmit={event => void prepareCreation(event)}>
@@ -1065,7 +1091,7 @@ export default function App({ user, onLogout }: { user?: SignedInUser | null; on
     </Modal>
     <Modal open={!!projectDialog} onOpenChange={open => { if (!open && !busy) setProjectDialog(null) }} title={projectDialog === 'rename' ? '重命名项目' : '新建项目'}><form className="project-form" onSubmit={event => void saveProject(event)}><label htmlFor="project-title">项目名称</label><input id="project-title" autoFocus required maxLength={80} value={projectName} placeholder="为这次创作命名" onChange={event => setProjectName(event.target.value)} /><button className="primary" disabled={busy || !projectName.trim()} type="submit">{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}保存项目</button>{error && <p role="alert" className="form-error">{error}</p>}</form></Modal>
     <Modal open={servicesOpen} onOpenChange={setServicesOpen} title="服务状态"><div className="service-list"><p>{storageStatus === 'ready' ? <Check size={18} /> : <CirclePause size={18} />}<strong>本地数据</strong><span>{storageStatus === 'ready' ? 'SQLite 已连接' : storageStatus === 'checking' ? '检查中' : '连接失败'}</span></p><p><CirclePause size={18} /><strong>Codex / GPT-5.4</strong><span>{storageStatus === 'ready' && health?.agent === 'configured' ? '容器已配置' : '未连接'}</span></p><p><Cpu size={18} /><strong>OpenMontage</strong><span>{storageStatus === 'ready' && health?.openmontage === 'installed' ? '已安装' : '未连接'}</span></p><p><Images size={18} /><strong>Azure 图片</strong><span>{storageStatus === 'ready' && health?.renderer === 'azure_image2' ? '已配置 · 按量计费' : '未连接'}</span></p><p><Cpu size={18} /><strong>ComfyUI / GPU</strong><span>{storageStatus === 'ready' && (health?.models?.images.some(model => model.startsWith('qwen-image-')) || health?.models?.videos.includes('minimax-h3')) ? '已连接 · GPU 计费' : '未就绪'}</span></p></div></Modal>
-    <Modal open={referenceTarget !== null} onOpenChange={open => { if (!open && !busy) setReferenceTarget(null) }} title="参考图库" className="project-panel reference-panel reference-library-panel"><ReferenceLibrary projects={projects} select={chooseHistoricalReference} remove={requestDeleteImage} revision={referenceRevision} /></Modal>
+    <Modal open={referenceTarget !== null} onOpenChange={open => { if (!open && !busy) setReferenceTarget(null) }} title="参考图库" className="project-panel reference-panel reference-library-panel"><ReferenceLibrary key={projectId} projects={projects} currentProjectId={projectId} select={chooseHistoricalReference} remove={requestDeleteImage} rename={renameReference} revision={referenceRevision} /></Modal>
     <Viewer asset={selectedAsset} close={() => setSelectedAsset(null)} reference={attachReference} remove={requestDeleteImage} deletingDisabled={busy || activeRuns.length > 0} />
     <Modal open={vmOpen} onOpenChange={setVmOpen} title="VM 管理"><VmPanel /></Modal>
     <Modal open={!!clearingConversation} onOpenChange={open => { if (!open && !busy) setClearingConversation(null) }} title="清空会话？"><div className="resend-confirmation"><strong>{clearingConversation?.title}</strong><p>将清空当前项目的全部历史消息及任务文字记录，无法撤销。已生成的图片、参考图和其他素材保留，作品集合不受影响。</p><div className="actions"><button type="button" disabled={busy} onClick={() => setClearingConversation(null)}>取消</button><button type="button" className="primary danger" disabled={busy} onClick={() => void clearConversation()}><Trash2 size={18} />确认清空</button></div>{error && <p role="alert" className="form-error">{error}</p>}</div></Modal>

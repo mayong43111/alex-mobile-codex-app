@@ -8,6 +8,7 @@ import { defaultUserSettings } from '../src/domain.ts'
 import type { UserSettings } from '../src/domain.ts'
 
 test('image management clears conversation text while preserving works and deletes individual images with confirmation', async ({ page, request }, testInfo) => {
+  test.setTimeout(60000)
   const project = await (await request.post('/api/projects', { data: { title: '作品管理验收' } })).json()
   const other = await (await request.post('/api/projects', { data: { title: '独立副本' } })).json()
   const buffer = await sharp(resolve('public/reference-interior.jpg')).resize(320, 240).png().toBuffer()
@@ -25,6 +26,12 @@ test('image management clears conversation text while preserving works and delet
     await route.fulfill({ response, json: snapshot })
   })
   await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.route('**/api/references*', async route => {
+    const response = await route.fetch()
+    if (!response.ok()) return route.fulfill({ response })
+    const assets = await response.json()
+    await route.fulfill({ response, json: assets.map((asset: { id: string }) => [first.id, second.id].includes(asset.id) ? { ...asset, kind: 'generated' } : asset) })
+  })
   await page.goto('/')
   await expect(page.getByText('历史消息 11', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '清空会话', exact: true }).click()
@@ -68,6 +75,39 @@ test('image management clears conversation text while preserving works and delet
   await viewer.getByRole('button', { name: '关闭', exact: true }).click()
   await page.locator('.composer').getByRole('button', { name: '历史参考图' }).click()
   const library = page.getByRole('dialog', { name: '参考图库', exact: true })
+  await expect(library.getByLabel('参考图来源项目')).toHaveValue(project.id)
+  await expect(library.getByRole('button', { name: /^选用参考图 / })).toHaveCount(2)
+  await expect(library.getByText('生成 · 作品管理验收', { exact: true })).toBeVisible()
+  await expect(library.getByText('上传 · 作品管理验收', { exact: true })).toBeVisible()
+  await library.getByRole('button', { name: `修改图片名称 ${second.name}`, exact: true }).click()
+  const renaming = page.getByRole('dialog', { name: '修改图片名称', exact: true })
+  await renaming.getByLabel('图片名称', { exact: true }).fill('取消修改')
+  await renaming.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(library.getByRole('button', { name: `选用参考图 ${second.name}`, exact: true })).toBeVisible()
+  let failRename = true
+  await page.route(`**/api/assets/${second.id}`, route => {
+    if (route.request().method() === 'PATCH' && failRename) { failRename = false; return route.fulfill({ status: 503, json: { error: '名称暂时无法保存' } }) }
+    return route.continue()
+  })
+  await library.getByRole('button', { name: `修改图片名称 ${second.name}`, exact: true }).click()
+  await renaming.getByLabel('图片名称', { exact: true }).fill('  ')
+  await expect(renaming.getByRole('button', { name: '保存名称' })).toBeDisabled()
+  const renamed = `试拍生成作品-${randomUUID()}.png`
+  await renaming.getByLabel('图片名称', { exact: true }).fill(renamed)
+  await renaming.getByRole('button', { name: '保存名称' }).click()
+  await expect(renaming.getByRole('alert')).toContainText('暂时无法保存')
+  await renaming.getByRole('button', { name: '保存名称' }).click()
+  await expect(renaming).toHaveCount(0)
+  await expect(library.getByRole('button', { name: `选用参考图 ${renamed}`, exact: true })).toBeVisible()
+  expect((await (await request.get(`/api/projects/${project.id}`)).json()).assets.find((asset: { id: string }) => asset.id === second.id).name).toBe(renamed)
+  expect((await request.get(`/api/assets/${second.id}/content`)).status()).toBe(200)
+  for (const viewport of [page.viewportSize()!, { width: 700, height: 607 }, { width: 1280, height: 900 }]) {
+    await page.setViewportSize(viewport)
+    expect(await library.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false)
+    const actions = library.locator('.reference-item-actions').first()
+    for (const button of await actions.getByRole('button').all()) expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44)
+    await page.screenshot({ path: testInfo.outputPath(`reference-management-${viewport.width}.png`) })
+  }
   await library.getByLabel('搜索参考图').fill(source.name)
   await library.getByRole('button', { name: `删除参考图 ${source.name}`, exact: true }).click()
   await deleting.getByRole('button', { name: '确认删除图片', exact: true }).click()
@@ -92,7 +132,7 @@ test('historical references can be searched and reused in image forms and chat a
   const submitted: Record<string, unknown>[] = []
   await page.route('**/api/projects/*/chat', route => { submitted.push(route.request().postDataJSON()); return route.fulfill({ status: 202, json: { id: randomUUID() } }) })
   let failListing = true
-  await page.route('**/api/references', route => failListing ? route.fulfill({ status: 503, json: { error: '参考图库暂时离线' } }) : route.continue())
+  await page.route('**/api/references*', route => failListing ? route.fulfill({ status: 503, json: { error: '参考图库暂时离线' } }) : route.continue())
   await page.goto('/')
   await expect(page.getByLabel('创作需求')).toBeEnabled()
   await page.getByRole('button', { name: '做图片', exact: true }).click()
@@ -103,6 +143,7 @@ test('historical references can be searched and reused in image forms and chat a
   await expect(library.getByRole('alert')).toContainText('暂时离线')
   failListing = false
   await library.getByRole('button', { name: '刷新参考图库' }).click()
+  await expect(library.getByLabel('参考图来源项目')).toHaveValue(target.id)
   await library.getByLabel('搜索参考图').fill(name)
   await library.getByLabel('参考图来源项目').selectOption(target.id)
   await expect(library.getByText('没有匹配的参考图')).toBeVisible()
@@ -332,6 +373,53 @@ test('image forms submit directly with explicit source and reuse failed request 
   expect(submitted[3]).not.toHaveProperty('directImage')
 })
 
+test('model shoot accepts optional and shared references and remembers categories', async ({ page, request }) => {
+  test.setTimeout(90000)
+  const project = await (await request.post('/api/projects', { data: { title: '可选参考试拍' } })).json()
+  const buffer = await sharp(resolve('public/reference-interior.jpg')).resize(320, 240).png().toBuffer()
+  const assets: { id: string }[] = []
+  for (const name of ['model.png', 'pose.png', 'product.png']) assets.push(await (await request.post(`/api/projects/${project.id}/uploads`, { multipart: { file: { name, mimeType: 'image/png', buffer } } })).json())
+  await page.addInitScript(id => localStorage.setItem('qwen-project', id), project.id)
+  await page.route('**/api/health', route => route.fulfill({ json: { storage: 'ready', agentConfigured: true, agent: 'configured', models: { images: ['gpt-image-2.5-flare'], videos: [] } } }))
+  const submitted: { assetIds: string[]; text: string; directImage: { operation: string; sourceAssetId: string } }[] = []
+  await page.route('**/api/projects/*/chat', route => { submitted.push(route.request().postDataJSON()); return route.fulfill({ status: 202, json: { id: randomUUID() } }) })
+  await page.goto('/')
+  await page.getByRole('button', { name: '模特试拍', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '模特试拍', exact: true })
+  await dialog.getByLabel('模特类型', { exact: true }).selectOption('feet')
+  await dialog.getByLabel('商品类别', { exact: true }).selectOption('shoes')
+  await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+  await page.reload()
+  await page.getByRole('button', { name: '模特试拍', exact: true }).click()
+  await expect(dialog.getByLabel('模特类型', { exact: true })).toHaveValue('feet')
+  await expect(dialog.getByLabel('商品类别', { exact: true })).toHaveValue('shoes')
+  const roles = ['模特', '姿势', '商品']
+  const combinations = [[0, 1, 1], [0, 0, 0], [null, 1, 2], [0, null, 2], [0, 1, null], [null, null, 2], [null, 1, null], [0, null, null]]
+  for (const [index, combination] of combinations.entries()) {
+    if (index) await page.getByRole('button', { name: '模特试拍', exact: true }).click()
+    if (index === 5) await dialog.getByLabel('商品类别', { exact: true }).selectOption('stockings')
+    for (const [roleIndex, value] of combination.entries()) await dialog.getByLabel(`选择${roles[roleIndex]}参考图`, { exact: true }).selectOption(value === null ? '' : assets[value].id)
+    await dialog.getByRole('button', { name: '合并参考图', exact: true }).click()
+    await expect(dialog.getByRole('img', { name: '模特、姿势和商品合并预览' })).toBeVisible()
+    const ids = [...new Set(combination.filter((value): value is number => value !== null).map(value => assets[value].id))]
+    const prompt = await dialog.getByLabel('拍摄提示词', { exact: true }).inputValue()
+    for (const [roleIndex, value] of combination.entries()) {
+      if (value !== null) expect(prompt).toContain(`${roles[roleIndex]}参考图：参考图${ids.indexOf(assets[value].id) + 1}`)
+      else expect(prompt).toContain(`未指定${roles[roleIndex]}参考`)
+    }
+    for (const match of prompt.matchAll(/参考图(\d+)/g)) expect(Number(match[1])).toBeLessThanOrEqual(ids.length)
+    expect(prompt).not.toMatch(/冷白|蓝色闪粉/)
+    expect(prompt).not.toContain('来自模特图')
+    await dialog.getByRole('button', { name: '生成新作品' }).click()
+    await expect(dialog).toHaveCount(0)
+    expect(submitted[index]).toMatchObject({ assetIds: ids, directImage: { operation: 'edit', sourceAssetId: ids[0] } })
+  }
+  await page.getByRole('button', { name: '模特试拍', exact: true }).click()
+  for (const role of roles) await dialog.getByLabel(`选择${role}参考图`, { exact: true }).selectOption('')
+  await expect(dialog.getByRole('button', { name: '合并参考图', exact: true })).toBeDisabled()
+  expect(submitted).toHaveLength(combinations.length)
+})
+
 test('model shoot combines three roles, preserves prompt edits and retries the same direct request', async ({ page, request }, testInfo) => {
   test.setTimeout(90000)
   const project = await (await request.post('/api/projects', { data: { title: '模特试拍验收' } })).json()
@@ -357,6 +445,8 @@ test('model shoot combines three roles, preserves prompt edits and retries the s
   await dialog.getByLabel('选择姿势参考图', { exact: true }).selectOption(pose.id)
   await dialog.getByRole('button', { name: '从图库选择商品参考图', exact: true }).click()
   const library = page.getByRole('dialog', { name: '参考图库', exact: true })
+  await expect(library.getByLabel('参考图来源项目')).toHaveValue(project.id)
+  await library.getByLabel('参考图来源项目').selectOption(history.id)
   await library.getByLabel('搜索参考图').fill(product.name)
   await library.getByRole('button', { name: `选用参考图 ${product.name}`, exact: true }).click()
   await expect(library).toHaveCount(0)
