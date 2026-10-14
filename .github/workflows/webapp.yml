@@ -44,7 +44,6 @@ jobs:
       AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
       ACR_NAME: ${{ vars.ACR_NAME }}
       IMAGE_REPOSITORY: qwen-studio
-      RELEASE_EVIDENCE: ${{ runner.temp }}/release-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,6 +52,7 @@ jobs:
       - name: Build production image
         run: |
           set -euo pipefail
+          echo "RELEASE_EVIDENCE=$RUNNER_TEMP/release-evidence" >> "$GITHUB_ENV"
           test -n "$ACR_NAME"
           IMAGE="$ACR_NAME.azurecr.io/$IMAGE_REPOSITORY:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "RELEASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
@@ -84,6 +84,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.RELEASE_EVIDENCE }}
+          path: ${{ runner.temp }}/release-evidence
           if-no-files-found: ignore
           retention-days: 30
