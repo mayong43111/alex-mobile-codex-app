@@ -2,6 +2,20 @@
 
 公开脱敏记录：以下资源名、域名、地址、零值 UUID 及 REDACTED 标记均为示例或占位符，不能作为当前环境的操作参数。
 
+## GitHub Actions 发布
+
+`.github/workflows/webapp.yml` 仅在推送 tag 或手动运行时触发，普通分支推送和 PR 不触发。手动发布选择 `main`；tag 发布使用该 tag 对应的提交。生产任务串行执行，不自动取消正在发布的任务。
+
+GitHub `production` Environment 配置以下 Variables，不使用发布密码：`AZURE_CLIENT_ID`、`AZURE_TENANT_ID`、`AZURE_SUBSCRIPTION_ID`、`AZURE_RESOURCE_GROUP`、`AZURE_WEBAPP_NAME`、`ACR_NAME`。环境部署规则允许 `main` 分支和发布 tag。Azure 独立用户分配托管身份的联邦凭据使用 issuer `https://token.actions.githubusercontent.com`、audience `api://AzureADTokenExchange`、subject `repo:OWNER/REPOSITORY:environment:production`。仅给该身份目标 Web App 范围的 Website Contributor，以及目标 ACR 范围的 AcrPush 和 Reader，不更改应用运行时身份及其模型权限。
+
+流水线先执行 lint、构建、后端测试及发布脚本测试，再构建 `runtime/Dockerfile` 的 `webapp` 阶段。实际生产镜像在禁用网络的容器中执行 Node/Python 回归；通过后推送独立版本标签，使用镜像摘要部署，防止可变标签指向其他内容。
+
+`deploy/release-webapp.mjs` 自动执行空闲和配置检查、停站后的 SQLite 备份、只更新容器镜像、启动与有界就绪等待。SQLite 始终保留在持久化 `/home/studio/data/studio.sqlite`，不搬迁或重新导入；备份保存在 `/home/studio/backups/<release-tag>/`。必须保持 `WEBSITES_ENABLE_APP_SERVICE_STORAGE=true` 和单实例运行，不能让新旧容器并发写同一 SQLite。
+
+发布成功须同时满足：线上首页及 JS/CSS 与生产镜像的 SHA-256 一致，健康/PWA/会话入口正常，匿名私有 API 被拒绝，Entra 跳转正确，原有应用设置、认证、身份和网络不变，数据库完整性与业务记录数量保持。GitHub artifact 只保存非敏感验收记录，不上传数据库、令牌或应用设置。
+
+切换失败时尝试先停站、恢复旧镜像并验证旧首页，不自动还原数据库或重试模型任务。若出现新的活动任务、备份/回滚失败或配置变化，流水线失败并要求人工核对；不要盲目重新运行。中途手动取消 runner 也需要检查站点状态，不能假设回滚已执行。流水线不启动 GPU，不执行收费生成；线上登录后的实际生成效果需单独验收。
+
 ## 配置参数
 
 `deploy/configure-webapp.mjs` 没有真实账户或镜像默认值。运行前必须在终端提供以下环境变量；缺失时在调用 Azure 前退出：

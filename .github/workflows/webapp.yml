@@ -1,0 +1,89 @@
+name: Web App CI and Release
+
+on:
+  push:
+    tags: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+          registry-url: https://packagefeedproxy.microsoft.io/npm/
+      - run: npm ci --registry=https://packagefeedproxy.microsoft.io/npm/
+        working-directory: app
+      - run: npm run lint && npm run build && npm test
+        working-directory: app
+      - run: node --test deploy/*.test.mjs
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    concurrency:
+      group: production-webapp
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      IMAGE_REPOSITORY: qwen-studio
+      RELEASE_EVIDENCE: ${{ runner.temp }}/release-evidence
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Build production image
+        run: |
+          set -euo pipefail
+          test -n "$ACR_NAME"
+          IMAGE="$ACR_NAME.azurecr.io/$IMAGE_REPOSITORY:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "RELEASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build --target webapp --file runtime/Dockerfile --tag "$IMAGE" .
+      - name: Test actual production image without network
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint node "$RELEASE_IMAGE" --experimental-strip-types --experimental-vm-modules --test app/server/app.test.ts app/server/auth.test.ts app/server/avatar.test.ts runtime/attachments.test.mjs runtime/decision.test.mjs runtime/gateway.test.mjs runtime/persistence.test.mjs runtime/webapp.test.mjs
+          docker run --rm --network none --entrypoint /opt/venv/bin/python "$RELEASE_IMAGE" -m unittest discover -s runtime -p 'test_*.py'
+          mkdir -p "$RELEASE_EVIDENCE"
+          docker run --rm --network none --entrypoint node --volume "$PWD/deploy:/opt/validation:ro" "$RELEASE_IMAGE" /opt/validation/image-hashes.mjs > "$RELEASE_EVIDENCE/frontend-hashes.json"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Push validated image
+        run: |
+          set -euo pipefail
+          az acr login --name "$ACR_NAME"
+          docker push "$RELEASE_IMAGE"
+          DIGEST=$(az acr repository show --name "$ACR_NAME" --image "${RELEASE_IMAGE#*/}" --query digest -o tsv)
+          test -n "$DIGEST"
+          echo "RELEASE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+      - name: Back up, release and verify
+        run: node deploy/release-webapp.mjs
+      - name: Preserve non-secret release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_EVIDENCE }}
+          if-no-files-found: ignore
+          retention-days: 30
