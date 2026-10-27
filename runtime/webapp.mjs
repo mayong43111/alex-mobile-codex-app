@@ -37,7 +37,10 @@ const children = new Set()
 let stopping = false
 let exitCode = 0
 let forceStop
-const startup = setTimeout(() => stop(1), 60000)
+const startup = setTimeout(() => {
+  console.error('Runtime gateway did not become ready within 180 seconds')
+  stop(1)
+}, 180000)
 function stop(code) {
   if (stopping) return
   stopping = true

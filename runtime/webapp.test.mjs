@@ -12,10 +12,12 @@ test('WebApp passes native avatar configuration only to the authenticated API pr
   const env = { WEBSITE_HOSTNAME: 'studio.example', ENTRA_TENANT_ID: identifier, ENTRA_CLIENT_ID: identifier, ENTRA_CLIENT_SECRET: 'test-secret', ENTRA_ALLOWED_USER_IDS: identifier, AZURE_GPT_ENDPOINT: 'https://model.example', AZURE_GPT_DEPLOYMENT: 'gpt', AZURE_IMAGE_ENDPOINT: 'https://model.example', AZURE_IMAGE_DEPLOYMENT: 'image', AZURE_MODEL_SUBSCRIPTION: identifier, AZURE_STORAGE_BLOB_ENDPOINT: 'https://storage.blob.core.windows.net', AZURE_STORAGE_CONTAINER: 'assets', COMFYUI_SERVER_URL: 'http://10.252.0.4:8188', SPEECH_AVATAR_ENDPOINT: 'https://speech.cognitiveservices.azure.com', OPENMONTAGE_AVATAR_ENABLED: '1', IDENTITY_ENDPOINT: 'http://identity.local', IDENTITY_HEADER: 'private-identity-header', PATH: '/test/bin' }
   const children = []
   const written = []
+  const timers = []
+  const cleared = []
   env.AZURE_OPENAI_API_KEY = 'legacy-key-must-not-reach-workers'
   env.COMFYUI_T4_URL = 'http://10.48.1.5:8189'
   env.COMFYUI_T4_TOKEN = 'fixture-private-proxy-token'
-  const context = createContext({ process: { env, execPath: '/usr/local/bin/node', once() {} }, setTimeout: () => ({ unref() {} }), clearTimeout() {} })
+  const context = createContext({ process: { env, execPath: '/usr/local/bin/node', once() {} }, setTimeout: (callback, milliseconds) => { const timer = { callback, milliseconds, unref() {} }; timers.push(timer); return timer }, clearTimeout: timer => { cleared.push(timer) } })
   const modules = {
     'node:fs/promises': { mkdir: async () => {}, writeFile: async (_path, content) => { written.push(JSON.parse(content)) }, mkdtemp: async () => '/tmp/test' },
     'node:crypto': { randomBytes: () => Buffer.from('test-runtime-token') },
@@ -26,6 +28,7 @@ test('WebApp passes native avatar configuration only to the authenticated API pr
   const launcher = new SourceTextModule(source, { context })
   await launcher.link(name => new SyntheticModule(Object.keys(modules[name]), function () { for (const [key, value] of Object.entries(modules[name])) this.setExport(key, value) }, { context }))
   await launcher.evaluate()
+  assert.equal(timers[0].milliseconds, 180000)
   assert.equal(children.length, 1)
   assert.equal(children[0].options.env.OPENMONTAGE_AVATAR_ENABLED, undefined)
   assert.equal(children[0].options.env.IDENTITY_HEADER, undefined)
@@ -39,6 +42,7 @@ test('WebApp passes native avatar configuration only to the authenticated API pr
   assert.deepEqual(written[0].image.deployments, { 'gpt-image-2.5-flare': 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst': 'gpt-image-2.5-sunburst' })
   assert(!JSON.stringify(written).includes(env.AZURE_OPENAI_API_KEY))
   children[0].emit('message', { type: 'ready' })
+  assert.equal(cleared.includes(timers[0]), true)
   assert.equal(children.length, 2)
   const api = children[1].options.env
   assert.equal(api.OPENMONTAGE_AVATAR_ENABLED, '1')
