@@ -4,6 +4,11 @@ on:
   push:
     tags: ['**']
   workflow_dispatch:
+    inputs:
+      security_patch:
+        description: 'Patch a stopped site; never restart the previous image on failure'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.23.2
+          node-version: 22.23.4
           cache: npm
           cache-dependency-path: app/package-lock.json
           registry-url: https://packagefeedproxy.microsoft.io/npm/
@@ -44,11 +49,12 @@ jobs:
       AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
       ACR_NAME: ${{ vars.ACR_NAME }}
       IMAGE_REPOSITORY: qwen-studio
+      SECURITY_PATCH: ${{ inputs.security_patch == true && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.23.2
+          node-version: 22.23.4
       - name: Build production image
         run: |
           set -euo pipefail
@@ -56,10 +62,11 @@ jobs:
           test -n "$ACR_NAME"
           IMAGE="$ACR_NAME.azurecr.io/$IMAGE_REPOSITORY:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "RELEASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          docker build --target webapp --file runtime/Dockerfile --tag "$IMAGE" .
+          docker build --pull --target webapp --file runtime/Dockerfile --tag "$IMAGE" .
       - name: Test actual production image without network
         run: |
           set -euo pipefail
+          docker run --rm --network none --entrypoint node "$RELEASE_IMAGE" -e 'require("node:assert/strict").equal(process.version, "v22.23.4"); console.log(JSON.stringify({ node: process.version, brotli: process.versions.brotli }))'
           docker run --rm --network none --entrypoint node "$RELEASE_IMAGE" --experimental-strip-types --experimental-vm-modules --test app/server/app.test.ts app/server/auth.test.ts app/server/avatar.test.ts runtime/attachments.test.mjs runtime/decision.test.mjs runtime/gateway.test.mjs runtime/persistence.test.mjs runtime/webapp.test.mjs
           docker run --rm --network none --entrypoint /opt/venv/bin/python "$RELEASE_IMAGE" -m unittest discover -s runtime -p 'test_*.py'
           mkdir -p "$RELEASE_EVIDENCE"

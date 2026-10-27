@@ -24,10 +24,62 @@ export function checkConfiguration(before, after, image) {
   }
 }
 
-export async function runRelease(adapter, image) {
+export function backupCleanupScript(backup, { root = '/home/studio/backups', dryRun = false } = {}) {
+  const options = Buffer.from(JSON.stringify({ backup, root, dryRun })).toString('base64')
+  return `import base64, hashlib, json, pathlib, re, sqlite3, stat
+options = json.loads(base64.b64decode('${options}'))
+root = pathlib.Path(options['root'])
+kept = pathlib.Path(options['backup']['backup'])
+assert root.is_absolute() and root.resolve() == root, 'Backup root must be canonical'
+assert kept.parent.parent == root and kept.name == 'studio.sqlite', 'Backup is outside the retention scope'
+assert re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]*', kept.parent.name), 'Invalid release directory'
+assert kept.resolve() == kept and stat.S_ISREG(kept.lstat().st_mode), 'Kept backup must be a regular file without symlinks'
+kept_stat = kept.stat()
+assert kept_stat.st_size == options['backup']['bytes'] and kept_stat.st_size > 0, 'Kept backup size mismatch'
+assert hashlib.sha256(kept.read_bytes()).hexdigest() == options['backup']['sha256'], 'Kept backup hash mismatch'
+with sqlite3.connect(kept.as_uri() + '?mode=ro', uri=True) as database:
+  assert database.execute('PRAGMA integrity_check').fetchone()[0] == 'ok', 'Kept backup integrity failed'
+database.close()
+result = {'state': 'dry-run' if options['dryRun'] else 'completed', 'kept': str(kept), 'removed': [], 'candidates': [], 'skipped': []}
+entries = []
+for entry in sorted(root.iterdir()):
+  if entry == kept.parent:
+    continue
+  if entry.is_symlink() or entry.resolve().parent != root:
+    result['skipped'].append(str(entry))
+  elif entry.is_dir() and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]*', entry.name):
+    entries.extend(sorted(entry.iterdir()))
+  else:
+    entries.append(entry)
+for snapshot in entries:
+  if (not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]*[.]sqlite', snapshot.name)
+      or snapshot.is_symlink() or snapshot.resolve() != snapshot
+      or not stat.S_ISREG(snapshot.lstat().st_mode)
+      or snapshot.stat().st_mtime_ns > kept_stat.st_mtime_ns):
+    result['skipped'].append(str(snapshot))
+    continue
+  with snapshot.open('rb') as source:
+    if source.read(16) != b'SQLite format 3\\x00':
+      result['skipped'].append(str(snapshot))
+      continue
+  if snapshot.parent != root and snapshot.parent.parent != root:
+    result['skipped'].append(str(snapshot))
+    continue
+  result['candidates'].append(str(snapshot))
+  if not options['dryRun']:
+    current = kept.stat()
+    assert (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) == (kept_stat.st_dev, kept_stat.st_ino, kept_stat.st_size, kept_stat.st_mtime_ns), 'Kept backup changed during cleanup'
+    snapshot.unlink()
+    if snapshot.parent != root and not any(snapshot.parent.iterdir()):
+      snapshot.parent.rmdir()
+    result['removed'].append(str(snapshot))
+print(json.dumps(result))`
+}
+
+export async function runRelease(adapter, image, { securityPatch = false } = {}) {
   const before = await adapter.configuration()
-  if (before.state !== 'Running' || !before.image?.startsWith('DOCKER|') || before.image === image) throw new Error('Expected a running site on the previous Docker image')
-  const oldHashes = await adapter.currentHashes()
+  if (!(securityPatch ? ['Running', 'Stopped'].includes(before.state) : before.state === 'Running') || !before.image?.startsWith('DOCKER|') || before.image === image) throw new Error('Expected an eligible site on the previous Docker image')
+  const oldHashes = securityPatch ? null : await adapter.currentHashes()
   const initial = await adapter.database()
   checkDatabase(initial)
   adapter.record('before', { image: before.image, database: initial, oldHashes })
@@ -35,6 +87,7 @@ export async function runRelease(adapter, image) {
   if (!isDeepStrictEqual(before, current)) throw new Error('Production baseline changed before stopping')
   checkDatabase(await adapter.database())
   let stopAttempted = false
+  let verifiedBackup
   try {
     stopAttempted = true
     await adapter.stop()
@@ -53,8 +106,19 @@ export async function runRelease(adapter, image) {
       if (backup.counts[table] !== database.counts[table]) throw new Error(`Database counts changed: ${table}; reconcile before accepting release`)
     }
     adapter.record('result', { state: 'verified', image, previousImage: before.image, configurationUnchanged: true, database })
+    verifiedBackup = backup
   } catch (error) {
     adapter.record('failure', { message: error.message })
+    if (securityPatch && stopAttempted) {
+      try {
+        await adapter.stop()
+        adapter.record('rollback', { state: 'stopped-for-security', previousImage: before.image, oldImageRestarted: false })
+      } catch (stopError) {
+        adapter.record('rollback', { state: 'requires-attention', message: stopError.message, oldImageRestarted: false })
+        throw new AggregateError([error, stopError], 'Security patch failed; stopping needs operator attention')
+      }
+      throw error
+    }
     if (stopAttempted) {
       try {
         checkDatabase(await adapter.database())
@@ -70,6 +134,16 @@ export async function runRelease(adapter, image) {
       }
     }
     throw error
+  }
+  if (securityPatch) {
+    adapter.record('retention', { state: 'preserved-for-security', kept: verifiedBackup.backup })
+    return
+  }
+  try {
+    adapter.record('retention', await adapter.pruneBackups(verifiedBackup))
+  } catch (error) {
+    adapter.record('retention', { state: 'failed', message: error.message })
+    throw new Error('Release verified but backup cleanup failed; the new image remains running', { cause: error })
   }
 }
 
@@ -162,6 +236,15 @@ print(json.dumps(result))`
   return {
     image,
     configuration, database, record,
+    pruneBackups: async backup => {
+      const script = backupCleanupScript(backup)
+      const command = `python3 -c "import base64;exec(base64.b64decode('${Buffer.from(script).toString('base64')}'))"`
+      const response = await request(`https://${site}.scm.azurewebsites.net/api/command`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ command, dir: '/home' }),
+      })
+      if (response.ExitCode !== 0) throw new Error('SCM backup cleanup failed; inspect retained snapshots before retrying')
+      return JSON.parse(response.Output)
+    },
     currentHashes: async () => {
       const response = await get('/')
       if (response.status !== 200) throw new Error('Current production homepage is unavailable')
@@ -216,7 +299,7 @@ print(json.dumps(result))`
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const adapter = createAdapter(process.env)
-    await runRelease(adapter, adapter.image)
+    await runRelease(adapter, adapter.image, { securityPatch: process.env.SECURITY_PATCH === 'true' })
   } catch (error) {
     console.error(error.message)
     process.exitCode = 1

@@ -1,4 +1,4 @@
-FROM node:22.23.2-bookworm-slim AS web-build
+FROM node:22.23.4-bookworm-slim AS web-build
 WORKDIR /opt/web
 COPY app/package.json app/package-lock.json ./
 ARG NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
@@ -6,7 +6,7 @@ RUN npm ci
 COPY app/ ./
 RUN npm run build
 
-FROM node:22.23.2-bookworm-slim AS runtime
+FROM node:22.23.4-bookworm-slim AS runtime
 ARG OPENMONTAGE_REV=08e2151fa02de28a5d6a312b3d575692bf147ad7
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
