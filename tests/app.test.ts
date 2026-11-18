@@ -8,7 +8,7 @@ import type { ChatState } from '@microsoft/agent-host-protocol'
 import { fixture, connect, until, modelCatalogFixture } from './helpers.js'
 import { ToolRegistry } from '../server/tools.js'
 import { readConfig } from '../server/config.js'
-import { hashPassword } from '../server/auth.js'
+import { checkPassword, hashPassword } from '../server/auth.js'
 import { importAccounts } from '../server/bootstrap.js'
 import { defaultSkills } from '../src/shared.js'
 import { AgentHost } from '../server/host.js'
@@ -85,7 +85,8 @@ test('manually imported legacy Argon2 credentials can log in and change to a new
   const f = await fixture(t)
   const salt = Buffer.alloc(16, 7)
   const key = argon2Sync('argon2id', { message: 'legacy-password', nonce: salt, parallelism: 1, memory: 65536, passes: 3, tagLength: 32 })
-  const password = `$argon2id$v=19$m=65536,t=3,p=1$${salt.toString('base64').replace(/=+$/, '')}$${key.toString('base64').replace(/=+$/, '')}`
+  const password = `$argon2id$v=19$m=65536,p=1,t=3$${salt.toString('base64').replace(/=+$/, '')}$${key.toString('base64').replace(/=+$/, '')}`
+  assert.equal(await checkPassword('legacy-password', password.replace('m=65536,p=1,t=3', 'm=65536,t=3,p=1')), true)
   await importAccounts(f.store, JSON.stringify([{ username: 'legacy-fixture', password }]))
   const login = (password: string) => f.app.inject({
     method: 'POST', url: '/api/login', headers: { origin: f.config.origin }, payload: { username: 'legacy-fixture', password },

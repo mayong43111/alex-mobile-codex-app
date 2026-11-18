@@ -5,7 +5,7 @@ import { z } from 'zod'
 const derive = promisify(scrypt)
 const deriveArgon2 = promisify(argon2)
 export const passwordSchema = z.string().min(6).max(256)
-export const storedPasswordSchema = z.string().regex(/^(?:scrypt:[a-f0-9]{32}:[a-f0-9]{128}|\$argon2id\$v=19\$m=65536,t=3,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43})$/)
+export const storedPasswordSchema = z.string().regex(/^(?:scrypt:[a-f0-9]{32}:[a-f0-9]{128}|\$argon2id\$v=19\$m=65536,(?:t=3,p=1|p=1,t=3)\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43})$/)
 export const credentialsSchema = z.object({
   username: z.string().regex(/^[a-z0-9][a-z0-9._-]{2,63}$/),
   password: passwordSchema,
