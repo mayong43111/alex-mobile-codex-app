@@ -47,7 +47,7 @@ test('development UI supports React HMR without exposing backend or workspace fi
       await closed
     }
     assert.equal((await read('/server/config.ts')).status, 403)
-    assert.equal((await read('/README.md')).status, 403)
+    assert.equal((await read('/package.json')).status, 403)
     assert.equal((await read('/api/unknown')).status, 401)
     t.diagnostic('HTTP and HMR verification complete')
   } finally {
