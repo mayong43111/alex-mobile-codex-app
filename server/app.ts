@@ -168,7 +168,11 @@ export async function buildApp(config: Config, options: { agent?: Agent; store?:
         reply.hijack()
         vite.middlewares(request.raw, reply.raw)
       })
-      app.addHook('onClose', async () => vite.close())
+      app.addHook('onClose', async () => {
+        // Cold pre-bundling must finish before transforms waiting on it are closed.
+        await vite.waitForRequestsIdle()
+        await vite.close()
+      })
     }
   }
   app.addHook('onClose', async () => { await host.close(); await store.close() })
