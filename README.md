@@ -135,6 +135,8 @@ SDK 的 `sessionFs` 接口将原生 transcript/checkpoint 同步写入托管数�
 
 首次部署由操作员临时授权站点身份初始化新 SQL，使用
 `deploy/schema.sql` 创建表及仅有 DML 权限的 `copilot-mobile-runtime` 用户。
+SQL 用户 SID 使用托管身份的 client ID；初始化从平台令牌读取并核对站点 principal ID，
+不需要 Microsoft Graph 目录读取权限。
 `STUDIO_BOOTSTRAP_USERS` 是仅迁移账号哈希的一次性受保护环境 Secret，
 不包含登录 Cookie、会话或图片，也不能覆盖已有的不同凭据。
 初始化执行真实 SQL/Blob/会话文件验证并清理验证数据。

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { fixture } from './helpers.js'
 import { SessionFiles } from '../server/session-files.js'
-import { importAccounts } from '../server/bootstrap.js'
+import { importAccounts, sqlRuntimeClientId } from '../server/bootstrap.js'
 import { hashPassword } from '../server/auth.js'
 import { readConfig } from '../server/config.js'
 
@@ -52,4 +52,15 @@ test('account bootstrap is idempotent and refuses credential replacement', async
   assert.deepEqual(await f.store.user('imported'), first)
   assert.throws(() => readConfig({ SQL_SERVER: 'sql-fixture.database.windows.net', SQL_DATABASE: 'fixture' }), /together/)
   assert.throws(() => readConfig({ SQL_SERVER: 'sql-fixture.database.windows.net', SQL_DATABASE: 'fixture', AZURE_BLOB_CONTAINER_URL: 'https://storage.blob.core.windows.net/private?sig=not-allowed' }), /without credentials/)
+})
+
+test('SQL managed-identity SID uses the client ID and verifies the expected object ID', () => {
+  const principal = randomUUID()
+  const clientId = randomUUID()
+  const token = (claims: object) => `header.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.signature`
+  assert.equal(sqlRuntimeClientId(token({ oid: principal, appid: clientId }), principal), clientId)
+  assert.equal(sqlRuntimeClientId(token({ oid: principal, azp: clientId }), principal), clientId)
+  assert.throws(() => sqlRuntimeClientId(token({ oid: randomUUID(), appid: clientId }), principal), /does not match/)
+  assert.throws(() => sqlRuntimeClientId(token({ oid: principal }), principal), /missing its client ID/)
+  assert.throws(() => sqlRuntimeClientId('invalid', principal), /Invalid managed-identity token metadata/)
 })
