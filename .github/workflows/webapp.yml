@@ -54,10 +54,3 @@ jobs:
         env:
           RELEASE_RECORD_DIR: ${{ runner.temp }}/copilot-mobile-release
         run: node deploy/release-webapp.mjs
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: copilot-mobile-release-${{ github.run_id }}
-          path: ${{ runner.temp }}/copilot-mobile-release
-          retention-days: 30
-          if-no-files-found: ignore
