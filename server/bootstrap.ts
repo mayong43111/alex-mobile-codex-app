@@ -5,10 +5,11 @@ import { connectSqlPool, SqlServerDatabase } from './database.js'
 import { Store } from './store.js'
 import { verifyStorage } from './storage-probe.js'
 import { createAzureCredential } from './models.js'
+import { storedPasswordSchema } from './auth.js'
 
 const accounts = z.array(z.object({
   username: z.string().regex(/^[a-z0-9][a-z0-9._-]{2,63}$/),
-  password: z.string().regex(/^scrypt:[a-f0-9]{32}:[a-f0-9]{128}$/),
+  password: storedPasswordSchema,
 }).strict()).min(1).max(100)
 
 export async function importAccounts(store: Store, raw: string) {

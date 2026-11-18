@@ -39,7 +39,7 @@ export interface ChatModel { id: string; name: string; version: string; provider
 export interface ModelCatalogResponse { models: ChatModel[]; defaultModel?: string; authMode: string }
 export interface ImageModelCatalogResponse extends ModelCatalogResponse { selectedModel?: string }
 export interface UserInfo { id: string; username: string; csrf: string }
-export interface PublicTool { id: string; label: string; skill: SkillId; tools: string[]; configured: boolean }
+export interface PublicTool { id: string; label: string; skill?: SkillId; tools: string[]; configured: boolean }
 export interface Settings {
   skills: SkillChoices
   tools: PublicTool[]

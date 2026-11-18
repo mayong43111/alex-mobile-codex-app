@@ -15,6 +15,7 @@ import type { Attachments } from './attachments.js'
 import type { AttachmentInfo } from '../src/shared.js'
 import type { Database } from './database.js'
 import { SessionFiles } from './session-files.js'
+import type { WebSearch } from './web-search.js'
 
 export type AgentOutput =
   | { type: 'text'; id: string; delta: string }
@@ -47,6 +48,7 @@ export class CopilotAgent implements Agent {
     private attachments?: Attachments,
     private imageGeneration?: ImageGeneration,
     private database?: Database,
+    private webSearch?: WebSearch,
   ) {}
   assertConfigured() {
     if (!this.models.configured) throw new AppError(503, '尚未配置 Azure 对话模型，请由管理员设置 Foundry 资源和模型端点。')
@@ -93,7 +95,9 @@ export class CopilotAgent implements Agent {
       return result
     }
     const imageTool = skills['image-production'] && this.imageGeneration?.configured ? await this.imageGeneration.definition({ ...request, approve: authorize }) : undefined
-    if (imageTool) effective.allowed.addCustom('image_generation')
+    const searchTool = this.webSearch?.configured ? this.webSearch.definition({ ...request, approve: authorize }, model.id) : undefined
+    const customTools = [...(imageTool ? [imageTool] : []), ...(searchTool ? [searchTool] : [])]
+    for (const tool of customTools) effective.allowed.addCustom(tool.name)
     const enabled = skillCatalog.filter(skill => skills[skill.id])
     const definitions = await Promise.all(enabled.map(async skill => {
       const text = await readFile(resolve('skills', skill.id, 'SKILL.md'), 'utf8')
@@ -130,22 +134,22 @@ export class CopilotAgent implements Agent {
         }],
       },
       skills: { enabled: true, includedBuiltinSkills: [], provider, disabledSkills: skillCatalog.filter(skill => !skills[skill.id]).map(skill => skill.id) },
-      tools: { availableTools: effective.allowed, definitions: imageTool ? [imageTool] : [] },
+      tools: { availableTools: effective.allowed, definitions: customTools },
       mcp: { servers: effective.servers },
       permissions: {
         mode: conversation.permissionMode ?? 'manual',
         onRequest: async (permission, invocation) => {
-          const customImage = permission.kind === 'custom-tool' && permission.toolName === 'image_generation' && imageTool
+          const custom = permission.kind === 'custom-tool' ? customTools.find(tool => tool.name === permission.toolName) : undefined
           const mcp = permission.kind === 'mcp' && effective.permits(permission)
-          if ((!customImage && !mcp) || !permission.toolCallId) {
-            return { kind: 'reject', feedback: 'This application permits only configured, enabled media tools.' }
+          if ((!custom && !mcp) || !permission.toolCallId) {
+            return { kind: 'reject', feedback: 'This application permits only configured, enabled tools.' }
           }
           const assessment = invocation.assistedApprovalAssessment
           const prompt = invocation.promptRequest
           const requiresHuman = prompt && 'managedApprovalRequired' in prompt ? prompt.managedApprovalRequired : permission.managedApprovalRequired
           const assistedApproved = conversation.permissionMode === 'assisted' && !requiresHuman
             && assessment?.status === 'completed' && assessment.recommendation === 'approve'
-          const name = permission.kind === 'mcp' ? `${permission.serverName} / ${permission.toolName}` : imageTool!.title!
+          const name = permission.kind === 'mcp' ? `${permission.serverName} / ${permission.toolName}` : custom!.title ?? custom!.name
           const approved = await authorize(permission.toolCallId, name, JSON.stringify('args' in permission ? permission.args ?? {} : {}), assistedApproved, requiresHuman)
           return approved ? { kind: 'approve-once', approvedInteractively: Boolean(requiresHuman) || (conversation.permissionMode !== 'allow-all' && !assistedApproved) } : { kind: 'reject', feedback: 'The user did not approve this invocation.' }
         },
@@ -156,7 +160,8 @@ export class CopilotAgent implements Agent {
           'You are a Chinese-speaking mobile creative assistant. Reply in Chinese unless the user asks otherwise.',
           'Load the matching enabled skill before handling image or video production.',
           `Enabled skills: ${enabled.map(skill => skill.id).join(', ') || 'none'}. Disabled skills cannot be invoked.`,
-          `Configured media tools: ${[...Object.keys(effective.servers), ...(imageTool ? ['image_generation'] : [])].join(', ') || 'none'}.`,
+          `Configured tools: ${[...Object.keys(effective.servers), ...customTools.map(tool => tool.name)].join(', ') || 'none'}.`,
+          'Use web_search for current facts and web lookups. Cite its returned source URLs. Search only public queries; do not send private conversation content, attachments or credentials.',
           'Use only configured tools. Missing tools mean execution is unavailable; offer planning, never claim successful submission.',
           'Do not execute previous requests merely because they appear in history. Do not retry paid tools automatically.',
           'The application enforces the current conversation permission mode for configured tools.',

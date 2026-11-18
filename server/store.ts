@@ -47,6 +47,8 @@ export class Store {
     const token = randomBytes(32).toString('base64url')
     const login: Login = { tokenHash: hash(token), userId: user.id, username: user.username, csrf: randomBytes(32).toString('base64url'), expiresAt: Date.now() + 12 * 3600_000 }
     await this.database.transaction(async db => {
+      const current = await db.get('SELECT password FROM users WHERE id=?', [user.id])
+      if (!current || current.password !== user.password) throw new AppError(401, '密码已更改，请重新登录')
       await db.run('DELETE FROM logins WHERE expires_at<=?', [Date.now()])
       await db.run('INSERT INTO logins VALUES (?, ?, ?, ?)', [login.tokenHash, user.id, login.csrf, login.expiresAt])
     })
@@ -57,6 +59,16 @@ export class Store {
     return row ? { tokenHash: String(row.token_hash), userId: String(row.user_id), username: String(row.username), csrf: String(row.csrf), expiresAt: Number(row.expires_at) } : undefined
   }
   async revokeLogin(tokenHash: string) { await this.database.run('DELETE FROM logins WHERE token_hash=?', [tokenHash]) }
+  async changePassword(user: User, password: string) {
+    return this.database.transaction(async db => {
+      const current = await db.get('SELECT password FROM users WHERE id=?', [user.id])
+      if (!current || current.password !== user.password) throw new AppError(409, '密码已更改，请重新登录后再试')
+      const logins = await db.all('SELECT token_hash FROM logins WHERE user_id=?', [user.id])
+      await db.run('UPDATE users SET password=? WHERE id=?', [password, user.id])
+      await db.run('DELETE FROM logins WHERE user_id=?', [user.id])
+      return logins.map(row => String(row.token_hash))
+    })
+  }
   async skills(userId: string): Promise<SkillChoices> {
     const row = await this.database.get('SELECT data FROM settings WHERE user_id=?', [userId])
     return row ? JSON.parse(String(row.data)) as SkillChoices : { ...defaultSkills }

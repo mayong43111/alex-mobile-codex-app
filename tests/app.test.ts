@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { argon2Sync, randomUUID } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ActionType, MessageKind, ResponsePartKind, ToolCallConfirmationReason } from '@microsoft/agent-host-protocol'
@@ -9,6 +9,7 @@ import { fixture, connect, until, modelCatalogFixture } from './helpers.js'
 import { ToolRegistry } from '../server/tools.js'
 import { readConfig } from '../server/config.js'
 import { hashPassword } from '../server/auth.js'
+import { importAccounts } from '../server/bootstrap.js'
 import { defaultSkills } from '../src/shared.js'
 import { AgentHost } from '../server/host.js'
 import { FixtureAgent } from './helpers.js'
@@ -49,6 +50,59 @@ test('login, CSRF, ownership and per-user skill choices are enforced', async t =
   const settings = (await f.app.inject({ url: '/api/settings', headers: alice.headers })).json()
   assert.equal(settings.model.configured, false)
   assert.equal(JSON.stringify(settings).includes('password'), false)
+})
+
+test('password changes require the current password and revoke every session without affecting other users', async t => {
+  const f = await fixture(t)
+  const stale = (await f.store.user('alice'))!
+  const alice = await f.login()
+  const otherDevice = await f.login()
+  const bob = await f.login('bob')
+  const socket = await connect(f.wsUrl, otherDevice.cookie, 'ahp-root://')
+  const closed = new Promise<number>(resolve => socket.socket.once('close', resolve))
+  const change = (currentPassword: string, newPassword: string, headers = alice.headers) => f.app.inject({
+    method: 'POST', url: '/api/password', headers, payload: { currentPassword, newPassword },
+  })
+  assert.equal((await change('wrong-password', 'new-password-123')).statusCode, 400)
+  assert.equal((await change('test-password-1234', 'short')).statusCode, 400)
+  assert.equal((await change('test-password-1234', 'test-password-1234')).statusCode, 400)
+  assert.equal((await change('test-password-1234', 'new-password-123', { ...alice.headers, 'x-csrf-token': '' })).statusCode, 403)
+  assert.equal((await change('test-password-1234', 'new-password-123')).statusCode, 200)
+  assert.equal(await closed, 4001)
+  await socket.client.shutdown()
+  for (const login of [alice, otherDevice]) assert.equal((await f.app.inject({ url: '/api/me', headers: login.headers })).statusCode, 401)
+  assert.equal((await f.app.inject({ url: '/api/me', headers: bob.headers })).statusCode, 200)
+  const login = (password: string) => f.app.inject({
+    method: 'POST', url: '/api/login', headers: { origin: f.config.origin }, payload: { username: 'alice', password },
+  })
+  assert.equal((await login('test-password-1234')).statusCode, 401)
+  assert.equal((await login('new-password-123')).statusCode, 200)
+  await assert.rejects(f.store.createLogin(stale), /密码已更改/)
+  await assert.rejects(f.store.changePassword(stale, await hashPassword('stale-update-password')), /密码已更改/)
+})
+
+test('manually imported legacy Argon2 credentials can log in and change to a new password', async t => {
+  const f = await fixture(t)
+  const salt = Buffer.alloc(16, 7)
+  const key = argon2Sync('argon2id', { message: 'legacy-password', nonce: salt, parallelism: 1, memory: 65536, passes: 3, tagLength: 32 })
+  const password = `$argon2id$v=19$m=65536,t=3,p=1$${salt.toString('base64').replace(/=+$/, '')}$${key.toString('base64').replace(/=+$/, '')}`
+  await importAccounts(f.store, JSON.stringify([{ username: 'legacy-fixture', password }]))
+  const login = (password: string) => f.app.inject({
+    method: 'POST', url: '/api/login', headers: { origin: f.config.origin }, payload: { username: 'legacy-fixture', password },
+  })
+  assert.equal((await login('incorrect-password')).statusCode, 401)
+  const response = await login('legacy-password')
+  assert.equal(response.statusCode, 200)
+  const cookie = response.cookies[0].name + '=' + response.cookies[0].value
+  const changed = await f.app.inject({
+    method: 'POST', url: '/api/password',
+    headers: { cookie, origin: f.config.origin, 'x-csrf-token': response.json().csrf },
+    payload: { currentPassword: 'legacy-password', newPassword: 'updated-legacy-password' },
+  })
+  assert.equal(changed.statusCode, 200)
+  assert.ok((await f.store.user('legacy-fixture'))!.password.startsWith('scrypt:'))
+  assert.equal((await login('legacy-password')).statusCode, 401)
+  assert.equal((await login('updated-legacy-password')).statusCode, 200)
 })
 
 test('official AHP client streams, reconnects and cannot duplicate an accepted turn', async t => {

@@ -21,6 +21,8 @@ p { line-height: 1.6; }
 .login { max-width: 420px; margin: auto; padding: max(60px, 12dvh) 24px 24px; text-align: center; }
 .login form { text-align: left; margin-top: 30px; display: grid; gap: 18px; }
 .login label { display: grid; gap: 8px; font-size: 14px; }
+.password-form { display: grid; gap: 16px; }
+.password-form label { display: grid; gap: 8px; }
 .studio { width: 100%; height: 100dvh; margin: auto; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top); background: var(--panel); }
 .chat-header { display: flex; align-items: center; justify-content: space-between; min-height: 35px; padding: 0 8px 0 12px; flex-shrink: 0; }
 .chat-title { display: flex; align-items: center; gap: 5px; padding: 0 4px; font-size: 11px; font-weight: 600; min-height: 28px; border: 0; background: transparent; }

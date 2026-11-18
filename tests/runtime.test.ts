@@ -18,6 +18,7 @@ import { modelCatalogFixture } from './helpers.js'
 import { Store } from '../server/store.js'
 import { Attachments } from '../server/attachments.js'
 import { ImageGeneration } from '../server/image-generation.js'
+import { WebSearch } from '../server/web-search.js'
 
 for (const remote of [false, true]) test(`real Copilot runtime uses ${remote ? 'durable remote session files' : 'local session files'} through the production adapter`, { timeout: 90_000 }, async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'studio-native-test-'))
@@ -26,10 +27,21 @@ for (const remote of [false, true]) test(`real Copilot runtime uses ${remote ? '
     let body = ''
     for await (const chunk of request) body += chunk
     requests.push({ authorization: request.headers.authorization, body: JSON.parse(body) as Record<string, unknown> })
+    if (JSON.stringify(requests.at(-1)!.body.tools) === JSON.stringify([{ type: 'web_search' }])) {
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify({ status: 'completed', output: [
+        { type: 'web_search_call', status: 'completed' },
+        { type: 'message', content: [{ type: 'output_text', text: 'Grounded public fixture.', annotations: [
+          { type: 'url_citation', url: 'https://learn.microsoft.com/', title: 'Microsoft Learn' },
+        ] }] },
+      ] }))
+      return
+    }
     response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
     const event = (type: string, value: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`)
-    if (requests.length === 3) {
-      const item = { id: 'fc_fixture', type: 'function_call', call_id: 'image_fixture', name: 'image_generation', arguments: JSON.stringify({ prompt: 'A blue square', size: '1024x1024', quality: 'auto' }), status: 'completed' }
+    if (requests.length === 3 || requests.length === 6) {
+      const search = requests.length === 6
+      const item = { id: 'fc_fixture', type: 'function_call', call_id: search ? 'search_fixture' : 'image_fixture', name: search ? 'web_search' : 'image_generation', arguments: JSON.stringify(search ? { query: 'public search fixture' } : { prompt: 'A blue square', size: '1024x1024', quality: 'auto' }), status: 'completed' }
       const result = { id: 'resp_tool', object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'completed', model: 'fixture-model-b', output: [item] }
       event('response.created', { response: { ...result, status: 'in_progress', output: [] } })
       event('response.output_item.added', { output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } })
@@ -80,7 +92,7 @@ for (const remote of [false, true]) test(`real Copilot runtime uses ${remote ? '
   })
   const createAgent = () => new CopilotAgent(config, new ToolRegistry(config.toolsFile), {
     getToken: async () => ({ token: 'local-fixture-token', expiresOnTimestamp: Date.now() + 3600_000 }),
-  }, modelCatalogFixture(), attachments, imageService, remote ? store.database : undefined)
+  }, modelCatalogFixture(), attachments, imageService, remote ? store.database : undefined, new WebSearch(config, store, credential))
   let agent = createAgent()
   const output: AgentOutput[] = []
   const conversation = {
@@ -108,6 +120,7 @@ for (const remote of [false, true]) test(`real Copilot runtime uses ${remote ? '
     assert.equal(firstTools.includes('bash'), false)
     assert.equal(firstTools.includes('generate_image'), false)
     assert.equal(firstTools.includes('image_generation'), true)
+    assert.equal(firstTools.includes('web_search'), true)
     const visualInput = JSON.stringify(requests[0].body.input)
     assert.ok(visualInput.includes('input_image'))
     assert.ok(visualInput.includes(`data:image/webp;base64,${(await attachments.read(user.id, image.id)).data.toString('base64')}`))
@@ -134,8 +147,10 @@ for (const remote of [false, true]) test(`real Copilot runtime uses ${remote ? '
     await agent.run({ ...request, prompt: 'Reply without using tools.' })
     assert.equal(requests.length, 5)
     conversation.permissionMode = 'allow-all'
-    await agent.run({ ...request, prompt: 'Reply without using tools.' })
-    assert.equal(requests.length, 6)
+    await agent.run({ ...request, prompt: 'Search public documentation.', approve: async () => true })
+    assert.equal(requests.length, 8)
+    assert.equal(requests[6].body.input, 'public search fixture')
+    assert.ok(JSON.stringify(requests[7].body.input).includes('https://learn.microsoft.com/'))
   } finally {
     await agent.close()
     await store.close()

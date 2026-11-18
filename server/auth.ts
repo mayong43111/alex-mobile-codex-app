@@ -1,11 +1,14 @@
-import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
+import { argon2, randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 
 const derive = promisify(scrypt)
+const deriveArgon2 = promisify(argon2)
+export const passwordSchema = z.string().min(6).max(256)
+export const storedPasswordSchema = z.string().regex(/^(?:scrypt:[a-f0-9]{32}:[a-f0-9]{128}|\$argon2id\$v=19\$m=65536,t=3,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43})$/)
 export const credentialsSchema = z.object({
   username: z.string().regex(/^[a-z0-9][a-z0-9._-]{2,63}$/),
-  password: z.string().min(6).max(256),
+  password: passwordSchema,
 }).strict()
 
 export async function hashPassword(password: string): Promise<string> {
@@ -14,6 +17,16 @@ export async function hashPassword(password: string): Promise<string> {
   return `scrypt:${salt}:${key.toString('hex')}`
 }
 export async function checkPassword(password: string, encoded: string): Promise<boolean> {
+  if (!storedPasswordSchema.safeParse(encoded).success) throw new Error('Unsupported stored password format')
+  if (encoded.startsWith('$argon2id$')) {
+    const parts = encoded.split('$')
+    const expected = Buffer.from(parts[5], 'base64')
+    const actual = await deriveArgon2('argon2id', {
+      message: password, nonce: Buffer.from(parts[4], 'base64'),
+      parallelism: 1, memory: 65536, passes: 3, tagLength: expected.length,
+    })
+    return timingSafeEqual(actual, expected)
+  }
   const [, salt, expected] = encoded.split(':')
   const actual = await derive(password, salt, 64) as Buffer
   const saved = Buffer.from(expected, 'hex')

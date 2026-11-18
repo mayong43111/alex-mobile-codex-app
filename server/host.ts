@@ -42,6 +42,7 @@ const rpcSchema = z.object({
 interface Peer {
   socket: WebSocket; login: Login; clientId?: string; subscriptions: Set<string>
   work: Promise<void>
+  revoked?: boolean
 }
 interface Running {
   turnId: string; userId: string; controller: AbortController; work: Promise<void>
@@ -68,7 +69,7 @@ export class AgentHost {
     socket.on('close', () => { clearTimeout(expiry); this.peers.delete(peer) })
   }
   revoke(tokenHash: string) {
-    for (const peer of this.peers) if (peer.login.tokenHash === tokenHash) peer.socket.close(4001, 'Logged out')
+    for (const peer of this.peers) if (peer.login.tokenHash === tokenHash) { peer.revoked = true; peer.socket.close(4001, 'Logged out') }
   }
   private send(peer: Peer, message: unknown) {
     if (peer.socket.readyState !== 1) return
@@ -116,6 +117,7 @@ export class AgentHost {
     }
   }
   private async handle(peer: Peer, method: string, params: Record<string, unknown>): Promise<unknown> {
+    if (peer.revoked) throw new AppError(401, '登录已失效，请重新登录')
     const userId = peer.login.userId
     if (method === 'ping') return {}
     if (method === 'initialize') {
@@ -164,6 +166,7 @@ export class AgentHost {
     throw new ProtocolError(-32601, `当前 Host 不支持方法 ${method}`)
   }
   private async dispatch(peer: Peer, params: Record<string, unknown>) {
+    if (peer.revoked) throw new AppError(401, '登录已失效，请重新登录')
     const input = dispatchSchema.parse(params)
     const match = /^ahp-chat:\/([0-9a-f-]{36})$/.exec(input.channel)
     if (!match) throw new AppError(404, '聊天通道不存在')

@@ -27,6 +27,7 @@ export function App() {
   const [user, setUser] = useState<UserInfo>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   useEffect(() => {
     let active = true
     void api<UserInfo>('/me').then(value => { if (active) setUser(value) }).catch(error => {
@@ -35,11 +36,11 @@ export function App() {
     return () => { active = false }
   }, [])
   if (loading) return <main className="login"><p role="status">正在打开工作室…</p></main>
-  return user ? <Studio key={user.id} user={user} onLogout={() => setUser(undefined)} />
-    : <Login onLogin={setUser} initialError={error} />
+  return user ? <Studio key={user.id} user={user} onLogout={(message = '') => { setNotice(message); setUser(undefined) }} />
+    : <Login onLogin={setUser} initialError={error} notice={notice} />
 }
 
-function Login({ onLogin, initialError }: { onLogin: (user: UserInfo) => void; initialError: string }) {
+function Login({ onLogin, initialError, notice }: { onLogin: (user: UserInfo) => void; initialError: string; notice: string }) {
   const [error, setError] = useState(initialError)
   const [busy, setBusy] = useState(false)
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -54,19 +55,20 @@ function Login({ onLogin, initialError }: { onLogin: (user: UserInfo) => void; i
     <form onSubmit={submit}>
       <label>账号<input name="username" autoComplete="username" required autoCapitalize="none" /></label>
       <label>密码<input name="password" type="password" autoComplete="current-password" minLength={6} maxLength={256} required /></label>
+      {notice && <p role="status">{notice}</p>}
       {error && <p className="error" role="alert">{error}</p>}
       <button className="primary" disabled={busy}>{busy ? '正在登录…' : '进入工作室'}</button>
     </form>
   </main>
 }
 
-function Studio({ user, onLogout }: { user: UserInfo; onLogout: () => void }) {
+function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: string) => void }) {
   const [settings, setSettings] = useState<Settings>()
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [current, setCurrent] = useState<ConversationSummary>()
   const [state, setState] = useState<ChatState>()
   const [status, setStatus] = useState<'connecting' | 'connected' | 'offline'>('connecting')
-  const [panel, setPanel] = useState<'sessions' | 'settings' | 'models' | 'permissions' | 'image-models'>()
+  const [panel, setPanel] = useState<'sessions' | 'settings' | 'models' | 'permissions' | 'image-models' | 'password'>()
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('manual')
   const [permissionWarning, setPermissionWarning] = useState<PermissionMode>()
   const acknowledgedPermissions = useRef(new Set<PermissionMode>())
@@ -295,8 +297,8 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: () => void }) {
       {unavailableModel && <p className="model-error" role="alert">当前会话的模型已不可用，请选择另一个模型后发送；不会自动切换。</p>}
     </form>
     {panel && <div className={`overlay${panel === 'models' || panel === 'permissions' ? ' model-overlay' : ''}`} onClick={() => setPanel(undefined)}>
-      <section className={`sheet${panel === 'permissions' ? ' permission-menu' : ''}`} role="dialog" aria-modal="true" aria-label={panel === 'settings' ? '设置' : panel === 'models' ? '选择模型' : panel === 'image-models' ? '图片模型' : panel === 'permissions' ? '权限' : '会话列表'} onClick={event => event.stopPropagation()}>
-        {panel !== 'permissions' && <div className="sheet-heading"><h2>{panel === 'settings' ? '工作室设置' : panel === 'models' ? '选择模型' : panel === 'image-models' ? 'image_generation' : '我的对话'}</h2><button className="icon" aria-label="关闭" onClick={() => setPanel(undefined)}><Icon name="close" /></button></div>}
+      <section className={`sheet${panel === 'permissions' ? ' permission-menu' : ''}`} role="dialog" aria-modal="true" aria-label={panel === 'settings' ? '设置' : panel === 'password' ? '修改密码' : panel === 'models' ? '选择模型' : panel === 'image-models' ? '图片模型' : panel === 'permissions' ? '权限' : '会话列表'} onClick={event => event.stopPropagation()}>
+        {panel !== 'permissions' && <div className="sheet-heading"><h2>{panel === 'settings' ? '工作室设置' : panel === 'password' ? '修改密码' : panel === 'models' ? '选择模型' : panel === 'image-models' ? 'image_generation' : '我的对话'}</h2><button className="icon" aria-label="关闭" onClick={() => setPanel(undefined)}><Icon name="close" /></button></div>}
         {panel === 'permissions' ? <div className="permission-options">
           {permissionModes.map(mode => <button key={mode} aria-pressed={permissionMode === mode} disabled={busy || active || savingPermissions}
             onClick={() => { void choosePermission(mode) }}><span className="permission-check">{permissionMode === mode && <Icon name="check" />}</span><span>{permissionLabels[mode]}</span></button>)}
@@ -318,7 +320,7 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: () => void }) {
             <span><strong>{model.id}</strong><span className="muted small">{model.provider} · {model.name}{model.version && ` · ${model.version}`}</span></span>
             {model.id === selectedModel && <Icon name="check" />}
           </button>)}</div>
-        </> : panel === 'sessions' ? <>
+        </> : panel === 'password' ? <PasswordForm user={user} onChanged={() => onLogout('密码已修改，请重新登录')} /> : panel === 'sessions' ? <>
           <button className="primary" disabled={busy} onClick={newConversation}>＋ 新对话</button>
           <div className="session-list">{conversations.map(item => <button key={item.id} onClick={() => {
             setCurrent(item); setDraft(''); setAttachments([]); setError(''); setPanel(undefined)
@@ -338,14 +340,14 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: () => void }) {
           <h3>Skills</h3>
           {skillCatalog.map(skill => <label className="skill" key={skill.id}><strong>{skill.name}</strong>
             <input aria-label={skill.name} type="checkbox" role="switch" checked={settings?.skills[skill.id] ?? false} disabled={!settings || saving} onChange={() => { void toggle(skill.id) }} /></label>)}
-          <div className="account"><span>{user.username}</span><button onClick={() => { void logout() }}>退出登录</button></div>
+          <div className="account"><span>{user.username}</span><button onClick={() => setPanel('password')}>修改密码</button><button onClick={() => { void logout() }}>退出登录</button></div>
         </>}
       </section>
     </div>}
     {permissionWarning && <div className="overlay permission-warning">
       <section className="sheet" role="alertdialog" aria-modal="true" aria-labelledby="permission-warning-title">
         <h2 id="permission-warning-title">启用 {permissionLabels[permissionWarning]}？</h2>
-        <p>{permissionWarning === 'assisted' ? '模型将评估工具调用并自动批准通过评估的操作，判断可能出错；其余操作仍需确认。' : '已启用的工具将不再逐次确认，图片和视频调用可能产生费用。'}</p>
+        <p>{permissionWarning === 'assisted' ? '模型将评估工具调用并自动批准通过评估的操作，判断可能出错；其余操作仍需确认。' : '已启用的工具将不再逐次确认，联网搜索、图片和视频调用可能产生费用。'}</p>
         <div className="actions"><button onClick={() => setPermissionWarning(undefined)}>取消</button><button className="primary" onClick={() => {
           const mode = permissionWarning
           acknowledgedPermissions.current.add(mode); setPermissionWarning(undefined); void choosePermission(mode, true)
@@ -353,6 +355,29 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: () => void }) {
       </section>
     </div>}
   </div>
+}
+
+function PasswordForm({ user, onChanged }: { user: UserInfo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    if (form.get('newPassword') !== form.get('confirmPassword')) { setError('两次输入的新密码不一致'); return }
+    setBusy(true); setError('')
+    try {
+      await api('/password', user, { currentPassword: form.get('currentPassword'), newPassword: form.get('newPassword') })
+      onChanged()
+    } catch (error) { setError(errorText(error)) }
+    finally { setBusy(false) }
+  }
+  return <form className="password-form" onSubmit={submit}>
+    <label>当前密码<input name="currentPassword" type="password" autoComplete="current-password" maxLength={256} required disabled={busy} /></label>
+    <label>新密码<input name="newPassword" type="password" autoComplete="new-password" minLength={6} maxLength={256} required disabled={busy} /></label>
+    <label>确认新密码<input name="confirmPassword" type="password" autoComplete="new-password" minLength={6} maxLength={256} required disabled={busy} /></label>
+    {error && <p className="error" role="alert">{error}</p>}
+    <button className="primary" disabled={busy}>{busy ? '保存中…' : '保存并重新登录'}</button>
+  </form>
 }
 
 function CopyButton({ text, onError }: { text: string; onError: (message: string) => void }) {

@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
-import { credentialsSchema, checkPassword, hashPassword, LoginLimiter } from './auth.js'
+import { credentialsSchema, passwordSchema, checkPassword, hashPassword, LoginLimiter } from './auth.js'
 import type { Config } from './config.js'
 import { AppError } from './errors.js'
 import { Store } from './store.js'
@@ -19,6 +19,7 @@ import { ModelCatalog, createAzureCredential } from './models.js'
 import { Attachments } from './attachments.js'
 import { ImageGeneration } from './image-generation.js'
 import { imageLimits, permissionModes } from '../src/shared.js'
+import { WebSearch } from './web-search.js'
 
 declare module 'fastify' {
   interface FastifyRequest { login?: Login }
@@ -31,9 +32,11 @@ export async function buildApp(config: Config, options: { agent?: Agent; store?:
   const models = options.models ?? new ModelCatalog(config, credential)
   const attachments = new Attachments(store, config.dataDir, config)
   const imageGeneration = new ImageGeneration(config, attachments, store, credential, fetch, options.imageModels)
-  const host = new AgentHost(store, options.agent ?? new CopilotAgent(config, tools, credential, models, attachments, imageGeneration, config.sqlServer ? store.database : undefined), message => app.log.error(message), attachments)
+  const webSearch = new WebSearch(config, store, credential)
+  const host = new AgentHost(store, options.agent ?? new CopilotAgent(config, tools, credential, models, attachments, imageGeneration, config.sqlServer ? store.database : undefined, webSearch), message => app.log.error(message), attachments)
   await host.initialize()
   const limiter = new LoginLimiter()
+  const passwordLimiter = new LoginLimiter()
   const dummyPassword = await hashPassword(randomBytes(32).toString('hex'))
   const cookieName = config.secureCookie ? '__Host-studio' : 'studio'
   await app.register(cookie)
@@ -78,6 +81,18 @@ export async function buildApp(config: Config, options: { agent?: Agent; store?:
     return { id: login.userId, username: login.username, csrf: login.csrf }
   })
   app.get('/api/me', async request => ({ id: request.login!.userId, username: request.login!.username, csrf: request.login!.csrf }))
+  app.post('/api/password', async (request, reply) => {
+    const login = request.login!
+    if (!passwordLimiter.attempt(login.userId)) throw new AppError(429, '密码验证尝试过多，请稍后再试')
+    const input = z.object({ currentPassword: z.string().min(1).max(256), newPassword: passwordSchema }).strict().parse(request.body)
+    const user = await store.user(login.username)
+    if (!user || user.id !== login.userId || !await checkPassword(input.currentPassword, user.password)) throw new AppError(400, '当前密码不正确')
+    if (input.currentPassword === input.newPassword) throw new AppError(400, '新密码不能与当前密码相同')
+    const revoked = await store.changePassword(user, await hashPassword(input.newPassword))
+    for (const tokenHash of revoked) host.revoke(tokenHash)
+    reply.clearCookie(cookieName, { path: '/', secure: config.secureCookie, sameSite: 'strict' })
+    return { ok: true }
+  })
   app.post('/api/logout', async (request, reply) => {
     await store.revokeLogin(request.login!.tokenHash)
     host.revoke(request.login!.tokenHash)
@@ -85,7 +100,8 @@ export async function buildApp(config: Config, options: { agent?: Agent; store?:
     return { ok: true }
   })
   app.get('/api/settings', async request => ({
-    skills: await store.skills(request.login!.userId), tools: [...tools.publicTools(), await imageGeneration.publicTool(request.login!.userId)],
+    skills: await store.skills(request.login!.userId), tools: [...tools.publicTools(), await imageGeneration.publicTool(request.login!.userId),
+      { id: 'web_search', label: 'Azure Foundry Web Search', tools: ['web_search'], configured: webSearch.configured }],
     model: { configured: models.configured, deployment: config.deployment, authMode: config.authMode },
     image: { configured: imageGeneration.configured, model: await imageGeneration.model(request.login!.userId) },
   }))
