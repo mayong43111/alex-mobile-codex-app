@@ -1,7 +1,9 @@
 import { buildApp } from './app.js'
 import { readConfig } from './config.js'
+import { bootstrap } from './bootstrap.js'
 
 const config = readConfig()
+await bootstrap(config)
 const { app } = await buildApp(config)
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {

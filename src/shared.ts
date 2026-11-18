@@ -1,4 +1,14 @@
 export const skillIds = ['image-production', 'video-production'] as const
+export const permissionModes = ['manual', 'assisted', 'allow-all'] as const
+export type PermissionMode = typeof permissionModes[number]
+export const permissionLabels: Record<PermissionMode, string> = {
+  manual: 'Manual permissions', assisted: 'Assisted permissions', 'allow-all': 'Allow all',
+}
+export const imageLimits = { originalBytes: 20 * 1024 * 1024, uploadBytes: 2 * 1024 * 1024, maxEdge: 2048, maxAttachments: 6 }
+export interface AttachmentInfo {
+  id: string; name: string; url: string; mime: string; width: number; height: number; bytes: number
+  kind: 'upload' | 'generated'
+}
 export type SkillId = typeof skillIds[number]
 export type SkillChoices = Record<SkillId, boolean>
 export const defaultSkills: SkillChoices = {
@@ -22,11 +32,17 @@ export interface ConversationSummary {
   session: string
   chat: string
   updatedAt: string
+  model?: string
+  permissionMode: PermissionMode
 }
+export interface ChatModel { id: string; name: string; version: string; provider: string }
+export interface ModelCatalogResponse { models: ChatModel[]; defaultModel?: string; authMode: string }
+export interface ImageModelCatalogResponse extends ModelCatalogResponse { selectedModel?: string }
 export interface UserInfo { id: string; username: string; csrf: string }
 export interface PublicTool { id: string; label: string; skill: SkillId; tools: string[]; configured: boolean }
 export interface Settings {
   skills: SkillChoices
   tools: PublicTool[]
   model: { configured: boolean; deployment: string; authMode: string }
+  image: { configured: boolean; model: string }
 }

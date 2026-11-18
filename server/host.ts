@@ -9,10 +9,20 @@ import type { Agent, AgentOutput } from './agent.js'
 import { AppError } from './errors.js'
 import { Store, hash } from './store.js'
 import type { Login } from './store.js'
+import type { Attachments } from './attachments.js'
+import { imageLimits } from '../src/shared.js'
+import type { AttachmentInfo } from '../src/shared.js'
 
 const startSchema = z.object({
   type: z.literal('chat/turnStarted'), turnId: z.uuid(), startedAt: z.iso.datetime(),
-  message: z.object({ text: z.string().trim().min(1).max(12000), origin: z.object({ kind: z.literal('user') }).strict() }).strict(),
+  message: z.object({
+    text: z.string().trim().max(12000), origin: z.object({ kind: z.literal('user') }).strict(),
+    attachments: z.array(z.object({
+      type: z.literal('resource'), uri: z.string().regex(/^studio-attachment:\/[0-9a-f-]{36}$/),
+      label: z.string().max(180), displayKind: z.literal('image').optional(),
+      contentType: z.string().max(80).optional(), sizeHint: z.number().nonnegative().optional(),
+    }).strict()).max(imageLimits.maxAttachments).optional(),
+  }).strict().refine(message => Boolean(message.text || message.attachments?.length), 'Message is empty'),
 }).strict()
 const cancelSchema = z.object({
   type: z.literal('chat/turnCancelled'), turnId: z.uuid(), duration: z.number().nonnegative(),
@@ -31,6 +41,7 @@ const rpcSchema = z.object({
 }).strict()
 interface Peer {
   socket: WebSocket; login: Login; clientId?: string; subscriptions: Set<string>
+  work: Promise<void>
 }
 interface Running {
   turnId: string; userId: string; controller: AbortController; work: Promise<void>
@@ -43,14 +54,16 @@ class ProtocolError extends AppError {
 export class AgentHost {
   private peers = new Set<Peer>()
   private running = new Map<string, Running>()
-  constructor(private store: Store, private agent: Agent, private report: (message: string) => void) {
-    store.interruptActiveTurns()
+  private dispatchQueue: Promise<void> = Promise.resolve()
+  get activeCount() { return this.running.size }
+  constructor(private store: Store, private agent: Agent, private report: (message: string) => void, private attachments?: Attachments) {
   }
+  initialize() { return this.store.interruptActiveTurns() }
   attach(socket: WebSocket, login: Login) {
-    const peer: Peer = { socket, login, subscriptions: new Set() }
+    const peer: Peer = { socket, login, subscriptions: new Set(), work: Promise.resolve() }
     this.peers.add(peer)
     const expiry = setTimeout(() => socket.close(4001, 'Login expired'), Math.max(1, login.expiresAt - Date.now()))
-    socket.on('message', data => this.receive(peer, data.toString()))
+    socket.on('message', data => { peer.work = peer.work.then(() => this.receive(peer, data.toString())) })
     socket.on('error', () => this.report('AHP socket error'))
     socket.on('close', () => { clearTimeout(expiry); this.peers.delete(peer) })
   }
@@ -65,10 +78,10 @@ export class AgentHost {
   private notification(peer: Peer, method: string, params: unknown) {
     this.send(peer, { jsonrpc: '2.0', method, params })
   }
-  private publish(userId: string, id: string, envelope: ActionEnvelope) {
-    const conversation = this.store.conversation(userId, id)
+  private async publish(userId: string, id: string, envelope: ActionEnvelope) {
+    const conversation = await this.store.conversation(userId, id)
     const summary = this.store.sessionSummary(conversation)
-    const sessionUpdate = this.store.sessionUpdate(userId, id)
+    const sessionUpdate = await this.store.sessionUpdate(userId, id)
     for (const peer of this.peers) {
       if (peer.login.userId !== userId) continue
       if (peer.subscriptions.has(envelope.channel)) this.notification(peer, 'action', envelope)
@@ -79,19 +92,19 @@ export class AgentHost {
       })
     }
   }
-  private apply(userId: string, id: string, action: ChatAction, command?: { clientId: string; clientSeq: number; fingerprint: string }) {
-    const envelope = this.store.apply(userId, id, action, command)
-    this.publish(userId, id, envelope)
+  private async apply(userId: string, id: string, action: ChatAction, command?: { clientId: string; clientSeq: number; fingerprint: string }) {
+    const envelope = await this.store.apply(userId, id, action, command)
+    await this.publish(userId, id, envelope)
     return envelope
   }
-  private receive(peer: Peer, text: string) {
+  private async receive(peer: Peer, text: string) {
     let id: string | number | undefined
     let clientSeq: unknown
     try {
       const request = rpcSchema.parse(JSON.parse(text))
       id = request.id
       clientSeq = request.params.clientSeq
-      const result = this.handle(peer, request.method, request.params)
+      const result = await this.handle(peer, request.method, request.params)
       if (id !== undefined) this.send(peer, { jsonrpc: '2.0', id, result })
     } catch (error) {
       const status = error instanceof AppError ? error.status : error instanceof z.ZodError || error instanceof SyntaxError ? 400 : 500
@@ -102,7 +115,7 @@ export class AgentHost {
       else this.notification(peer, 'x-studio/error', { channel: 'ahp-root://', clientSeq, message })
     }
   }
-  private handle(peer: Peer, method: string, params: Record<string, unknown>): unknown {
+  private async handle(peer: Peer, method: string, params: Record<string, unknown>): Promise<unknown> {
     const userId = peer.login.userId
     if (method === 'ping') return {}
     if (method === 'initialize') {
@@ -114,10 +127,10 @@ export class AgentHost {
       if (!input.protocolVersions.includes(PROTOCOL_VERSION)) {
         throw new ProtocolError(-32005, `不支持此协议版本，需要 ${PROTOCOL_VERSION}`, { supportedVersions: [PROTOCOL_VERSION] })
       }
-      const snapshots = input.initialSubscriptions.map(channel => this.store.snapshot(userId, channel))
+      const snapshots = await Promise.all(input.initialSubscriptions.map(channel => this.store.snapshot(userId, channel)))
       peer.clientId = input.clientId
       input.initialSubscriptions.forEach(channel => peer.subscriptions.add(channel))
-      return { protocolVersion: PROTOCOL_VERSION, serverSeq: this.store.sequence, snapshots, serverInfo: { name: 'mobile-studio', version: '0.1.0' } } satisfies InitializeResult
+      return { protocolVersion: PROTOCOL_VERSION, serverSeq: await this.store.sequence(), snapshots, serverInfo: { name: 'mobile-studio', version: '0.1.0' } } satisfies InitializeResult
     }
     if (method === 'reconnect') {
       const input = z.object({
@@ -126,7 +139,7 @@ export class AgentHost {
         subscriptions: z.array(z.string()).max(50),
       }).parse(params)
       if (peer.clientId && peer.clientId !== input.clientId) throw new AppError(409, '重连客户端标识不一致')
-      const snapshots = input.subscriptions.map(channel => this.store.snapshot(userId, channel))
+      const snapshots = await Promise.all(input.subscriptions.map(channel => this.store.snapshot(userId, channel)))
       peer.clientId = input.clientId
       peer.subscriptions = new Set(input.subscriptions)
       return { type: 'snapshot', snapshots }
@@ -135,24 +148,30 @@ export class AgentHost {
     if (method === 'subscribe') {
       if (peer.subscriptions.size >= 50) throw new AppError(429, '订阅数量达到上限')
       const channel = z.string().parse(params.channel)
-      const snapshot = this.store.snapshot(userId, channel)
+      const snapshot = await this.store.snapshot(userId, channel)
       peer.subscriptions.add(channel)
       return { snapshot }
     }
     if (method === 'unsubscribe') { peer.subscriptions.delete(z.string().parse(params.channel)); return {} }
-    if (method === 'listSessions') return { items: this.store.conversations(userId).map(conversation => this.store.sessionSummary(conversation)) }
-    if (method === 'dispatchAction') { this.dispatch(peer, params); return {} }
+    if (method === 'listSessions') return { items: (await this.store.conversations(userId)).map(conversation => this.store.sessionSummary(conversation)) }
+    if (method === 'dispatchAction') {
+      const dispatch = () => this.dispatch(peer, params)
+      const result = this.dispatchQueue.then(dispatch, dispatch)
+      this.dispatchQueue = result
+      await result
+      return {}
+    }
     throw new ProtocolError(-32601, `当前 Host 不支持方法 ${method}`)
   }
-  private dispatch(peer: Peer, params: Record<string, unknown>) {
+  private async dispatch(peer: Peer, params: Record<string, unknown>) {
     const input = dispatchSchema.parse(params)
     const match = /^ahp-chat:\/([0-9a-f-]{36})$/.exec(input.channel)
     if (!match) throw new AppError(404, '聊天通道不存在')
     const id = match[1]
     const userId = peer.login.userId
-    const conversation = this.store.conversation(userId, id)
+    const conversation = await this.store.conversation(userId, id)
     const command = { clientId: peer.clientId!, clientSeq: input.clientSeq, fingerprint: hash(JSON.stringify(input)) }
-    const accepted = this.store.accepted(userId, command.clientId, command.clientSeq, command.fingerprint)
+    const accepted = await this.store.accepted(userId, command.clientId, command.clientSeq, command.fingerprint)
     if (accepted) {
       this.notification(peer, 'action', accepted)
       return
@@ -162,17 +181,27 @@ export class AgentHost {
       if (conversation.state.activeTurn || this.running.has(id)) throw new AppError(409, '当前会话仍在处理，请等待或停止')
       if (conversation.state.turns.some(turn => turn.id === input.action.turnId)) throw new AppError(409, '这条消息已经处理，未重复提交')
       if (this.running.size >= 8 || [...this.running.values()].filter(run => run.userId === userId).length >= 2) throw new AppError(429, '运行中的会话过多，请稍后重试')
-      const action: ChatAction = { type: ActionType.ChatTurnStarted, turnId: input.action.turnId, startedAt: new Date().toISOString(), message: { text: input.action.message.text, origin: { kind: MessageKind.User } } }
-      this.apply(userId, id, action, command)
+      const references = input.action.message.attachments ? await Promise.all(input.action.message.attachments.map(reference => {
+        if (!this.attachments) throw new AppError(503, '图片存储不可用')
+        return this.attachments.reference(userId, reference.uri)
+      })) : undefined
+      const images = references ? await Promise.all(references.map(reference => this.attachments!.info(userId, reference.uri.slice('studio-attachment:/'.length)))) : []
+      const action: ChatAction = { type: ActionType.ChatTurnStarted, turnId: input.action.turnId, startedAt: new Date().toISOString(), message: {
+        text: input.action.message.text, origin: { kind: MessageKind.User }, ...(references?.length ? { attachments: references } : {}),
+      } }
+      await this.apply(userId, id, action, command)
       const running: Running = { turnId: action.turnId, userId, controller: new AbortController(), approvals: new Map(), work: Promise.resolve() }
       this.running.set(id, running)
-      running.work = this.execute(id, running, input.action.message.text)
+      running.work = this.execute(id, running, input.action.message.text, images).catch(() => {
+        this.report('Turn state could not be persisted; closing affected connections')
+        for (const peer of this.peers) if (peer.login.userId === userId) peer.socket.close(1011, 'Storage unavailable; reconnect after recovery')
+      })
       return
     }
     const running = this.running.get(id)
     if (!running || running.turnId !== input.action.turnId) throw new AppError(409, '该任务已结束或不存在')
     if (input.action.type === 'chat/turnCancelled') {
-      this.apply(userId, id, { type: ActionType.ChatActivityChanged, activity: '正在请求停止；外部任务可能仍会计费。' }, command)
+      await this.apply(userId, id, { type: ActionType.ChatActivityChanged, activity: '正在请求停止；外部任务可能仍会计费。' }, command)
       running.controller.abort()
       for (const approve of running.approvals.values()) approve(false)
       return
@@ -182,59 +211,103 @@ export class AgentHost {
     const action: ChatAction = input.action.approved
       ? { type: ActionType.ChatToolCallConfirmed, turnId: running.turnId, toolCallId: input.action.toolCallId, approved: true, confirmed: ToolCallConfirmationReason.UserAction }
       : { type: ActionType.ChatToolCallConfirmed, turnId: running.turnId, toolCallId: input.action.toolCallId, approved: false, reason: ToolCallCancellationReason.Denied }
-    this.apply(userId, id, action, command)
+    await this.apply(userId, id, action, command)
     approve(input.action.approved)
   }
-  private async execute(id: string, run: Running, prompt: string) {
+  private async execute(id: string, run: Running, prompt: string, attachments: AttachmentInfo[]) {
     const started = Date.now()
     const textParts = new Set<string>()
     const tools = new Set<string>()
-    const emit = (event: AgentOutput) => {
-      if (event.type === 'text') {
+    let output: Promise<void> = Promise.resolve()
+    let outputFailure: unknown
+    let outputFailed = false
+    const pending: AgentOutput[] = []
+    const processOutput = async (event: AgentOutput) => {
+      if (event.type === 'image') {
+        const partId = `image-${event.id}`
+        if (textParts.has(partId)) return
+        textParts.add(partId)
+        await this.apply(run.userId, id, { type: ActionType.ChatResponsePart, turnId: run.turnId, part: { kind: ResponsePartKind.Markdown, id: partId, content: `![生成图片](${event.url})` } })
+      } else if (event.type === 'error') {
+        await this.apply(run.userId, id, { type: ActionType.ChatResponsePart, turnId: run.turnId, part: { kind: ResponsePartKind.Error, error: { errorType: 'image_tool_failure', message: event.message } } })
+      } else if (event.type === 'text') {
         if (!textParts.has(event.id)) {
           textParts.add(event.id)
-          this.apply(run.userId, id, { type: ActionType.ChatResponsePart, turnId: run.turnId, part: { kind: ResponsePartKind.Markdown, id: event.id, content: '' } })
+          await this.apply(run.userId, id, { type: ActionType.ChatResponsePart, turnId: run.turnId, part: { kind: ResponsePartKind.Markdown, id: event.id, content: '' } })
         }
-        this.apply(run.userId, id, { type: ActionType.ChatDelta, turnId: run.turnId, partId: event.id, content: event.delta })
+        await this.apply(run.userId, id, { type: ActionType.ChatDelta, turnId: run.turnId, partId: event.id, content: event.delta })
       } else if (event.type === 'tool-start') {
         if (tools.has(event.id)) return
         tools.add(event.id)
-        this.apply(run.userId, id, { type: ActionType.ChatToolCallStart, turnId: run.turnId, toolCallId: event.id, toolName: event.name, displayName: event.name })
-        this.apply(run.userId, id, { type: ActionType.ChatToolCallReady, turnId: run.turnId, toolCallId: event.id, invocationMessage: '执行工具', confirmed: ToolCallConfirmationReason.NotNeeded })
+        await this.apply(run.userId, id, { type: ActionType.ChatToolCallStart, turnId: run.turnId, toolCallId: event.id, toolName: event.name, displayName: event.name })
+        await this.apply(run.userId, id, { type: ActionType.ChatToolCallReady, turnId: run.turnId, toolCallId: event.id, invocationMessage: '执行工具', confirmed: ToolCallConfirmationReason.NotNeeded })
       } else if (event.type === 'tool-complete' && tools.has(event.id)) {
-        this.apply(run.userId, id, { type: ActionType.ChatToolCallComplete, turnId: run.turnId, toolCallId: event.id, result: { success: event.success, pastTenseMessage: event.success ? '工具已返回结果' : '工具执行失败' } })
+        await this.apply(run.userId, id, { type: ActionType.ChatToolCallComplete, turnId: run.turnId, toolCallId: event.id, result: { success: event.success, pastTenseMessage: event.success ? '工具已返回结果' : '工具执行失败' } })
       }
+    }
+    const emit = (event: AgentOutput) => {
+      if (outputFailed) return
+      const last = pending.at(-1)
+      if (last?.type === 'text' && event.type === 'text' && last.id === event.id) last.delta += event.delta
+      else pending.push(event)
+      output = output.then(async () => {
+        while (pending.length && !outputFailed) await processOutput(pending.shift()!)
+      }).catch(error => {
+        outputFailure = error
+        outputFailed = true
+        pending.length = 0
+        this.report('Conversation output persistence failed; aborting the current turn')
+        run.controller.abort()
+      })
     }
     try {
       await this.agent.run({
-        conversation: this.store.conversation(run.userId, id), skills: this.store.skills(run.userId),
-        prompt, signal: run.controller.signal, emit,
-        saveRuntimeId: runtimeId => {
-          const current = this.store.conversation(run.userId, id)
-          current.runtimeId = runtimeId
-          this.store.save(current)
+        conversation: await this.store.conversation(run.userId, id), skills: await this.store.skills(run.userId),
+        prompt, attachments, signal: run.controller.signal, emit,
+        saveRuntimeId: async runtimeId => {
+          await this.store.updateConversation(run.userId, id, current => { current.runtimeId = runtimeId })
         },
-        approve: (toolId, name, input) => new Promise<boolean>(resolve => {
-          if (run.controller.signal.aborted) { resolve(false); return }
-          tools.add(toolId)
-          this.apply(run.userId, id, { type: ActionType.ChatToolCallStart, turnId: run.turnId, toolCallId: toolId, toolName: name, displayName: name })
-          this.apply(run.userId, id, { type: ActionType.ChatToolCallReady, turnId: run.turnId, toolCallId: toolId, invocationMessage: `确认执行 ${name}？这可能产生费用。\n${input.slice(0, 8000)}` })
-          const finish = (approved: boolean) => {
-            clearTimeout(timer)
-            run.approvals.delete(toolId)
-            resolve(approved)
+        approve: async (toolId, name, input, assistedApproved, requireManual) => {
+          await output
+          if (outputFailed) throw outputFailure
+          if (run.controller.signal.aborted) return false
+          if (!tools.has(toolId)) {
+            tools.add(toolId)
+            await this.apply(run.userId, id, { type: ActionType.ChatToolCallStart, turnId: run.turnId, toolCallId: toolId, toolName: name, displayName: name })
           }
-          const timer = setTimeout(() => {
-            this.apply(run.userId, id, { type: ActionType.ChatToolCallConfirmed, turnId: run.turnId, toolCallId: toolId, approved: false, reason: ToolCallCancellationReason.Skipped })
-            finish(false)
-          }, 120_000)
-          run.approvals.set(toolId, finish)
-        }),
+          const mode = (await this.store.conversation(run.userId, id)).permissionMode
+          if (!requireManual && (mode === 'allow-all' || (mode === 'assisted' && assistedApproved))) {
+            await this.apply(run.userId, id, { type: ActionType.ChatToolCallReady, turnId: run.turnId, toolCallId: toolId, invocationMessage: input.slice(0, 8000), confirmed: ToolCallConfirmationReason.NotNeeded })
+            await this.store.check()
+            return true
+          }
+          await this.apply(run.userId, id, { type: ActionType.ChatToolCallReady, turnId: run.turnId, toolCallId: toolId, invocationMessage: `确认执行 ${name}？这可能产生费用。\n${input.slice(0, 8000)}` })
+          if (run.controller.signal.aborted) return false
+          return new Promise<boolean>(resolve => {
+            const finish = (approved: boolean) => {
+              clearTimeout(timer)
+              run.approvals.delete(toolId)
+              resolve(approved)
+            }
+            const timer = setTimeout(() => {
+              void this.apply(run.userId, id, { type: ActionType.ChatToolCallConfirmed, turnId: run.turnId, toolCallId: toolId, approved: false, reason: ToolCallCancellationReason.Skipped })
+                .then(() => finish(false), () => {
+                  this.report('Permission timeout could not be persisted; rejecting the tool')
+                  run.controller.abort()
+                  finish(false)
+                })
+            }, 120_000)
+            run.approvals.set(toolId, finish)
+          })
+        },
       })
-      this.apply(run.userId, id, { type: run.controller.signal.aborted ? ActionType.ChatTurnCancelled : ActionType.ChatTurnComplete, turnId: run.turnId, duration: Date.now() - started })
+      await output
+      if (outputFailed) throw outputFailure
+      await this.apply(run.userId, id, { type: run.controller.signal.aborted ? ActionType.ChatTurnCancelled : ActionType.ChatTurnComplete, turnId: run.turnId, duration: Date.now() - started })
     } catch {
       this.report('Copilot turn failed; inspect model/tool configuration without exposing credentials')
-      this.apply(run.userId, id, {
+      await output
+      await this.apply(run.userId, id, {
         type: ActionType.ChatError, turnId: run.turnId, duration: Date.now() - started,
         part: { kind: ResponsePartKind.Error, error: {
           errorType: run.controller.signal.aborted ? 'stopped' : 'agent_failure',
@@ -249,6 +322,7 @@ export class AgentHost {
     }
   }
   async close() {
+    await this.dispatchQueue.catch(() => { this.report('AHP dispatch failed during shutdown') })
     for (const peer of this.peers) peer.socket.close(1001, 'Server shutting down')
     for (const run of this.running.values()) {
       run.controller.abort()

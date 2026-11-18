@@ -1,0 +1,63 @@
+name: Copilot Mobile Release
+on:
+  push:
+    tags:
+      - 'copilot-mobile-*'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: production-webapp
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      SQL_SERVER: ${{ vars.COPILOT_SQL_SERVER }}
+      SQL_DATABASE: ${{ vars.COPILOT_SQL_DATABASE }}
+      AZURE_BLOB_CONTAINER_URL: ${{ vars.COPILOT_BLOB_CONTAINER_URL }}
+      AZURE_MODEL_ENDPOINT: ${{ vars.COPILOT_MODEL_ENDPOINT }}
+      AZURE_MODEL_DEPLOYMENT: ${{ vars.COPILOT_MODEL_DEPLOYMENT }}
+      AZURE_FOUNDRY_RESOURCE_ID: ${{ vars.COPILOT_FOUNDRY_RESOURCE_ID }}
+      AZURE_IMAGE_ENDPOINT: ${{ vars.COPILOT_IMAGE_ENDPOINT }}
+      AZURE_IMAGE_DEPLOYMENT: ${{ vars.COPILOT_IMAGE_DEPLOYMENT }}
+      AZURE_IMAGE_FOUNDRY_RESOURCE_ID: ${{ vars.COPILOT_IMAGE_FOUNDRY_RESOURCE_ID }}
+      STUDIO_BOOTSTRAP_USERS: ${{ secrets.STUDIO_BOOTSTRAP_USERS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build and verify production container
+        run: |
+          IMAGE="$ACR_NAME.azurecr.io/copilot-mobile:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --build-arg APP_REVISION="$GITHUB_SHA" --tag "$IMAGE" .
+          az acr login --name "$ACR_NAME"
+          docker push "$IMAGE"
+          PINNED_IMAGE="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")"
+          echo "RELEASE_IMAGE=$PINNED_IMAGE" >> "$GITHUB_ENV"
+      - name: Release with legacy data protection and rollback
+        env:
+          RELEASE_RECORD_DIR: ${{ runner.temp }}/copilot-mobile-release
+        run: node deploy/release-webapp.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: copilot-mobile-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/copilot-mobile-release
+          retention-days: 30
+          if-no-files-found: ignore

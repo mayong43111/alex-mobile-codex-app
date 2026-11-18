@@ -1,7 +1,8 @@
-import { ActionType, MessageKind, PROTOCOL_VERSION, chatReducer } from '@microsoft/agent-host-protocol'
+import { ActionType, MessageAttachmentKind, MessageKind, PROTOCOL_VERSION, chatReducer } from '@microsoft/agent-host-protocol'
 import type { ChatAction, ChatState, ClientChatAction, StateAction } from '@microsoft/agent-host-protocol'
 import { AhpClient } from '@microsoft/agent-host-protocol/client'
 import { WebSocketTransport } from '@microsoft/agent-host-protocol/ws'
+import type { AttachmentInfo } from './shared'
 
 function isChatAction(action: StateAction): action is ChatAction { return action.type.startsWith('chat/') }
 
@@ -98,7 +99,7 @@ export class ChatConnection {
       delay = Math.min(delay * 2, 10_000)
     }
   }
-  async send(text: string) {
+  async send(text: string, attachments: AttachmentInfo[] = []) {
     if (!this.client) throw new Error('尚未连接，请稍后再发送')
     if (this.pending) throw new Error('上一条消息仍在确认中')
     const turnId = crypto.randomUUID()
@@ -108,7 +109,11 @@ export class ChatConnection {
       try {
         this.client!.dispatch(this.channel, {
           type: ActionType.ChatTurnStarted, turnId, startedAt: new Date().toISOString(),
-          message: { text, origin: { kind: MessageKind.User } },
+          message: { text, origin: { kind: MessageKind.User }, ...(attachments.length ? {
+            attachments: attachments.map(image => ({
+              type: MessageAttachmentKind.Resource, uri: `studio-attachment:/${image.id}`, label: image.name, displayKind: 'image',
+            })),
+          } : {}) },
         })
       } catch (error) { this.rejectPending(error instanceof Error ? error.message : '发送失败') }
     })

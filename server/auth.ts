@@ -5,7 +5,7 @@ import { z } from 'zod'
 const derive = promisify(scrypt)
 export const credentialsSchema = z.object({
   username: z.string().regex(/^[a-z0-9][a-z0-9._-]{2,63}$/),
-  password: z.string().min(12).max(256),
+  password: z.string().min(6).max(256),
 }).strict()
 
 export async function hashPassword(password: string): Promise<string> {

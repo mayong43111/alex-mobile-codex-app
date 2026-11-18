@@ -12,6 +12,42 @@ import { readConfig } from '../server/config.js'
 import { hashPassword } from '../server/auth.js'
 import type { Agent, AgentRequest } from '../server/agent.js'
 import type { UserInfo } from '../src/shared.js'
+import { ModelCatalog } from '../server/models.js'
+
+export function modelCatalogFixture() {
+  const config = readConfig({
+    AZURE_MODEL_ENDPOINT: 'https://models.example/openai/v1/',
+    AZURE_FOUNDRY_RESOURCE_ID: '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/test/providers/Microsoft.CognitiveServices/accounts/fixture',
+  })
+  const definitions = [
+    { name: 'fixture-model', version: '1', format: 'OpenAI', capabilities: { responses: 'true', chatCompletion: 'true' } },
+    { name: 'fixture-model-b', version: '2', format: 'OpenAI', capabilities: { responses: 'true', chatCompletion: 'true' } },
+    { name: 'embedding', version: '1', format: 'OpenAI', capabilities: { embeddings: 'true' } },
+    { name: 'image', version: '1', format: 'OpenAI', capabilities: { imageGeneration: 'true' } },
+  ]
+  const request: typeof fetch = async url => Response.json({
+    value: String(url).includes('/deployments?') ? definitions.map(model => ({
+      name: model.name, properties: { provisioningState: 'Succeeded', model },
+    })) : definitions,
+  })
+  return new ModelCatalog(config, { getToken: async () => ({ token: 'catalog-fixture-token', expiresOnTimestamp: Date.now() + 3600_000 }) }, request)
+}
+export function imageCatalogFixture() {
+  const config = readConfig({
+    AZURE_IMAGE_ENDPOINT: 'https://images.example/openai/v1/', AZURE_IMAGE_DEPLOYMENT: 'gpt-image-2.5-flare',
+    AZURE_IMAGE_FOUNDRY_RESOURCE_ID: '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/test/providers/Microsoft.CognitiveServices/accounts/images',
+  })
+  const definitions = ['gpt-image-2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'chat'].map(name => ({
+    name, version: '1', format: 'OpenAI', capabilities: name === 'chat'
+      ? { responses: 'true', chatCompletion: 'true' } : { imageGenerations: 'true', imageEdits: 'true' },
+  }))
+  const request: typeof fetch = async url => Response.json({
+    value: String(url).includes('/deployments?') ? definitions.map(model => ({
+      name: model.name, properties: { provisioningState: 'Succeeded', model },
+    })) : definitions,
+  })
+  return new ModelCatalog(config, { getToken: async () => ({ token: 'image-catalog-fixture-token', expiresOnTimestamp: Date.now() + 3600000 }) }, request, 'image')
+}
 
 export class FixtureAgent implements Agent {
   requests: AgentRequest[] = []
@@ -22,8 +58,9 @@ export class FixtureAgent implements Agent {
       await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true }))
       return
     }
-    if (request.prompt === 'tool') {
-      const approved = await request.approve('fixture-tool', 'image / generate', '{"prompt":"fixture"}')
+    if (request.prompt === 'tool' || request.prompt === 'assisted-tool' || request.prompt === 'managed-tool') {
+      request.emit({ type: 'tool-start', id: 'fixture-tool', name: 'image / generate' })
+      const approved = await request.approve('fixture-tool', 'image / generate', '{"prompt":"fixture"}', request.prompt === 'assisted-tool', request.prompt === 'managed-tool')
       if (approved) {
         request.emit({ type: 'tool-start', id: 'fixture-tool', name: 'image / generate' })
         request.emit({ type: 'tool-complete', id: 'fixture-tool', success: true })
@@ -37,13 +74,16 @@ export class FixtureAgent implements Agent {
   }
   async close() {}
 }
-export async function fixture(t: TestContext, agent = new FixtureAgent()) {
+export async function fixture(t: TestContext, agent = new FixtureAgent(), models?: ModelCatalog, imageModels?: ModelCatalog) {
   const dataDir = await mkdtemp(join(tmpdir(), 'copilot-studio-test-'))
-  const config = readConfig({ DATA_DIR: dataDir, TOOLS_FILE: join(dataDir, 'tools.json') })
-  const result = await buildApp(config, { agent, serveUi: false, logger: false })
+  const config = readConfig({
+    DATA_DIR: dataDir, TOOLS_FILE: join(dataDir, 'tools.json'),
+    ...(imageModels ? { AZURE_IMAGE_ENDPOINT: 'https://images.example/openai/v1/', AZURE_IMAGE_DEPLOYMENT: 'gpt-image-2.5-flare' } : {}),
+  })
+  const result = await buildApp(config, { agent, models, imageModels, serveUi: false, logger: false })
   const password = await hashPassword('test-password-1234')
-  const alice = result.store.createUser('alice', password)
-  const bob = result.store.createUser('bob', password)
+  const alice = (await result.store.createUser('alice', password))
+  const bob = (await result.store.createUser('bob', password))
   await result.app.listen({ host: '127.0.0.1', port: 0 })
   t.after(async () => { await result.app.close(); await rm(dataDir, { recursive: true, force: true }) })
   const address = result.app.server.address()
@@ -101,9 +141,9 @@ export async function connect(url: string, cookie: string, channel: string, clie
   const initialized = await client.initialize({ clientId, protocolVersions: [PROTOCOL_VERSION], initialSubscriptions: [channel] })
   return { socket, transport, client, subscription, initialized }
 }
-export async function until(predicate: () => boolean, timeout = 3000) {
+export async function until(predicate: () => boolean | Promise<boolean>, timeout = 3000) {
   const end = Date.now() + timeout
-  while (!predicate()) {
+  while (!await predicate()) {
     if (Date.now() > end) throw new Error('Timed out waiting for expected state')
     await new Promise(resolve => setTimeout(resolve, 10))
   }

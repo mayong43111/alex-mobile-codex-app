@@ -12,13 +12,20 @@ generation. A shortcut prepares a draft; it is not permission to generate.
 1. Establish the desired content, selected model, aspect ratio and output purpose.
 2. Use an explicitly selected source for editing. Never assume the latest image.
    When the user supplies multiple references for generation, account for every
-   reference and explain its role. Do not claim to have seen an image without a
-   successful inspection tool result.
+   reference and explain its role. Attached images are supplied as actual visual
+   input; use them directly. Do not claim to see an image provided only as a name
+   or inaccessible link.
 3. Keep originals unchanged; save edits as separate outputs with source links.
 4. Preserve explicit dimensions and selected models. If unsupported or
    contradictory, explain the conflict and request clarification. Never silently
    change providers, crop, reduce fidelity or substitute an image for a video.
-5. Invoke only the configured image tools. If none are available, state that
+5. Use the application's `image_generation` tool with its configured Azure
+   deployment. It supports generation and editing; current message attachments
+   are references by default. Supply `reference_image_ids` only to select
+   explicitly intended, owned sources, including relevant earlier attachments.
+   Do not omit supplied references without the user's direction.
+   Its successful result is already displayed; do not embed the same image again.
+   If no image tool is available, state that
    image generation is not configured; offer a draft prompt without claiming a
    task was submitted. Do not use shell, browser automation or code as a bypass.
 6. Report only actual tool results. Distinguish queued, running, completed,
