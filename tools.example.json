@@ -1,0 +1,20 @@
+{
+  "servers": [
+    {
+      "id": "studio-images",
+      "label": "Image service",
+      "skill": "image-production",
+      "url": "https://YOUR-IMAGE-SERVICE.example/mcp",
+      "tokenEnv": "IMAGE_TOOL_TOKEN",
+      "tools": ["generate_image", "edit_image"]
+    },
+    {
+      "id": "studio-video",
+      "label": "Video service",
+      "skill": "video-production",
+      "url": "https://YOUR-VIDEO-SERVICE.example/mcp",
+      "tokenEnv": "VIDEO_TOOL_TOKEN",
+      "tools": ["generate_video", "create_story", "create_narration"]
+    }
+  ]
+}

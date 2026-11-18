@@ -1,0 +1,74 @@
+:root { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #e8edf5; background: #10141d; font-synthesis: none; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, textarea { font: inherit; }
+button { cursor: pointer; min-height: 44px; border: 1px solid #303846; border-radius: 12px; color: inherit; background: #202734; padding: 10px 15px; }
+button:hover { background: #2a3444; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid #a798ff; outline-offset: 3px; }
+input, textarea { color: inherit; border: 1px solid #3b4352; background: #171d28; border-radius: 12px; padding: 12px; min-width: 0; font-size: 16px; }
+textarea { resize: none; }
+h1 { font-size: 25px; letter-spacing: -.5px; }
+h2 { font-size: 20px; margin: 0; }
+h3 { font-size: 16px; margin: 25px 0 10px; }
+p { line-height: 1.65; }
+.muted { color: #a4afc1; }
+.small { font-size: 12px; line-height: 1.6; }
+.primary { color: #fff; background: #6754d8; border-color: #7965ed; }
+.primary:hover { background: #7763e6; }
+.brand-mark { width: 60px; height: 60px; display: grid; place-items: center; border-radius: 20px; background: #29213f; color: #c4b5ff; font-size: 34px; margin: 0 auto 24px; }
+.login { max-width: 420px; margin: auto; padding: max(60px, 12dvh) 24px 24px; text-align: center; }
+.login form { text-align: left; margin-top: 30px; display: grid; gap: 18px; }
+.login label { display: grid; gap: 8px; font-size: 14px; }
+.studio { width: 100%; max-width: 800px; height: 100dvh; margin: auto; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top); }
+header { display: flex; align-items: center; gap: 12px; min-height: 72px; padding: 10px 14px; border-bottom: 1px solid #272e3b; flex-shrink: 0; }
+.icon { width: 44px; flex-shrink: 0; padding: 0; border-color: transparent; background: transparent; font-size: 23px; }
+.heading { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.heading strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 15px; }
+.notice { padding: 10px 18px; background: #292437; color: #d3c8ed; font-size: 12px; line-height: 1.6; }
+.error { color: #ffb9b9; background: #42242d; padding: 12px; border-radius: 10px; font-size: 13px; overflow-wrap: anywhere; }
+.banner { display: flex; justify-content: space-between; align-items: center; margin: 8px 12px; flex-shrink: 0; max-height: 130px; overflow-y: auto; }
+.banner button { border: 0; background: transparent; padding: 5px 12px; }
+.conversation { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 18px; overscroll-behavior: contain; }
+.welcome { padding: 36px 0 20px; text-align: center; max-width: 520px; margin: auto; }
+.welcome h1 { font-size: 25px; margin-bottom: 8px; }
+.welcome p { font-size: 13px; }
+.shortcuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 28px 0 18px; }
+.shortcut { display: flex; align-items: center; gap: 10px; text-align: left; min-height: 64px; background: #191f2a; font-size: 14px; }
+.shortcut:first-child { grid-column: span 2; }
+.shortcut span { color: #b7aaff; font-size: 24px; }
+.composer { padding: 10px 14px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid #272e3b; background: #10141d; flex-shrink: 0; }
+.quick-row { display: flex; gap: 7px; overflow-x: auto; padding: 0 0 10px; }
+.quick-row button { white-space: nowrap; min-height: 32px; padding: 5px 10px; font-size: 12px; background: #181f2b; border-radius: 20px; }
+.input-row { display: flex; align-items: flex-end; gap: 8px; border: 1px solid #3b4352; background: #171d28; border-radius: 16px; padding: 6px; margin-bottom: 7px; }
+.input-row textarea { flex: 1; border: 0; background: transparent; padding: 8px; line-height: 1.5; max-height: 180px; }
+.send { width: 44px; padding: 0; font-size: 23px; flex-shrink: 0; }
+.turn { margin: 0 0 30px; }
+.user-message { margin-left: 35px; margin-bottom: 24px; padding: 12px 16px; border-radius: 17px 17px 3px 17px; background: #29243e; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.6; }
+.assistant-message { font-size: 15px; line-height: 1.7; overflow-wrap: anywhere; }
+.assistant-label { color: #bbaeff; font-size: 12px; display: block; margin-bottom: 8px; }
+.markdown > :first-child { margin-top: 0; }
+.markdown pre { overflow-x: auto; padding: 14px; background: #080d16; border-radius: 12px; }
+.markdown code { font-size: 13px; }
+.markdown a { color: #bfafff; }
+.markdown table { display: block; overflow-x: auto; max-width: 100%; }
+.markdown img { max-width: 100%; }
+.thinking { color: #a4afc1; font-size: 13px; }
+.tool-call { border: 1px solid #3b4352; border-radius: 12px; padding: 12px; margin: 12px 0; font-size: 13px; }
+.tool-call summary { cursor: pointer; min-height: 24px; }
+.tool-input { white-space: pre-wrap; max-height: 240px; overflow-y: auto; }
+.actions { display: flex; gap: 10px; justify-content: flex-end; }
+.overlay { position: fixed; inset: 0; background: #0009; display: flex; align-items: flex-end; justify-content: center; z-index: 20; }
+.sheet { width: 100%; max-width: 650px; max-height: 88dvh; overflow-y: auto; background: #181e29; padding: 18px 20px max(24px, env(safe-area-inset-bottom)); border: 1px solid #363e4e; border-radius: 22px 22px 0 0; }
+.sheet-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+.session-list { display: grid; gap: 9px; margin-top: 16px; }
+.session-list button { display: grid; gap: 6px; text-align: left; }
+.session-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 15px 0; border-bottom: 1px solid #303846; font-size: 14px; }
+.skill p { margin: 5px 0 0; }
+.skill input { width: 44px; height: 28px; accent-color: #9784ff; flex-shrink: 0; }
+.tool-config { display: grid; gap: 6px; padding: 12px; background: #202734; border-radius: 12px; margin: 10px 0; font-size: 13px; }
+.tool-config code { overflow-wrap: anywhere; font-size: 12px; }
+.empty-config { border: 1px dashed #465065; padding: 15px; border-radius: 12px; font-size: 13px; color: #b3bdd0; line-height: 1.7; }
+.account { display: flex; justify-content: space-between; align-items: center; margin-top: 28px; padding-top: 18px; border-top: 1px solid #303846; }
+@media (max-width: 350px) { .conversation { padding: 18px 12px; } .shortcut { font-size: 12px; padding: 9px; gap: 6px; } .welcome h1 { font-size: 22px; } }
