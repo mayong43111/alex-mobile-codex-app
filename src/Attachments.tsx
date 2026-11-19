@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import { imageLimits } from './shared'
 import type { AttachmentInfo, UserInfo } from './shared'
+import { compressImage } from './image-compression'
 
 interface PreparedImage { file: File; image: HTMLImageElement; url: string; width: number; height: number }
 export function ImageAttachments({ user, value, onChange, inputRef, disabled, onBusyChange, onError }: {
@@ -69,11 +70,9 @@ export function ImageAttachments({ user, value, onChange, inputRef, disabled, on
       const context = canvas.getContext('2d')
       if (!context) throw new Error('浏览器无法处理图片。')
       context.drawImage(prepared.image, 0, 0, width, height)
-      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error('图片压缩失败。')), 'image/webp', quality / 100))
-      if (blob.type !== 'image/webp') throw new Error('浏览器不支持 WebP 压缩，请升级浏览器后重试。')
-      if (blob.size > imageLimits.uploadBytes) throw new Error(`压缩后 ${(blob.size / 1024 / 1024).toFixed(2)}MB，仍超过 2MB；请降低分辨率或质量。`)
+      const blob = await compressImage(canvas, quality / 100)
       const response = await fetch(`/api/attachments?name=${encodeURIComponent(prepared.file.name)}`, {
-        method: 'POST', headers: { 'Content-Type': 'image/webp', 'X-CSRF-Token': user.csrf }, body: blob,
+        method: 'POST', headers: { 'Content-Type': blob.type, 'X-CSRF-Token': user.csrf }, body: blob,
       })
       if (!response.ok) {
         const result: { error?: string } = await response.json()
@@ -101,7 +100,7 @@ export function ImageAttachments({ user, value, onChange, inputRef, disabled, on
           <div className="resolution-fields"><label>宽度<input type="number" min={1} max={2048} value={width} disabled={uploading} onChange={event => resize(event.currentTarget.valueAsNumber, 'width')} /></label>
             <span aria-hidden="true">×</span><label>高度<input type="number" min={1} max={2048} value={height} disabled={uploading} onChange={event => resize(event.currentTarget.valueAsNumber, 'height')} /></label></div>
           <label className="quality-field">质量 {quality}%<input aria-label="压缩质量" type="range" min={40} max={95} value={quality} disabled={uploading} onChange={event => setQuality(event.currentTarget.valueAsNumber)} /></label>
-          <p className="compression-notice">将保持比例压缩为 {width}×{height} WebP，移除定位等元数据。超过 2MB 时需继续调小；原图不变。</p>
+          <p className="compression-notice">将保持比例压缩为 {width}×{height}，自动选择浏览器支持的 WebP、PNG 或 JPEG 格式；JPEG 透明区域填充白色。移除定位等元数据，超过 2MB 时需继续调小；原图不变。</p>
         </>}
         {error && <p className="error" role="alert">{error}</p>}
         <div className="actions"><button type="button" disabled={uploading} onClick={() => { setQueue([]); setError('') }}>取消</button>
