@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import Markdown from 'react-markdown'
+import type { Components } from 'react-markdown'
 import {
   ActionType, ResponsePartKind, ToolCallCancellationReason, ToolCallConfirmationReason,
 } from '@microsoft/agent-host-protocol'
@@ -8,8 +9,8 @@ import type { ActiveTurn, ChatState, ResponsePart, Turn } from '@microsoft/agent
 import { api, ApiError } from './api'
 import { ChatConnection } from './connection'
 import { ImageAttachments } from './Attachments'
-import { imageLimits, permissionLabels, permissionModes, shortcuts, skillCatalog } from './shared'
-import type { AttachmentInfo, ChatModel, ConversationSummary, ImageModelCatalogResponse, ModelCatalogResponse, PermissionMode, Settings, UserInfo } from './shared'
+import { historyPageSize, imageLimits, permissionLabels, permissionModes, shortcuts, skillCatalog } from './shared'
+import type { AttachmentInfo, ChatModel, ConversationSummary, ImageModelCatalogResponse, ModelCatalogResponse, PermissionMode, Settings, TurnPage, UserInfo } from './shared'
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败'
 
@@ -67,6 +68,14 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [current, setCurrent] = useState<ConversationSummary>()
   const [state, setState] = useState<ChatState>()
+  const [olderTurns, setOlderTurns] = useState<Turn[]>([])
+  const [hasMore, setHasMore] = useState(true)
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const historyRequest = useRef(false)
+  const selectedConversation = useRef<string | undefined>(undefined)
+  const [deleteTarget, setDeleteTarget] = useState<ConversationSummary>()
+  const [deleting, setDeleting] = useState(false)
+  const initialized = useRef(false)
   const [status, setStatus] = useState<'connecting' | 'connected' | 'offline'>('connecting')
   const [panel, setPanel] = useState<'sessions' | 'settings' | 'models' | 'permissions' | 'image-models' | 'password'>()
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('manual')
@@ -93,17 +102,50 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
   const firstMessage = useRef<{ id: string; text: string; attachments: AttachmentInfo[] } | undefined>(undefined)
   const input = useRef<HTMLTextAreaElement>(null)
   const scroll = useRef<HTMLDivElement>(null)
+  const content = useRef<HTMLDivElement>(null)
+  const anchor = useRef<{ id: string; top: number } | undefined>(undefined)
   const follow = useRef(true)
+  const lastScrollTop = useRef(0)
+  const [following, setFollowing] = useState(true)
+  const lastSessionKey = `studio:last-conversation:${user.id}`
+  function rememberConversation(id?: string) {
+    try {
+      if (id) localStorage.setItem(lastSessionKey, id)
+      else localStorage.removeItem(lastSessionKey)
+    } catch { setError('浏览器无法保存上次会话，重新打开时将使用最近更新的会话。') }
+  }
+  function openConversation(item?: ConversationSummary) {
+    if (item && current?.id === item.id) return
+    selectedConversation.current = item?.id
+    rememberConversation(item?.id)
+    setState(undefined); setOlderTurns([]); setHasMore(true)
+    anchor.current = undefined
+    follow.current = true; setFollowing(true); lastScrollTop.current = 0
+    setCurrent(item); setStatus('connecting')
+  }
   const expire = useCallback(() => onLogout(), [onLogout])
   const load = useCallback(async () => {
     try {
       const [settings, list] = await Promise.all([api<Settings>('/settings'), api<ConversationSummary[]>('/conversations')])
       setSettings(settings); setConversations(list)
+      if (!initialized.current) {
+        initialized.current = true
+        let lastId: string | null = null
+        try { lastId = localStorage.getItem(lastSessionKey) }
+        catch { setError('浏览器无法读取上次会话，已使用最近更新的会话。') }
+        const restored = list.find(item => item.id === lastId) ?? list[0]
+        try {
+          if (restored) localStorage.setItem(lastSessionKey, restored.id)
+          else localStorage.removeItem(lastSessionKey)
+        } catch { setError('浏览器无法保存上次会话，重新打开时将使用最近更新的会话。') }
+        selectedConversation.current = restored?.id
+        setCurrent(restored)
+      }
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) onLogout()
       else setError(errorText(error))
     }
-  }, [onLogout])
+  }, [onLogout, lastSessionKey])
   useEffect(() => { void load() }, [load])
   const loadModels = useCallback(async (refresh = false) => {
     setLoadingModels(true); setModelError('')
@@ -129,7 +171,10 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
     setState(undefined)
     if (!current) return
     follow.current = true
-    const next = new ChatConnection(current.chat, setState, status => {
+    const next = new ChatConnection(current.chat, (state, resetHistory) => {
+      if (resetHistory) { setOlderTurns([]); setHasMore(true); anchor.current = undefined }
+      setState(state)
+    }, status => {
       setStatus(status)
       const queued = firstMessage.current
       if (status === 'connected' && queued?.id === current.id) {
@@ -142,9 +187,54 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
     void next.run().catch(error => setError(errorText(error)))
     return () => { next.close(); connection.current = undefined }
   }, [current?.id, expire])
+  function scrollToLatest() {
+    follow.current = true; setFollowing(true)
+    if (scroll.current) {
+      scroll.current.scrollTop = scroll.current.scrollHeight
+      lastScrollTop.current = scroll.current.scrollTop
+    }
+  }
+  useLayoutEffect(() => {
+    const element = scroll.current
+    if (!element) return
+    if (anchor.current) {
+      const saved = anchor.current
+      const turn = element.querySelector<HTMLElement>(`[data-turn-id="${saved.id}"]`)
+      if (turn) element.scrollTop += turn.getBoundingClientRect().top - saved.top
+      anchor.current = undefined
+      lastScrollTop.current = element.scrollTop
+    } else if (follow.current) {
+      element.scrollTop = element.scrollHeight
+      lastScrollTop.current = element.scrollTop
+    }
+  }, [state, olderTurns, current?.id])
   useEffect(() => {
-    if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
-  }, [state])
+    const observer = new ResizeObserver(() => {
+      if (follow.current) scrollToLatest()
+    })
+    if (content.current) observer.observe(content.current)
+    if (scroll.current) observer.observe(scroll.current)
+    return () => observer.disconnect()
+  }, [])
+  const recentTurns = state?.turns ?? []
+  const recentIds = new Set(recentTurns.map(turn => turn.id))
+  const visibleTurns = [...olderTurns.filter(turn => !recentIds.has(turn.id)), ...recentTurns]
+  async function loadHistory() {
+    const id = current?.id
+    const first = visibleTurns[0]
+    if (!id || !first || !hasMore || historyRequest.current) return
+    historyRequest.current = true; setLoadingHistory(true)
+    try {
+      const page = await api<TurnPage>(`/conversations/${id}/turns?before=${first.id}`)
+      if (selectedConversation.current !== id) return
+      const element = scroll.current?.querySelector<HTMLElement>(`[data-turn-id="${first.id}"]`)
+      if (element) anchor.current = { id: first.id, top: element.getBoundingClientRect().top }
+      follow.current = false; setFollowing(false)
+      setOlderTurns(turns => [...page.turns, ...turns]); setHasMore(page.hasMore)
+    } catch (error) {
+      if (selectedConversation.current === id) setError(errorText(error))
+    } finally { historyRequest.current = false; setLoadingHistory(false) }
+  }
   const active = Boolean(state?.activeTurn)
   const unavailableModel = Boolean(selectedModel && !loadingModels && !modelError && !models.some(model => model.id === selectedModel))
   async function send(event: FormEvent) {
@@ -159,15 +249,15 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
       if (!current) {
         const created = await api<ConversationSummary>('/conversations', user, { title: draft.trim().slice(0, 40) || '图片对话', model: selectedModel, permissionMode })
         firstMessage.current = { id: created.id, text: draft.trim(), attachments: [...attachments] }
-        setConversations(list => [created, ...list]); setCurrent(created)
+        setConversations(list => [created, ...list]); openConversation(created)
         return
       }
       if (!connection.current) throw new Error('请等待对话连接')
       const text = draft.trim()
       const sent = [...attachments]
+      scrollToLatest()
       await connection.current.send(text, sent)
       acknowledge(text, sent)
-      follow.current = true
     } catch (error) { setError(errorText(error)) }
     finally { if (!firstMessage.current) setBusy(false) }
   }
@@ -247,7 +337,22 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
   }
   function newConversation() {
     firstMessage.current = undefined
-    setBusy(false); setCurrent(undefined); setDraft(''); setAttachments([]); setPermissionMode('manual'); setPanel(undefined); setError('')
+    setError(''); setBusy(false); openConversation(); setDraft(''); setAttachments([]); setPermissionMode('manual'); setPanel(undefined)
+  }
+  async function deleteConversation() {
+    if (!deleteTarget || deleting) return
+    setDeleting(true); setError('')
+    try {
+      await api(`/conversations/${deleteTarget.id}`, user, undefined, 'DELETE')
+      const remaining = conversations.filter(item => item.id !== deleteTarget.id)
+      setConversations(remaining)
+      setError('')
+      if (current?.id === deleteTarget.id) {
+        openConversation(remaining[0]); setDraft(''); setAttachments([])
+      }
+      setDeleteTarget(undefined)
+    } catch (error) { setError(errorText(error)); setDeleteTarget(undefined) }
+    finally { setDeleting(false) }
   }
   return <div className="studio">
     <header className="chat-header">
@@ -262,18 +367,29 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
     {settings && !settings.model.configured && <div className="error banner" role="alert">未配置对话模型</div>}
     {error && <div className="error banner" role="alert"><span>{error}</span><button aria-label="关闭提示" onClick={() => setError('')}>×</button></div>}
     <div className="conversation" ref={scroll} onScroll={() => {
-      if (scroll.current) follow.current = scroll.current.scrollHeight - scroll.current.scrollTop - scroll.current.clientHeight < 100
+      const element = scroll.current
+      if (!element) return
+      const movedUp = element.scrollTop < lastScrollTop.current
+      follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 40
+      setFollowing(follow.current)
+      lastScrollTop.current = element.scrollTop
+      if (movedUp && element.scrollTop < 80) void loadHistory()
     }}>
-      {!state?.turns.length && !state?.activeTurn && <section className="welcome">
+      <div ref={content}>
+      {current && !state && <p className="muted small" role="status">正在加载会话…</p>}
+      {visibleTurns.length >= historyPageSize && hasMore && <button className="load-history" disabled={loadingHistory} onClick={() => { void loadHistory() }}>{loadingHistory ? '正在加载…' : '加载更早的对话'}</button>}
+      {!current && <section className="welcome">
         <div className="copilot-mark"><Icon name="sparkle" /></div><h1>Copilot</h1>
         <div className="shortcuts">{shortcuts.map(shortcut => <button key={shortcut.label} className="shortcut"
           disabled={Boolean(shortcut.skill && !settings?.skills[shortcut.skill])}
           onClick={() => chooseShortcut(shortcut)}><Icon name={shortcut.skill === 'image-production' ? 'image' : shortcut.skill === 'video-production' ? 'video' : 'sparkle'} /><span>{shortcut.label}</span><span className="shortcut-arrow" aria-hidden="true">→</span></button>)}</div>
       </section>}
-      {state?.turns.map(turn => <TurnView key={turn.id} turn={turn} username={user.username} approve={approve} onError={setError} />)}
+      {visibleTurns.map(turn => <TurnView key={turn.id} turn={turn} username={user.username} approve={approve} onError={setError} />)}
       {state?.activeTurn && <TurnView turn={state.activeTurn} username={user.username} approve={approve} onError={setError} active />}
       {state?.activity && <p className="muted small" role="status">{state.activity}</p>}
+      </div>
     </div>
+    {!following && current && <button className="jump-latest" onClick={scrollToLatest}>回到最新消息</button>}
     <form className="composer" onSubmit={send}>
       <div className="composer-box">
         <ImageAttachments user={user} value={attachments} onChange={setAttachments} inputRef={attachmentInput}
@@ -322,9 +438,12 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
           </button>)}</div>
         </> : panel === 'password' ? <PasswordForm user={user} onChanged={() => onLogout('密码已修改，请重新登录')} /> : panel === 'sessions' ? <>
           <button className="primary" disabled={busy} onClick={newConversation}>＋ 新对话</button>
-          <div className="session-list">{conversations.map(item => <button key={item.id} onClick={() => {
-            setCurrent(item); setDraft(''); setAttachments([]); setError(''); setPanel(undefined)
-          }}><strong>{item.title}</strong><span className="muted small">{new Date(item.updatedAt).toLocaleString()}</span></button>)}</div>
+          <div className="session-list">{conversations.map(item => <div className="session-row" key={item.id}>
+            <button disabled={busy || deleting} aria-current={current?.id === item.id ? 'true' : undefined} onClick={() => {
+              setError(''); openConversation(item); setDraft(''); setAttachments([]); setPanel(undefined)
+            }}><strong>{item.title}</strong><span className="muted small">{new Date(item.updatedAt).toLocaleString()}</span></button>
+            <button aria-label={`删除会话：${item.title}`} disabled={busy || deleting || (current?.id === item.id && active)} onClick={() => setDeleteTarget(item)}>删除</button>
+          </div>)}</div>
         </> : <>
           <h3>对话</h3>
           <button className="setting-row" aria-label="配置对话模型" disabled={busy || active || switchingModel} onClick={() => setPanel('models')}>
@@ -342,6 +461,13 @@ function Studio({ user, onLogout }: { user: UserInfo; onLogout: (message?: strin
             <input aria-label={skill.name} type="checkbox" role="switch" checked={settings?.skills[skill.id] ?? false} disabled={!settings || saving} onChange={() => { void toggle(skill.id) }} /></label>)}
           <div className="account"><span>{user.username}</span><button onClick={() => setPanel('password')}>修改密码</button><button onClick={() => { void logout() }}>退出登录</button></div>
         </>}
+      </section>
+    </div>}
+    {deleteTarget && <div className="overlay delete-warning">
+      <section className="sheet" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
+        <h2 id="delete-title">删除会话？</h2><p>将永久删除「{deleteTarget.title}」的聊天记录，无法撤销。</p>
+        <div className="actions"><button disabled={deleting} onClick={() => setDeleteTarget(undefined)}>取消</button>
+          <button className="primary" disabled={deleting} onClick={() => { void deleteConversation() }}>{deleting ? '正在删除…' : '确认删除'}</button></div>
       </section>
     </div>}
     {permissionWarning && <div className="overlay permission-warning">
@@ -389,12 +515,12 @@ function CopyButton({ text, onError }: { text: string; onError: (message: string
 }
 function TurnView({ turn, active, username, approve, onError }: { turn: Turn | ActiveTurn; active?: boolean; username: string; approve: (turn: string, tool: string, approved: boolean) => void; onError: (message: string) => void }) {
   const text = turn.responseParts.filter(part => part.kind === ResponsePartKind.Markdown).map(part => part.content).join('\n\n')
-  return <section className="turn"><div className="user-message">
+  return <section className="turn" data-turn-id={turn.id}><div className="user-message">
     <div className="message-heading"><span className="user-avatar" aria-hidden="true">{username.slice(0, 1).toUpperCase()}</span><strong>{username}</strong><CopyButton text={turn.message.text} onError={onError} /></div>
     <div className="user-content">{turn.message.text}</div>
     {turn.message.attachments?.length ? <div className="message-images">{turn.message.attachments.map((image, index) => {
       const id = 'uri' in image ? /^studio-attachment:\/([0-9a-f-]{36})$/.exec(image.uri)?.[1] : undefined
-      return id ? <a key={id} href={`/api/attachments/${id}`} target="_blank" rel="noreferrer noopener"><img src={`/api/attachments/${id}`} alt={image.label || `图片 ${index + 1}`} loading="lazy" /></a> : null
+      return id ? <ChatImage key={id} src={`/api/attachments/${id}`} alt={image.label || `图片 ${index + 1}`} thumbnail /> : null
     })}</div> : null}
   </div><div className="assistant-message">
     <div className="message-heading assistant-label"><span className="assistant-avatar"><Icon name="sparkle" /></span><strong>Copilot</strong></div>
@@ -407,11 +533,7 @@ function TurnView({ turn, active, username, approve, onError }: { turn: Turn | A
   </div></section>
 }
 function Part({ part, approve }: { part: ResponsePart; approve: (approved: boolean) => void }) {
-  if (part.kind === ResponsePartKind.Markdown) return <div className="markdown"><Markdown skipHtml components={{
-    img: ({ src, alt }) => typeof src === 'string' && /^\/api\/attachments\/[0-9a-f-]{36}$/.test(src)
-      ? <a href={src} target="_blank" rel="noreferrer noopener"><img src={src} alt={alt || '图片'} loading="lazy" /></a> : null,
-    a: ({ href, children }) => <a href={href && /^https?:\/\//i.test(href) ? href : undefined} target="_blank" rel="noreferrer noopener">{children}</a>,
-  }}>{part.content}</Markdown></div>
+  if (part.kind === ResponsePartKind.Markdown) return <div className="markdown"><Markdown skipHtml components={markdownComponents}>{part.content}</Markdown></div>
   if (part.kind === ResponsePartKind.Error) return <p className="error">{part.error.message}</p>
   if (part.kind === ResponsePartKind.ToolCall) {
     const tool = part.toolCall
@@ -422,4 +544,22 @@ function Part({ part, approve }: { part: ResponsePart; approve: (approved: boole
     </details>
   }
   return null
+}
+
+const markdownComponents: Components = {
+  img: ({ src, alt }) => typeof src === 'string' && /^\/api\/attachments\/[0-9a-f-]{36}$/.test(src)
+    ? <ChatImage src={src} alt={alt || '图片'} /> : null,
+  a: ({ href, children }) => <a href={href && /^https?:\/\//i.test(href) ? href : undefined} target="_blank" rel="noreferrer noopener">{children}</a>,
+}
+
+function ChatImage({ src, alt, thumbnail = false }: { src: string; alt: string; thumbnail?: boolean }) {
+  const [status, setStatus] = useState<'loading' | 'loaded' | 'error'>('loading')
+  const [attempt, setAttempt] = useState(0)
+  return <span className={`chat-image${thumbnail ? ' thumbnail' : ''}`} aria-busy={status === 'loading'}>
+    <a href={src} target="_blank" rel="noreferrer noopener" aria-label={`查看原图：${alt}`}>
+      <img key={attempt} src={src} alt={alt} loading="lazy" decoding="async" onLoad={() => setStatus('loaded')} onError={() => setStatus('error')} />
+    </a>
+    {status === 'loading' && <span className="image-status" role="status">图片加载中…</span>}
+    {status === 'error' && <span className="image-status" role="alert">图片加载失败<button type="button" onClick={() => { setStatus('loading'); setAttempt(value => value + 1) }}>重试</button></span>}
+  </span>
 }

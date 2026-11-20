@@ -71,6 +71,21 @@ export class AgentHost {
   revoke(tokenHash: string) {
     for (const peer of this.peers) if (peer.login.tokenHash === tokenHash) { peer.revoked = true; peer.socket.close(4001, 'Logged out') }
   }
+  async deleteConversation(userId: string, id: string) {
+    const remove = async () => {
+      await this.store.conversation(userId, id)
+      if (this.running.has(id)) throw new AppError(409, '请先停止当前回复，结束后再删除会话。')
+      await this.store.deleteConversation(userId, id)
+      for (const peer of this.peers) {
+        if (peer.login.userId === userId && (peer.subscriptions.has(`ahp-chat:/${id}`) || peer.subscriptions.has(`ahp-session:/${id}`))) {
+          peer.socket.close(4004, 'Conversation deleted')
+        }
+      }
+    }
+    const result = this.dispatchQueue.then(remove, remove)
+    this.dispatchQueue = result
+    await result
+  }
   private send(peer: Peer, message: unknown) {
     if (peer.socket.readyState !== 1) return
     if (peer.socket.bufferedAmount > 2 * 1024 * 1024) { peer.socket.close(1013, 'Reconnect for latest snapshot'); return }

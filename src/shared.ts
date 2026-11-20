@@ -1,3 +1,8 @@
+import type { Turn } from '@microsoft/agent-host-protocol'
+
+export const historyPageSize = 10
+export interface TurnPage { turns: Turn[]; hasMore: boolean }
+
 export const skillIds = ['image-production', 'video-production'] as const
 export const permissionModes = ['manual', 'assisted', 'allow-all'] as const
 export type PermissionMode = typeof permissionModes[number]

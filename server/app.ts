@@ -18,7 +18,7 @@ import { ToolRegistry } from './tools.js'
 import { ModelCatalog, createAzureCredential } from './models.js'
 import { Attachments } from './attachments.js'
 import { ImageGeneration } from './image-generation.js'
-import { imageLimits, permissionModes } from '../src/shared.js'
+import { historyPageSize, imageLimits, permissionModes } from '../src/shared.js'
 import { WebSearch } from './web-search.js'
 
 declare module 'fastify' {
@@ -161,7 +161,18 @@ export async function buildApp(config: Config, options: { agent?: Agent; store?:
   })
   app.get('/api/conversations/:id', async request => {
     const { id } = z.object({ id: z.uuid() }).parse(request.params)
-    return (await store.conversation(request.login!.userId, id)).state
+    const { state } = await store.conversation(request.login!.userId, id)
+    return { ...state, turns: state.turns.slice(-historyPageSize) }
+  })
+  app.get('/api/conversations/:id/turns', async request => {
+    const { id } = z.object({ id: z.uuid() }).parse(request.params)
+    const { before } = z.object({ before: z.uuid().optional() }).strict().parse(request.query)
+    return store.turnPage(request.login!.userId, id, before)
+  })
+  app.delete('/api/conversations/:id', async request => {
+    const { id } = z.object({ id: z.uuid() }).parse(request.params)
+    await host.deleteConversation(request.login!.userId, id)
+    return { ok: true }
   })
   app.get('/api/ahp', { websocket: true }, (socket, request) => host.attach(socket, request.login!))
   if (options.serveUi !== false) {

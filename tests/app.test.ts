@@ -13,6 +13,139 @@ import { importAccounts } from '../server/bootstrap.js'
 import { defaultSkills } from '../src/shared.js'
 import { AgentHost } from '../server/host.js'
 import { FixtureAgent } from './helpers.js'
+import { WebSocket } from 'ws'
+import { ChatConnection } from '../src/connection.js'
+
+test('browser reconnection preserves overlapping history but resets pagination across a missed page', async t => {
+  const f = await fixture(t)
+  const login = await f.login()
+  const conversation = await f.store.createConversation(f.alice.id, 'Reconnect pages')
+  const addTurns = async (count: number) => {
+    for (let index = 0; index < count; index++) {
+      const turnId = randomUUID()
+      await f.store.apply(f.alice.id, conversation.id, {
+        type: ActionType.ChatTurnStarted, turnId, startedAt: new Date().toISOString(),
+        message: { text: 'history', origin: { kind: MessageKind.User } },
+      })
+      await f.store.apply(f.alice.id, conversation.id, { type: ActionType.ChatTurnComplete, turnId, duration: 0 })
+    }
+  }
+  await addTurns(12)
+  const sockets: WebSocket[] = []
+  class BrowserSocket extends WebSocket {
+    constructor() {
+      super(f.wsUrl, { headers: { Cookie: login.cookie, Origin: f.config.origin } })
+      sockets.push(this)
+    }
+  }
+  const descriptors = new Map(['window', 'WebSocket'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { href: f.config.origin } } })
+  Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: BrowserSocket })
+  let latest: ChatState | undefined
+  let connected = 0
+  let resets = 0
+  const errors: string[] = []
+  const connection = new ChatConnection(conversation.state.resource, (state, reset) => {
+    latest = state
+    if (reset) resets++
+  }, status => { if (status === 'connected') connected++ }, error => errors.push(error), () => errors.push('expired'))
+  const work = connection.run()
+  try {
+    await until(() => connected === 1)
+    assert.equal(latest?.turns.length, 10)
+    await addTurns(1)
+    sockets[0].close()
+    await until(() => connected === 2)
+    assert.equal(latest?.turns.length, 11)
+    assert.equal(resets, 0)
+    await addTurns(12)
+    sockets[1].close()
+    await until(() => connected === 3)
+    assert.equal(latest?.turns.length, 10)
+    assert.equal(resets, 1)
+    assert.deepEqual(errors, [])
+  } finally {
+    connection.close()
+    await work
+    for (const [key, descriptor] of descriptors) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  }
+})
+
+test('history snapshots and cursor pages return ten turns without gaps, including while streaming', async t => {
+  const f = await fixture(t)
+  const alice = await f.login()
+  const bob = await f.login('bob')
+  const conversation = await f.store.createConversation(f.alice.id, 'Paged')
+  const ids: string[] = []
+  for (let index = 0; index < 23; index++) {
+    const turnId = randomUUID()
+    ids.push(turnId)
+    await f.store.apply(f.alice.id, conversation.id, {
+      type: ActionType.ChatTurnStarted, turnId, startedAt: new Date().toISOString(),
+      message: { text: `message ${index}`, origin: { kind: MessageKind.User } },
+    })
+    await f.store.apply(f.alice.id, conversation.id, { type: ActionType.ChatTurnComplete, turnId, duration: 0 })
+  }
+  const activeId = randomUUID()
+  await f.store.apply(f.alice.id, conversation.id, {
+    type: ActionType.ChatTurnStarted, turnId: activeId, startedAt: new Date().toISOString(),
+    message: { text: 'still streaming', origin: { kind: MessageKind.User } },
+  })
+  const connection = await connect(f.wsUrl, alice.cookie, conversation.state.resource)
+  t.after(() => connection.client.shutdown())
+  const snapshot = connection.initialized.snapshots[0].state as ChatState
+  assert.deepEqual(snapshot.turns.map(turn => turn.id), ids.slice(13))
+  assert.equal(snapshot.activeTurn?.id, activeId)
+  const read = (suffix = '', headers = alice.headers) => f.app.inject({
+    url: `/api/conversations/${conversation.id}${suffix}`, headers,
+  })
+  assert.equal((await read()).json<ChatState>().turns.length, 10)
+  const page = (await read(`/turns?before=${ids[13]}`)).json()
+  assert.deepEqual(page.turns.map((turn: { id: string }) => turn.id), ids.slice(3, 13))
+  assert.equal(page.hasMore, true)
+  const oldest = (await read(`/turns?before=${ids[3]}`)).json()
+  assert.deepEqual(oldest.turns.map((turn: { id: string }) => turn.id), ids.slice(0, 3))
+  assert.equal(oldest.hasMore, false)
+  assert.deepEqual((await read(`/turns?before=${ids[0]}`)).json(), { turns: [], hasMore: false })
+  assert.equal((await read(`/turns?before=${randomUUID()}`)).statusCode, 404)
+  assert.equal((await read('/turns?before=invalid')).statusCode, 400)
+  assert.equal((await read('/turns', bob.headers)).statusCode, 404)
+  assert.equal((await f.store.conversation(f.alice.id, conversation.id)).state.turns.length, 23)
+})
+
+test('conversation deletion enforces ownership and CSRF, rejects active turns and closes subscribers', async t => {
+  const f = await fixture(t)
+  const alice = await f.login()
+  const bob = await f.login('bob')
+  const conversation = await f.store.createConversation(f.alice.id, 'Delete me')
+  const other = await f.store.createConversation(f.alice.id, 'Keep me')
+  const remove = (headers = alice.headers) => f.app.inject({
+    method: 'DELETE', url: `/api/conversations/${conversation.id}`, headers,
+  })
+  assert.equal((await remove(bob.headers)).statusCode, 404)
+  assert.equal((await remove({ ...alice.headers, 'x-csrf-token': '' })).statusCode, 403)
+  const connection = await connect(f.wsUrl, alice.cookie, conversation.state.resource)
+  t.after(() => connection.client.shutdown())
+  connection.client.dispatch(conversation.state.resource, {
+    type: ActionType.ChatTurnStarted, turnId: randomUUID(), startedAt: new Date().toISOString(),
+    message: { text: 'wait', origin: { kind: MessageKind.User } },
+  })
+  await until(() => f.agent.requests.length === 1)
+  assert.equal((await remove()).statusCode, 409)
+  const activeTurn = (await f.store.conversation(f.alice.id, conversation.id)).state.activeTurn!
+  connection.client.dispatch(conversation.state.resource, { type: ActionType.ChatTurnCancelled, turnId: activeTurn.id, duration: 0 })
+  await until(() => f.host.activeCount === 0)
+  const closed = new Promise<number>(resolve => connection.socket.once('close', resolve))
+  assert.equal((await remove()).statusCode, 200)
+  assert.equal(await closed, 4004)
+  assert.equal((await remove()).statusCode, 404)
+  assert.deepEqual((await f.store.conversations(f.alice.id)).map(item => item.id), [other.id])
+  await assert.rejects(connection.client.subscribe(conversation.state.resource))
+  assert.equal((await f.app.inject({ url: `/api/conversations/${conversation.id}/turns`, headers: alice.headers })).statusCode, 404)
+})
 
 test('login accepts six-character passwords and rejects shorter input', async t => {
   const f = await fixture(t)

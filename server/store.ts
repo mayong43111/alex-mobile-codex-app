@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { ActionType, ResponsePartKind, SessionLifecycle, SessionStatus, chatReducer } from '@microsoft/agent-host-protocol'
 import type { ActionEnvelope, ActionOrigin, ChatAction, ChatState, SessionSummary, Snapshot } from '@microsoft/agent-host-protocol'
-import { defaultSkills } from '../src/shared.js'
+import { defaultSkills, historyPageSize } from '../src/shared.js'
 import type { AttachmentInfo, ConversationSummary, PermissionMode, SkillChoices } from '../src/shared.js'
 import { AppError } from './errors.js'
 import { SqliteDatabase, SqlServerDatabase, upsert } from './database.js'
@@ -99,6 +99,21 @@ export class Store {
     return JSON.parse(String(row.data)) as Conversation
   }
   conversation(userId: string, id: string) { return this.readConversation(this.database, userId, id) }
+  async turnPage(userId: string, id: string, before?: string) {
+    const { state } = await this.conversation(userId, id)
+    const end = before ? state.turns.findIndex(turn => turn.id === before) : state.turns.length
+    if (end < 0) throw new AppError(404, '历史消息不存在，请重新打开会话')
+    const start = Math.max(0, end - historyPageSize)
+    return { turns: state.turns.slice(start, end), hasMore: start > 0 }
+  }
+  async deleteConversation(userId: string, id: string) {
+    await this.database.transaction(async db => {
+      const conversation = await this.readConversation(db, userId, id)
+      if (conversation.state.activeTurn) throw new AppError(409, '请先停止当前回复，结束后再删除会话。')
+      if (conversation.runtimeId) await db.run('DELETE FROM runtime_files WHERE user_id=? AND session_id=?', [userId, conversation.runtimeId])
+      await db.run('DELETE FROM conversations WHERE user_id=? AND id=?', [userId, id])
+    })
+  }
   async conversations(userId: string): Promise<Conversation[]> {
     const modified = this.database.kind === 'sqlserver' ? "JSON_VALUE(data, '$.state.modifiedAt')" : "json_extract(data, '$.state.modifiedAt')"
     return (await this.database.all(`SELECT data FROM conversations WHERE user_id=? ORDER BY ${modified} DESC`, [userId])).map(row => JSON.parse(String(row.data)) as Conversation)
@@ -192,7 +207,7 @@ export class Store {
       if (!match) throw new AppError(404, '通道不存在')
       const conversation = await this.readConversation(db, userId, match[2])
       const { state } = conversation
-      if (match[1] === 'chat') return { resource: channel, fromSeq, state }
+      if (match[1] === 'chat') return { resource: channel, fromSeq, state: { ...state, turns: state.turns.slice(-historyPageSize) } }
       return { resource: channel, fromSeq, state: {
         lifecycle: SessionLifecycle.Ready, provider: 'copilot-azure', title: state.title, status: state.status,
         activeClients: [], chats: [{ resource: state.resource, title: state.title, status: state.status, modifiedAt: state.modifiedAt }],

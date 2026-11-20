@@ -13,13 +13,14 @@ export class ChatConnection {
   private pending?: { turnId: string; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
   constructor(
     private channel: string,
-    private onState: (state: ChatState) => void,
+    private onState: (state: ChatState, resetHistory?: boolean) => void,
     private onStatus: (status: 'connecting' | 'connected' | 'offline') => void,
     private onError: (message: string) => void,
     private onExpired: () => void,
   ) {}
   async run() {
     let delay = 500
+    let previous: ChatState | undefined
     while (!this.stopped) {
       let client: AhpClient | undefined
       let heartbeat: ReturnType<typeof setInterval> | undefined
@@ -57,11 +58,20 @@ export class ChatConnection {
           clientId: crypto.randomUUID(), protocolVersions: [PROTOCOL_VERSION],
           initialSubscriptions: [this.channel],
         })
+        if (this.stopped) return
         const snapshot = initialized.snapshots.find(item => item.resource === this.channel)
         if (!snapshot || !('turns' in snapshot.state)) throw new Error('未收到有效的对话状态')
         let state = snapshot.state as ChatState
+        const knownIds = new Set(previous?.turns.map(turn => turn.id))
+        const contiguous = !knownIds.size || state.turns.some(turn => knownIds.has(turn.id))
+        if (previous && contiguous) {
+          const turns = new Map(previous.turns.map(turn => [turn.id, turn]))
+          for (const turn of state.turns) turns.set(turn.id, turn)
+          state = { ...state, turns: [...turns.values()] }
+        }
+        previous = state
         let sequence = snapshot.fromSeq
-        this.onState(state)
+        this.onState(state, !contiguous)
         this.client = client
         this.onStatus('connected')
         delay = 500
@@ -73,6 +83,7 @@ export class ChatConnection {
           sequence = event.params.serverSeq
           if (!isChatAction(event.params.action)) continue
           state = chatReducer(state, event.params.action)
+          previous = state
           this.onState(state)
           if (event.params.action.type === ActionType.ChatTurnStarted && this.pending?.turnId === event.params.action.turnId) {
             clearTimeout(this.pending.timer)
@@ -81,6 +92,7 @@ export class ChatConnection {
           }
         }
         if (transport.lastClose?.code === 4001) { this.onExpired(); return }
+        if (transport.lastClose?.code === 4004) { this.onStatus('offline'); this.onError('此会话已删除，请选择其他会话或新建对话。'); return }
       } catch (error) {
         if (!this.stopped) this.onError(error instanceof Error ? error.message : '对话连接失败')
       } finally {
